@@ -1,37 +1,65 @@
 "use client";
 
-import React, { useState } from "react";
+import { useState, useEffect } from "react";
 import MacroBar from "@/components/MacroBar";
 import TimeframeToggle, { Timeframe } from "@/components/TimeframeToggle";
 import Heatmap from "@/components/Heatmap";
 import SignalScanner from "@/components/SignalScanner";
 import AssetDetailModal from "@/components/AssetDetailModal";
+import { FilterPanel } from "@/components/FilterPanel";
 import { useWatchlist } from "@/lib/useWatchlist";
+import { useFilters, passesFilters } from "@/lib/useFilters";
+import { AssetData } from "@/lib/types";
 
 export default function Home() {
   const [timeframe, setTimeframe] = useState<Timeframe>("24h");
   const [selectedAsset, setSelectedAsset] = useState<string | null>(null);
   const [showWatchlist, setShowWatchlist] = useState(false);
-  const [allowedSymbols, setAllowedSymbols] = useState<Set<string> | null>(null);
   const { watchlist, toggle, count } = useWatchlist();
 
-  // Load markets data to get allowed symbols
-  React.useEffect(() => {
-    fetch("/api/markets")
-      .then((r) => r.json())
-      .then((data: any[]) => {
-        if (Array.isArray(data)) {
-          setAllowedSymbols(new Set(data.map((a) => a.symbol)));
-        }
-      })
-      .catch(() => {
-        // On error, set to empty set so all signals are hidden
-        setAllowedSymbols(new Set());
-      });
+  // Filter state
+  const { filters, setFilter, clearFilters, activeCount } = useFilters();
+  const [filterPanelOpen, setFilterPanelOpen] = useState(false);
+
+  // Markets data — single source of truth for filtering
+  const [allAssets, setAllAssets] = useState<AssetData[]>([]);
+
+  useEffect(() => {
+    async function load() {
+      try {
+        const res = await fetch("/api/markets");
+        if (res.ok) setAllAssets(await res.json());
+        // On error: keep existing state (don't hide signals)
+      } catch {
+        // ignore — keep existing allAssets
+      }
+    }
+    load();
+    const id = setInterval(load, 30_000);
+    return () => clearInterval(id);
   }, []);
+
+  // Derived values — recomputed on every render when allAssets or filters change
+  const filteredAssets = allAssets.filter((a) => passesFilters(a, filters));
+
+  // null = data not loaded yet → SignalScanner shows all signals
+  const passingSymbols: Set<string> | null =
+    allAssets.length === 0
+      ? null
+      : new Set(filteredAssets.map((a) => a.symbol));
 
   return (
     <div className="min-h-screen flex flex-col">
+      {/* Slide-in filter panel (fixed position, conditionally rendered) */}
+      {filterPanelOpen && (
+        <FilterPanel
+          filters={filters}
+          onChange={setFilter}
+          onClear={clearFilters}
+          onClose={() => setFilterPanelOpen(false)}
+        />
+      )}
+
       <MacroBar />
 
       <div className="flex items-center justify-between px-6 py-4">
@@ -40,6 +68,29 @@ export default function Home() {
           <span className="text-gray-500">Screener</span>
         </h1>
         <div className="flex items-center gap-3">
+          {/* Filters button */}
+          <button
+            onClick={() => setFilterPanelOpen((prev) => !prev)}
+            className={`relative flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium transition-all border ${
+              activeCount > 0
+                ? "bg-violet-600/20 border-violet-500/50 text-violet-300"
+                : "bg-transparent border-white/10 text-gray-500 hover:text-gray-300 hover:border-white/20"
+            }`}
+          >
+            <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2}
+                d="M3 4a1 1 0 011-1h16a1 1 0 011 1v2a1 1 0 01-.293.707L13 13.414V19a1 1 0 01-.553.894l-4 2A1 1 0 017 21v-7.586L3.293 6.707A1 1 0 013 6V4z"
+              />
+            </svg>
+            Filters
+            {activeCount > 0 && (
+              <span className="absolute -top-1.5 -right-1.5 bg-violet-500 text-white text-[10px] font-bold rounded-full w-4 h-4 flex items-center justify-center">
+                {activeCount}
+              </span>
+            )}
+          </button>
+
+          {/* Watchlist button */}
           <button
             onClick={() => setShowWatchlist(!showWatchlist)}
             className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium transition-all border ${
@@ -56,11 +107,13 @@ export default function Home() {
               </span>
             )}
           </button>
+
           <TimeframeToggle selected={timeframe} onChange={setTimeframe} />
         </div>
       </div>
 
       <Heatmap
+        assets={filteredAssets}
         timeframe={timeframe}
         onSelectAsset={setSelectedAsset}
         showWatchlistOnly={showWatchlist}
@@ -69,7 +122,10 @@ export default function Home() {
       />
 
       <div className="px-4 pb-6 mt-2">
-        <SignalScanner onSelectAsset={setSelectedAsset} allowedSymbols={allowedSymbols} />
+        <SignalScanner
+          onSelectAsset={setSelectedAsset}
+          allowedSymbols={passingSymbols}
+        />
       </div>
 
       {selectedAsset && (
