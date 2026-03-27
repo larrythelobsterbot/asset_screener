@@ -88,6 +88,37 @@ export async function getCandles(
   return data;
 }
 
+export interface HLSpotCtx {
+  prevDayPx: string;
+  dayNtlVlm: string;
+  markPx: string;
+  midPx: string | null;
+  circulatingSupply: string;
+}
+
+export interface HLSpotMeta {
+  universe: Array<{
+    name: string;
+    tokens: [number, number];
+    index: number;
+    isCanonical: boolean;
+  }>;
+  tokens: Array<{
+    name: string;
+    index: number;
+  }>;
+}
+
+export async function getSpotMetaAndCtxs(): Promise<{ meta: HLSpotMeta; spotCtxs: HLSpotCtx[] }> {
+  const cached = cache.get<{ meta: HLSpotMeta; spotCtxs: HLSpotCtx[] }>("hl:spotMetaAndCtxs");
+  if (cached) return cached;
+
+  const data = await hlPost<[HLSpotMeta, HLSpotCtx[]]>({ type: "spotMetaAndAssetCtxs" });
+  const result = { meta: data[0], spotCtxs: data[1] };
+  cache.set("hl:spotMetaAndCtxs", result, 30_000);
+  return result;
+}
+
 export async function getFundingHistory(
   coin: string,
   hours: number = 168

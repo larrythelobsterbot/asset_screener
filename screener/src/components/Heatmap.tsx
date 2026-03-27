@@ -9,16 +9,18 @@ import { Timeframe } from "./TimeframeToggle";
 interface Props {
   timeframe: Timeframe;
   onSelectAsset: (symbol: string) => void;
+  showWatchlistOnly: boolean;
+  watchlist: Set<string>;
+  onToggleWatch: (symbol: string) => void;
 }
 
-// Order sectors should appear
 const SECTOR_ORDER: Sector[] = [
   "stocks", "indices", "commodities", "preipo",
   "l1", "defi", "ai", "infra", "meme", "gaming",
   "crypto-major", "crypto-alt",
 ];
 
-export default function Heatmap({ timeframe, onSelectAsset }: Props) {
+export default function Heatmap({ timeframe, onSelectAsset, showWatchlistOnly, watchlist, onToggleWatch }: Props) {
   const [assets, setAssets] = useState<AssetData[]>([]);
   const [loading, setLoading] = useState(true);
 
@@ -37,30 +39,45 @@ export default function Heatmap({ timeframe, onSelectAsset }: Props) {
     return () => clearInterval(interval);
   }, []);
 
+  const filtered = showWatchlistOnly
+    ? assets.filter((a) => watchlist.has(a.symbol))
+    : assets;
+
   // Group by sector
   const grouped = new Map<Sector, AssetData[]>();
-  for (const asset of assets) {
+  for (const asset of filtered) {
     const list = grouped.get(asset.sector) || [];
     list.push(asset);
     grouped.set(asset.sector, list);
   }
 
-  // Sort each group by volume descending
   for (const [, list] of grouped) {
     list.sort((a, b) => b.volume24h - a.volume24h);
   }
 
-  // Filter to sectors that have assets, in defined order
   const activeSectors = SECTOR_ORDER.filter(
     (s) => grouped.has(s) && grouped.get(s)!.length > 0
   );
 
   if (loading) {
     return (
-      <div className="flex-1 flex items-center justify-center">
+      <div className="flex-1 flex items-center justify-center py-20">
         <div className="flex flex-col items-center gap-3">
           <div className="w-8 h-8 border-2 border-white/20 border-t-white/60 rounded-full animate-spin" />
           <span className="text-sm text-gray-500">Loading markets...</span>
+        </div>
+      </div>
+    );
+  }
+
+  if (showWatchlistOnly && activeSectors.length === 0) {
+    return (
+      <div className="flex-1 flex items-center justify-center py-20">
+        <div className="text-center">
+          <span className="text-2xl block mb-2">&#9734;</span>
+          <span className="text-sm text-gray-500">No assets in your watchlist yet.</span>
+          <br />
+          <span className="text-xs text-gray-600 mt-1">Hover over any asset tile and click the star to add it.</span>
         </div>
       </div>
     );
@@ -104,6 +121,8 @@ export default function Heatmap({ timeframe, onSelectAsset }: Props) {
                   asset={asset}
                   timeframe={timeframe}
                   onClick={() => onSelectAsset(asset.symbol)}
+                  isWatched={watchlist.has(asset.symbol)}
+                  onToggleWatch={() => onToggleWatch(asset.symbol)}
                 />
               ))}
             </div>

@@ -28,7 +28,7 @@ const config: Config = {
         negative: "#EF4444",
       },
       fontFamily: {
-        sans: ["var(--font-geist-sans)"],
+        sans: ["var(--font-satoshi)", "system-ui", "sans-serif"],
         mono: ["var(--font-geist-mono)"],
       },
     },

@@ -1,23 +1,34 @@
 import { NextResponse } from "next/server";
-import { getMetaAndCtxs, getAllMids } from "@/lib/hyperliquid";
+import { getMetaAndCtxs, getAllMids, getSpotMetaAndCtxs } from "@/lib/hyperliquid";
 import { getMarkets } from "@/lib/coingecko";
 import { HL_PERP_SECTOR_MAP, HL_SPOT_STOCKS, SECTORS } from "@/config/sectors";
 import { AssetData } from "@/lib/types";
 import { cache } from "@/lib/cache";
-
 
 export async function GET() {
   try {
     const cached = cache.get<AssetData[]>("api:markets");
     if (cached) return NextResponse.json(cached);
 
-    const [hlData, allMids, cgData] = await Promise.all([
+    const [hlData, allMids, spotData, cgData] = await Promise.all([
       getMetaAndCtxs(),
       getAllMids(),
+      getSpotMetaAndCtxs().catch(() => null),
       getMarkets(),
     ]);
 
     const assets: AssetData[] = [];
+
+    // Build spot context lookup by @name
+    const spotCtxByName = new Map<string, { prevDayPx: string; dayNtlVlm: string; midPx: string | null }>();
+    if (spotData) {
+      for (let i = 0; i < spotData.meta.universe.length; i++) {
+        const name = spotData.meta.universe[i].name;
+        if (HL_SPOT_STOCKS[name]) {
+          spotCtxByName.set(name, spotData.spotCtxs[i]);
+        }
+      }
+    }
 
     // Hyperliquid perps
     const { meta, assetCtxs } = hlData;
@@ -58,6 +69,13 @@ export async function GET() {
       if (!midPx) continue;
 
       const price = parseFloat(midPx);
+      const spotCtx = spotCtxByName.get(spotName);
+      const prevDayPx = spotCtx ? parseFloat(spotCtx.prevDayPx || "0") : 0;
+      const volume = spotCtx ? parseFloat(spotCtx.dayNtlVlm || "0") : 0;
+      // Spot prevDayPx can be wildly off for some HIP-3 pairs — sanity check: reject changes > 50%
+      const rawChange = prevDayPx > 0 ? ((price - prevDayPx) / prevDayPx) * 100 : null;
+      const change24h = rawChange !== null && Math.abs(rawChange) < 20 ? rawChange : null;
+
       assets.push({
         symbol: info.ticker,
         name: info.label,
@@ -66,9 +84,9 @@ export async function GET() {
         price,
         change1h: null,
         change4h: null,
-        change24h: null,
+        change24h,
         change7d: null,
-        volume24h: 0,
+        volume24h: volume,
         fundingRate: null,
         openInterest: null,
         markPrice: price,
