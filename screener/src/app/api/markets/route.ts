@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
 import { getMetaAndCtxs, getAllMids, getSpotMetaAndCtxs } from "@/lib/hyperliquid";
 import { getMarkets } from "@/lib/coingecko";
-import { HL_PERP_SECTOR_MAP, HL_SPOT_STOCKS, SECTORS } from "@/config/sectors";
+import { HL_PERP_SECTOR_MAP, HL_SPOT_STOCKS, SECTORS, Sector } from "@/config/sectors";
 import { AssetData } from "@/lib/types";
 import { cache } from "@/lib/cache";
 
@@ -30,31 +30,48 @@ export async function GET() {
       }
     }
 
-    // Hyperliquid perps
+    // ALL Hyperliquid perps — use sector map if available, otherwise auto-classify
     const { meta, assetCtxs } = hlData;
     for (let i = 0; i < meta.universe.length; i++) {
       const name = meta.universe[i].name;
-      const mapping = HL_PERP_SECTOR_MAP[name];
-      if (!mapping) continue;
-
       const ctx = assetCtxs[i];
+
       let price = parseFloat(ctx.markPx || "0");
       let prevDayPx = parseFloat(ctx.prevDayPx || "0");
-      // SPX perp is fractional (~0.287 = SPX/20000)
       if (name === "SPX") { price *= 20000; prevDayPx *= 20000; }
       const change24h = prevDayPx > 0 ? ((price - prevDayPx) / prevDayPx) * 100 : null;
+      const volume = parseFloat(ctx.dayNtlVlm || "0");
+
+      // Skip zero-price assets
+      if (price === 0) continue;
+
+      const mapping = HL_PERP_SECTOR_MAP[name];
+      let sector: Sector;
+      let label: string;
+      let sectorColor: string;
+
+      if (mapping) {
+        sector = mapping.sector;
+        label = mapping.label;
+        sectorColor = SECTORS[sector].color;
+      } else {
+        // Auto-classify unmapped perps as crypto-alt
+        sector = "crypto-alt";
+        label = name;
+        sectorColor = SECTORS["crypto-alt"].color;
+      }
 
       assets.push({
         symbol: name,
-        name: mapping.label,
-        sector: mapping.sector,
-        sectorColor: SECTORS[mapping.sector].color,
+        name: label,
+        sector,
+        sectorColor,
         price,
         change1h: null,
         change4h: null,
         change24h,
         change7d: null,
-        volume24h: parseFloat(ctx.dayNtlVlm || "0"),
+        volume24h: volume,
         fundingRate: parseFloat(ctx.funding || "0"),
         openInterest: parseFloat(ctx.openInterest || "0"),
         markPrice: price,
@@ -72,7 +89,6 @@ export async function GET() {
       const spotCtx = spotCtxByName.get(spotName);
       const prevDayPx = spotCtx ? parseFloat(spotCtx.prevDayPx || "0") : 0;
       const volume = spotCtx ? parseFloat(spotCtx.dayNtlVlm || "0") : 0;
-      // Spot prevDayPx can be wildly off for some HIP-3 pairs — sanity check: reject changes > 50%
       const rawChange = prevDayPx > 0 ? ((price - prevDayPx) / prevDayPx) * 100 : null;
       const change24h = rawChange !== null && Math.abs(rawChange) < 20 ? rawChange : null;
 
@@ -97,7 +113,7 @@ export async function GET() {
 
     // CoinGecko assets
     for (const coin of cgData) {
-      const sector = (coin.market_cap_rank || 999) <= 10 ? "crypto-major" : "crypto-alt";
+      const sector: Sector = (coin.market_cap_rank || 999) <= 10 ? "crypto-major" : "crypto-alt";
       assets.push({
         symbol: coin.symbol.toUpperCase(),
         name: coin.name,
