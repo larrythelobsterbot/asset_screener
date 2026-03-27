@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import React, { useState } from "react";
 import MacroBar from "@/components/MacroBar";
 import TimeframeToggle, { Timeframe } from "@/components/TimeframeToggle";
 import Heatmap from "@/components/Heatmap";
@@ -12,7 +12,23 @@ export default function Home() {
   const [timeframe, setTimeframe] = useState<Timeframe>("24h");
   const [selectedAsset, setSelectedAsset] = useState<string | null>(null);
   const [showWatchlist, setShowWatchlist] = useState(false);
+  const [allowedSymbols, setAllowedSymbols] = useState<Set<string> | null>(null);
   const { watchlist, toggle, count } = useWatchlist();
+
+  // Load markets data to get allowed symbols
+  React.useEffect(() => {
+    fetch("/api/markets")
+      .then((r) => r.json())
+      .then((data: any[]) => {
+        if (Array.isArray(data)) {
+          setAllowedSymbols(new Set(data.map((a) => a.symbol)));
+        }
+      })
+      .catch(() => {
+        // On error, set to empty set so all signals are hidden
+        setAllowedSymbols(new Set());
+      });
+  }, []);
 
   return (
     <div className="min-h-screen flex flex-col">
@@ -53,7 +69,7 @@ export default function Home() {
       />
 
       <div className="px-4 pb-6 mt-2">
-        <SignalScanner onSelectAsset={setSelectedAsset} />
+        <SignalScanner onSelectAsset={setSelectedAsset} allowedSymbols={allowedSymbols} />
       </div>
 
       {selectedAsset && (

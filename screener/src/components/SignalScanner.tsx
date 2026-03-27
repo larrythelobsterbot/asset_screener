@@ -7,12 +7,18 @@ import SignalTable from "./SignalTable";
 
 interface Props {
   onSelectAsset: (symbol: string) => void;
+  allowedSymbols: Set<string> | null; // null = not loaded yet, show all
 }
 
-export default function SignalScanner({ onSelectAsset }: Props) {
+export default function SignalScanner({ onSelectAsset, allowedSymbols }: Props) {
   const [signals, setSignals] = useState<Signal[]>([]);
   const [view, setView] = useState<"feed" | "table">("feed");
   const [loading, setLoading] = useState(true);
+
+  const visibleSignals =
+    allowedSymbols === null
+      ? signals
+      : signals.filter((s) => allowedSymbols.has(s.symbol));
 
   useEffect(() => {
     const fetchSignals = () =>
@@ -38,7 +44,7 @@ export default function SignalScanner({ onSelectAsset }: Props) {
             Signal Scanner
           </span>
           <span className="text-[10px] font-mono text-gray-600 bg-gray-800/50 px-1.5 py-0.5 rounded">
-            {signals.length}
+            {visibleSignals.length}
           </span>
         </div>
         <div className="flex items-center gap-1 bg-surface rounded-lg p-0.5">
@@ -70,9 +76,9 @@ export default function SignalScanner({ onSelectAsset }: Props) {
             Scanning for signals...
           </div>
         ) : view === "feed" ? (
-          <SignalFeed signals={signals} onSelectAsset={onSelectAsset} />
+          <SignalFeed signals={visibleSignals} onSelectAsset={onSelectAsset} />
         ) : (
-          <SignalTable signals={signals} onSelectAsset={onSelectAsset} />
+          <SignalTable signals={visibleSignals} onSelectAsset={onSelectAsset} />
         )}
       </div>
     </div>
