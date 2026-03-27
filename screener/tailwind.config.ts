@@ -12,6 +12,7 @@ const config: Config = {
         base: "#0A0A0F",
         surface: "#111827",
         "surface-light": "#1F2937",
+        "sector-majors": "#F0B90B",
         "sector-l1": "#3B82F6",
         "sector-defi": "#10B981",
         "sector-meme": "#EC4899",

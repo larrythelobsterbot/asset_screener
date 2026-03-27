@@ -1,4 +1,5 @@
 export type Sector =
+  | "majors"
   | "l1"
   | "defi"
   | "meme"
@@ -19,6 +20,7 @@ export interface SectorConfig {
 }
 
 export const SECTORS: Record<Sector, SectorConfig> = {
+  majors: { id: "majors", label: "Majors", color: "#F0B90B" },
   stocks: { id: "stocks", label: "Stocks", color: "#3B82F6" },
   indices: { id: "indices", label: "Indices", color: "#FCD34D" },
   commodities: { id: "commodities", label: "Commodities", color: "#F59E0B" },
@@ -35,10 +37,13 @@ export const SECTORS: Record<Sector, SectorConfig> = {
 
 // Hyperliquid PERP ticker → sector mapping
 export const HL_PERP_SECTOR_MAP: Record<string, { sector: Sector; label: string }> = {
+  // Majors
+  BTC: { sector: "majors", label: "Bitcoin" },
+  ETH: { sector: "majors", label: "Ethereum" },
+  SOL: { sector: "majors", label: "Solana" },
+  BNB: { sector: "majors", label: "BNB" },
+  XRP: { sector: "majors", label: "Ripple" },
   // Layer 1s
-  BTC: { sector: "l1", label: "Bitcoin" },
-  ETH: { sector: "l1", label: "Ethereum" },
-  SOL: { sector: "l1", label: "Solana" },
   AVAX: { sector: "l1", label: "Avalanche" },
   SUI: { sector: "l1", label: "Sui" },
   APT: { sector: "l1", label: "Aptos" },
@@ -53,8 +58,6 @@ export const HL_PERP_SECTOR_MAP: Record<string, { sector: Sector; label: string 
   BERA: { sector: "l1", label: "Berachain" },
   ADA: { sector: "l1", label: "Cardano" },
   TON: { sector: "l1", label: "Toncoin" },
-  XRP: { sector: "l1", label: "Ripple" },
-  BNB: { sector: "l1", label: "BNB" },
   // DeFi
   AAVE: { sector: "defi", label: "Aave" },
   UNI: { sector: "defi", label: "Uniswap" },

@@ -15,7 +15,7 @@ interface Props {
 }
 
 const SECTOR_ORDER: Sector[] = [
-  "stocks", "indices", "commodities", "preipo",
+  "majors", "stocks", "indices", "commodities", "preipo",
   "l1", "defi", "ai", "infra", "meme", "gaming",
   "crypto-major", "crypto-alt",
 ];
