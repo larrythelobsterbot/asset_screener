@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
-import { getMetaAndCtxs, getAllMids, getSpotMetaAndCtxs } from "@/lib/hyperliquid";
+import { getMetaAndCtxs } from "@/lib/hyperliquid";
 import { getMarkets } from "@/lib/coingecko";
-import { HL_PERP_SECTOR_MAP, HL_SPOT_STOCKS, SECTORS, Sector } from "@/config/sectors";
+import { HL_PERP_SECTOR_MAP, SECTORS, Sector } from "@/config/sectors";
 import { AssetData } from "@/lib/types";
 import { cache } from "@/lib/cache";
 
@@ -10,25 +10,12 @@ export async function GET() {
     const cached = cache.get<AssetData[]>("api:markets");
     if (cached) return NextResponse.json(cached);
 
-    const [hlData, allMids, spotData, cgData] = await Promise.all([
+    const [hlData, cgData] = await Promise.all([
       getMetaAndCtxs(),
-      getAllMids(),
-      getSpotMetaAndCtxs().catch(() => null),
       getMarkets(),
     ]);
 
     const assets: AssetData[] = [];
-
-    // Build spot context lookup by @name
-    const spotCtxByName = new Map<string, { prevDayPx: string; dayNtlVlm: string; midPx: string | null }>();
-    if (spotData) {
-      for (let i = 0; i < spotData.meta.universe.length; i++) {
-        const name = spotData.meta.universe[i].name;
-        if (HL_SPOT_STOCKS[name]) {
-          spotCtxByName.set(name, spotData.spotCtxs[i]);
-        }
-      }
-    }
 
     // ALL Hyperliquid perps — use sector map if available, otherwise auto-classify
     const { meta, assetCtxs } = hlData;
@@ -80,37 +67,6 @@ export async function GET() {
       });
     }
 
-    // Hyperliquid HIP-3 spot stocks
-    for (const [spotName, info] of Object.entries(HL_SPOT_STOCKS)) {
-      const midPx = allMids[spotName];
-      if (!midPx) continue;
-
-      const price = parseFloat(midPx);
-      const spotCtx = spotCtxByName.get(spotName);
-      const prevDayPx = spotCtx ? parseFloat(spotCtx.prevDayPx || "0") : 0;
-      const volume = spotCtx ? parseFloat(spotCtx.dayNtlVlm || "0") : 0;
-      const rawChange = prevDayPx > 0 ? ((price - prevDayPx) / prevDayPx) * 100 : null;
-      const change24h = rawChange !== null && Math.abs(rawChange) < 20 ? rawChange : null;
-
-      assets.push({
-        symbol: info.ticker,
-        name: info.label,
-        sector: info.sector,
-        sectorColor: SECTORS[info.sector].color,
-        price,
-        change1h: null,
-        change4h: null,
-        change24h,
-        change7d: null,
-        volume24h: volume,
-        fundingRate: null,
-        openInterest: null,
-        markPrice: price,
-        oraclePrice: null,
-        source: "hyperliquid",
-      });
-    }
-
     // CoinGecko assets
     for (const coin of cgData) {
       const sector: Sector = (coin.market_cap_rank || 999) <= 10 ? "crypto-major" : "crypto-alt";
@@ -134,7 +90,9 @@ export async function GET() {
     }
 
     cache.set("api:markets", assets, 30_000);
-    return NextResponse.json(assets);
+    return NextResponse.json(assets, {
+      headers: { "Cache-Control": "no-store, no-cache, must-revalidate", "CDN-Cache-Control": "no-store" },
+    });
   } catch (err) {
     const stale = cache.getStale<AssetData[]>("api:markets");
     if (stale) return NextResponse.json(stale);
