@@ -23,6 +23,7 @@ export default function Home() {
 
   // Markets data — single source of truth for filtering
   const [allAssets, setAllAssets] = useState<AssetData[]>([]);
+  const [isLoading, setIsLoading] = useState(true);
 
   useEffect(() => {
     async function load() {
@@ -32,6 +33,8 @@ export default function Home() {
         // On error: keep existing state (don't hide signals)
       } catch {
         // ignore — keep existing allAssets
+      } finally {
+        setIsLoading(false);
       }
     }
     load();
@@ -114,6 +117,7 @@ export default function Home() {
 
       <Heatmap
         assets={filteredAssets}
+        isLoading={isLoading}
         timeframe={timeframe}
         onSelectAsset={setSelectedAsset}
         showWatchlistOnly={showWatchlist}

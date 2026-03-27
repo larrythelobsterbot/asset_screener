@@ -7,6 +7,7 @@ import { Timeframe } from "./TimeframeToggle";
 
 interface Props {
   assets: AssetData[];              // pre-filtered by page.tsx
+  isLoading: boolean;
   timeframe: Timeframe;
   onSelectAsset: (symbol: string) => void;
   showWatchlistOnly: boolean;
@@ -20,7 +21,7 @@ const SECTOR_ORDER: Sector[] = [
   "crypto-major", "crypto-alt",
 ];
 
-export default function Heatmap({ assets, timeframe, onSelectAsset, showWatchlistOnly, watchlist, onToggleWatch }: Props) {
+export default function Heatmap({ assets, isLoading, timeframe, onSelectAsset, showWatchlistOnly, watchlist, onToggleWatch }: Props) {
   const filtered = showWatchlistOnly
     ? assets.filter((a) => watchlist.has(a.symbol))
     : assets;
@@ -40,6 +41,17 @@ export default function Heatmap({ assets, timeframe, onSelectAsset, showWatchlis
   const activeSectors = SECTOR_ORDER.filter(
     (s) => grouped.has(s) && grouped.get(s)!.length > 0
   );
+
+  if (isLoading) {
+    return (
+      <div className="flex-1 flex items-center justify-center py-20">
+        <div className="flex flex-col items-center gap-3">
+          <div className="w-8 h-8 border-2 border-white/20 border-t-white/60 rounded-full animate-spin" />
+          <span className="text-sm text-gray-500">Loading markets...</span>
+        </div>
+      </div>
+    );
+  }
 
   if (showWatchlistOnly && activeSectors.length === 0) {
     return (

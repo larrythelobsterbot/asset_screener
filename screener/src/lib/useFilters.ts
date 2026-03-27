@@ -11,7 +11,7 @@ export interface FilterState {
 const DEFAULT_FILTERS: FilterState = { minVolume: null, minOI: null };
 const STORAGE_KEY = "asset-screener-filters";
 
-/** Pure helper — exported so Heatmap and page.tsx share the same logic */
+/** Pure helper — exported so page.tsx can apply filter logic against the markets data */
 export function passesFilters(asset: AssetData, filters: FilterState): boolean {
   if (filters.minVolume !== null && asset.volume24h < filters.minVolume) {
     return false;
