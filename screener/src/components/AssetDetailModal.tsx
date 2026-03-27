@@ -1,7 +1,13 @@
 "use client";
 
 import { useEffect, useState, useCallback } from "react";
-import { HL_PERP_SECTOR_MAP, SECTORS } from "@/config/sectors";
+import { HL_PERP_SECTOR_MAP, HL_SPOT_STOCKS, SECTORS } from "@/config/sectors";
+
+// Reverse lookup: ticker → spot info
+const TICKER_TO_SPOT_INFO: Record<string, { sector: string; label: string }> = {};
+for (const info of Object.values(HL_SPOT_STOCKS)) {
+  TICKER_TO_SPOT_INFO[info.ticker] = { sector: info.sector, label: info.label };
+}
 import PriceChart from "./PriceChart";
 
 interface AssetDetail {
@@ -79,9 +85,11 @@ export default function AssetDetailModal({ symbol, onClose }: Props) {
     return () => window.removeEventListener("keydown", handleEsc);
   }, [onClose]);
 
-  const mapping = HL_PERP_SECTOR_MAP[symbol];
-  const sectorColor = mapping ? SECTORS[mapping.sector].color : "#64748B";
-  const sectorLabel = mapping ? SECTORS[mapping.sector].label : "Unknown";
+  const perpMapping = HL_PERP_SECTOR_MAP[symbol];
+  const spotMapping = TICKER_TO_SPOT_INFO[symbol];
+  const mapping = perpMapping || spotMapping;
+  const sectorColor = mapping ? SECTORS[mapping.sector as keyof typeof SECTORS]?.color || "#64748B" : "#64748B";
+  const sectorLabel = mapping ? SECTORS[mapping.sector as keyof typeof SECTORS]?.label || mapping.sector : "Unknown";
 
   const lastRsi = data?.indicators.rsi
     ? data.indicators.rsi.filter((v) => v !== null).pop()
