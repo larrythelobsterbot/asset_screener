@@ -112,17 +112,13 @@ export const HL_PERP_SECTOR_MAP: Record<string, { sector: Sector; label: string 
 
 // Hyperliquid HIP-3 SPOT stocks — @N identifier → info
 // These are builder-deployed spot pairs under spotMeta
+// Only include HIP-3 spot pairs with reliable pricing (within ~15% of real price)
+// Many HIP-3 pairs have low liquidity and stale/inaccurate prices
 export const HL_SPOT_STOCKS: Record<string, { ticker: string; sector: Sector; label: string; tokenIndex: number }> = {
   "@264": { ticker: "TSLA", sector: "stocks", label: "Tesla", tokenIndex: 407 },
-  "@265": { ticker: "NVDA", sector: "stocks", label: "NVIDIA", tokenIndex: 408 },
-  "@266": { ticker: "GOOGL", sector: "stocks", label: "Google", tokenIndex: 412 },
-  "@268": { ticker: "AAPL", sector: "stocks", label: "Apple", tokenIndex: 413 },
-  "@271": { ticker: "HOOD", sector: "stocks", label: "Robinhood", tokenIndex: 0 },
-  "@276": { ticker: "GLD", sector: "commodities", label: "Gold ETF (GLD)", tokenIndex: 0 },
   "@279": { ticker: "SPY", sector: "indices", label: "SPY ETF", tokenIndex: 420 },
   "@280": { ticker: "AMZN", sector: "stocks", label: "Amazon", tokenIndex: 421 },
   "@287": { ticker: "META", sector: "stocks", label: "Meta", tokenIndex: 422 },
-  "@288": { ticker: "QQQ", sector: "indices", label: "QQQ ETF", tokenIndex: 426 },
   "@289": { ticker: "MSFT", sector: "stocks", label: "Microsoft", tokenIndex: 429 },
 };
 
