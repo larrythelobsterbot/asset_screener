@@ -50,7 +50,12 @@ export function FilterPanel({ filters, onChange, onClear, onClose }: Props) {
       />
 
       {/* Panel */}
-      <div className="fixed right-0 top-0 z-50 h-full w-72 bg-[#0f0f13] border-l border-white/10 shadow-2xl flex flex-col">
+      <div
+        role="dialog"
+        aria-modal="true"
+        aria-label="Filters"
+        className="fixed right-0 top-0 z-50 h-full w-72 bg-[#0f0f13] border-l border-white/10 shadow-2xl flex flex-col"
+      >
         {/* Header */}
         <div className="flex items-center justify-between px-5 py-4 border-b border-white/10">
           <span className="text-sm font-semibold text-white tracking-wide uppercase">
