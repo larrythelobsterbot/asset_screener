@@ -35,7 +35,15 @@ export function useFilters() {
     if (typeof window === "undefined") return;
     try {
       const raw = localStorage.getItem(STORAGE_KEY);
-      if (raw) setFiltersState(JSON.parse(raw));
+      if (raw) {
+        const parsed = JSON.parse(raw);
+        if (parsed && typeof parsed === "object") {
+          setFiltersState({
+            minVolume: typeof parsed.minVolume === "number" ? parsed.minVolume : null,
+            minOI: typeof parsed.minOI === "number" ? parsed.minOI : null,
+          });
+        }
+      }
     } catch {
       // ignore malformed stored data
     }
