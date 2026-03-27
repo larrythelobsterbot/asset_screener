@@ -20,15 +20,41 @@ function getChange(asset: AssetData, tf: Timeframe): number | null {
   }
 }
 
-function getIntensity(change: number | null): number {
-  if (change === null) return 0;
+// 6-tier color scale — intensity and hue shift as magnitude increases
+function getPerfColor(change: number | null): string {
+  if (change === null) return "rgba(255,255,255,0.03)";
   const abs = Math.abs(change);
-  if (abs < 0.5) return 0.15;
-  if (abs < 1) return 0.3;
-  if (abs < 2) return 0.45;
-  if (abs < 3) return 0.6;
-  if (abs < 5) return 0.8;
-  return 1;
+  if (change >= 0) {
+    if (abs < 0.5)  return "rgba(16,185,129,0.08)";   // near-flat — barely visible
+    if (abs < 1)    return "rgba(16,185,129,0.18)";   // <1% — faint green
+    if (abs < 2)    return "rgba(16,185,129,0.32)";   // 1-2% — light green
+    if (abs < 5)    return "rgba(22,163,74,0.46)";    // 2-5% — medium green
+    if (abs < 10)   return "rgba(22,163,74,0.62)";    // 5-10% — strong green
+    return                  "rgba(21,128,61,0.80)";   // >10%  — deep green
+  } else {
+    if (abs < 0.5)  return "rgba(239,68,68,0.08)";    // near-flat
+    if (abs < 1)    return "rgba(239,68,68,0.18)";    // <1% — faint red
+    if (abs < 2)    return "rgba(239,68,68,0.32)";    // 1-2% — light red
+    if (abs < 5)    return "rgba(220,38,38,0.46)";    // 2-5% — medium red
+    if (abs < 10)   return "rgba(220,38,38,0.62)";    // 5-10% — strong red
+    return                  "rgba(185,28,28,0.80)";   // >10%  — deep red
+  }
+}
+
+function getChangeTextColor(change: number | null): string {
+  if (change === null) return "text-gray-500";
+  const abs = Math.abs(change);
+  if (change >= 0) {
+    if (abs < 1)  return "text-emerald-600";
+    if (abs < 5)  return "text-emerald-400";
+    if (abs < 10) return "text-emerald-300";
+    return               "text-green-200";
+  } else {
+    if (abs < 1)  return "text-red-600";
+    if (abs < 5)  return "text-red-400";
+    if (abs < 10) return "text-red-300";
+    return               "text-red-200";
+  }
 }
 
 function hexToRgb(hex: string): [number, number, number] {
@@ -42,17 +68,10 @@ function hexToRgb(hex: string): [number, number, number] {
 
 export default function HeatmapTile({ asset, timeframe, onClick, isWatched, onToggleWatch }: Props) {
   const change = getChange(asset, timeframe);
-  const intensity = getIntensity(change);
   const isPositive = change !== null && change >= 0;
 
   const [sr, sg, sb] = hexToRgb(asset.sectorColor);
-
-  const perfColor = change === null
-    ? `rgba(${sr}, ${sg}, ${sb}, 0.08)`
-    : isPositive
-    ? `rgba(16, 185, 129, ${intensity * 0.35})`
-    : `rgba(239, 68, 68, ${intensity * 0.35})`;
-
+  const perfColor = getPerfColor(change);
   const sectorTint = `rgba(${sr}, ${sg}, ${sb}, 0.06)`;
 
   return (
@@ -99,13 +118,7 @@ export default function HeatmapTile({ asset, timeframe, onClick, isWatched, onTo
             })}
       </div>
       <div
-        className={`font-mono text-xs mt-0.5 font-semibold ${
-          change === null
-            ? "text-gray-500"
-            : isPositive
-            ? "text-emerald-400"
-            : "text-red-400"
-        }`}
+        className={`font-mono text-xs mt-0.5 font-semibold ${getChangeTextColor(change)}`}
       >
         {change !== null
           ? `${isPositive ? "+" : ""}${change.toFixed(2)}%`
