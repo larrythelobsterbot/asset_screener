@@ -5,6 +5,11 @@ import { detectSignals, detectSectorRelativeStrength, Signal, type SectorSnapsho
 import { cache } from "@/lib/cache";
 import { logSignalFires } from "@/lib/signalPersistence";
 
+// Without this, Next.js 14 prerenders this route statically at build time
+// and serves a frozen snapshot forever. See markets/route.ts for the same
+// fix. All routes that read live market data must opt out of static gen.
+export const dynamic = "force-dynamic";
+
 // Per-scan per-coin failure counts, so we can see at a glance whether a
 // fetch layer is degrading rather than silently swallowing errors.
 interface ScanFailure {

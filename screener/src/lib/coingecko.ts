@@ -17,8 +17,11 @@ export interface CGMarketData {
 }
 
 async function cgGet<T>(path: string): Promise<T> {
+  // Opt out of Next.js 14's fetch caching — our own TTL cache wraps this
+  // function and should be the single source of truth for freshness.
   const res = await fetch(`${CG_API}${path}`, {
     headers: { Accept: "application/json" },
+    cache: "no-store",
   });
   if (res.status === 429) throw new Error("CoinGecko rate limited");
   if (!res.ok) throw new Error(`CoinGecko API error: ${res.status}`);

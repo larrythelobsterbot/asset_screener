@@ -5,6 +5,13 @@ import { HL_PERP_SECTOR_MAP, HL_BUILDER_PERP_MAP, BUILDER_DEXES, SECTORS, Sector
 import { AssetData } from "@/lib/types";
 import { cache } from "@/lib/cache";
 
+// Without this, Next.js 14 App Router prerenders this route at BUILD TIME
+// and the built-in response gets served forever — meaning every price in
+// the response is frozen to whatever Hyperliquid returned during the build
+// step. `force-dynamic` makes Next.js evaluate the handler on every request
+// so our in-memory TTL cache is what actually controls freshness.
+export const dynamic = "force-dynamic";
+
 export async function GET() {
   try {
     const cached = cache.get<AssetData[]>("api:markets");

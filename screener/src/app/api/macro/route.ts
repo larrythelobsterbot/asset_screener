@@ -4,6 +4,10 @@ import { MACRO_INDICATORS } from "@/config/sectors";
 import { MacroData } from "@/lib/types";
 import { cache } from "@/lib/cache";
 
+// Same static-generation bug as markets/signals — opt out so the handler
+// runs per-request and our TTL cache controls freshness.
+export const dynamic = "force-dynamic";
+
 export async function GET() {
   try {
     const cached = cache.get<MacroData[]>("api:macro");
