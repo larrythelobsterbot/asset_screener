@@ -1,14 +1,16 @@
 {
   "name": "screener",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "scripts": {
     "dev": "next dev",
     "build": "next build",
     "start": "next start -p 3003",
-    "lint": "next lint"
+    "lint": "next lint",
+    "test": "node --test --import tsx --test-reporter=spec 'src/lib/__tests__/*.test.ts'"
   },
   "dependencies": {
+    "@supabase/supabase-js": "^2.103.3",
     "lightweight-charts": "^5.1.0",
     "next": "14.2.35",
     "react": "^18",
@@ -22,6 +24,7 @@
     "eslint-config-next": "14.2.35",
     "postcss": "^8",
     "tailwindcss": "^3.4.1",
+    "tsx": "^4.21.0",
     "typescript": "^5"
   }
 }

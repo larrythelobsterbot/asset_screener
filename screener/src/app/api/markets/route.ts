@@ -26,6 +26,12 @@ export async function GET() {
 
       let price = parseFloat(ctx.markPx || "0");
       let prevDayPx = parseFloat(ctx.prevDayPx || "0");
+      // HL's SPX perp is quoted as (index / 20000) — i.e. 1 unit = 1/20000th
+      // of the S&P 500 index level — so we scale back up here to display a
+      // number that matches the familiar SPX value (e.g. 5200, not 0.26).
+      // This multiplier is specific to HL's SPX contract; if they ever list
+      // an un-scaled SPX market (or rename this one) this branch becomes
+      // wrong and should be revisited.
       if (name === "SPX") { price *= 20000; prevDayPx *= 20000; }
       const change24h = prevDayPx > 0 ? ((price - prevDayPx) / prevDayPx) * 100 : null;
       const volume = parseFloat(ctx.dayNtlVlm || "0");
@@ -68,9 +74,13 @@ export async function GET() {
       });
     }
 
-    // HIP-3 builder-deployed perps — deduplicate against standard HL perps AND each other
-    // Seed with all standard HL symbols so builder dexes never shadow a native HL market
+    // HIP-3 builder-deployed perps — deduplicate against standard HL perps AND each other.
+    // Precedence rule: native HL markets win over builder DEXes, and among
+    // builder DEXes the first one in BUILDER_DEXES wins. If multiple DEXes
+    // list the same ticker we log it so we can see at a glance when a later
+    // entry is being silently masked (e.g. if pricing diverges noticeably).
     const seenBuilderSymbols = new Set<string>(assets.map((a) => a.symbol));
+    const dedupConflicts: Array<{ ticker: string; loserDex: string; winnerSource: string }> = [];
     for (let di = 0; di < BUILDER_DEXES.length; di++) {
       const dex = BUILDER_DEXES[di];
       const dexData = builderDexResults[di];
@@ -83,8 +93,19 @@ export async function GET() {
         const ticker = rawName.includes(":") ? rawName.split(":")[1] : rawName;
         const mapKey = `${dex}:${ticker}`;
 
-        // Deduplicate: first dex (xyz) wins for each ticker symbol
-        if (seenBuilderSymbols.has(ticker)) continue;
+        // Deduplicate: first dex (xyz) wins for each ticker symbol.
+        // Record the conflict so we can observe drift between venues.
+        if (seenBuilderSymbols.has(ticker)) {
+          const existing = assets.find((a) => a.symbol === ticker);
+          dedupConflicts.push({
+            ticker,
+            loserDex: dex,
+            winnerSource: existing?.source === "hyperliquid" && !existing?.name.startsWith(ticker)
+              ? `hyperliquid-native`
+              : `builder-earlier`,
+          });
+          continue;
+        }
         seenBuilderSymbols.add(ticker);
 
         const ctx = dexCtxs[i];
@@ -119,6 +140,17 @@ export async function GET() {
           source: "hyperliquid",
         });
       }
+    }
+
+    // Surface dedup conflicts once per scan (throttled to not spam logs).
+    if (dedupConflicts.length > 0) {
+      console.info(
+        `[markets] builder-dex dedup suppressed ${dedupConflicts.length} duplicate tickers: ` +
+          dedupConflicts
+            .slice(0, 10)
+            .map((c) => `${c.ticker}@${c.loserDex}<-${c.winnerSource}`)
+            .join(", ")
+      );
     }
 
     // CoinGecko assets — skip any symbol already covered by a Hyperliquid perp

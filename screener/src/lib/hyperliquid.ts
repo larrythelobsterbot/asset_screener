@@ -2,14 +2,104 @@ import { cache } from "./cache";
 
 const HL_API = "https://api.hyperliquid.xyz/info";
 
-async function hlPost<T>(body: Record<string, unknown>): Promise<T> {
-  const res = await fetch(HL_API, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body),
+// ── Token-bucket rate limiter ────────────────────────────────────────────
+// Hyperliquid's published limit is ~1200 req/min per IP on the /info endpoint.
+// We cap ourselves at 10 req/s sustained with a burst of 20, leaving headroom
+// for the future signal-bot process that will share this IP.
+
+const HL_RATE_PER_SEC = 10;
+const HL_BURST = 20;
+
+let hlTokens = HL_BURST;
+let hlLastRefill = Date.now();
+const hlWaitQueue: Array<() => void> = [];
+
+function refillTokens(): void {
+  const now = Date.now();
+  const elapsed = (now - hlLastRefill) / 1000;
+  if (elapsed <= 0) return;
+  hlTokens = Math.min(HL_BURST, hlTokens + elapsed * HL_RATE_PER_SEC);
+  hlLastRefill = now;
+}
+
+function acquireToken(): Promise<void> {
+  refillTokens();
+  if (hlTokens >= 1) {
+    hlTokens -= 1;
+    return Promise.resolve();
+  }
+  // Not enough tokens — queue caller; wake them when the bucket refills.
+  return new Promise((resolve) => {
+    hlWaitQueue.push(resolve);
+    scheduleQueueDrain();
   });
-  if (!res.ok) throw new Error(`Hyperliquid API error: ${res.status}`);
-  return res.json() as Promise<T>;
+}
+
+let drainTimer: ReturnType<typeof setTimeout> | null = null;
+function scheduleQueueDrain(): void {
+  if (drainTimer || hlWaitQueue.length === 0) return;
+  // Time until at least one token is available
+  const missing = Math.max(0, 1 - hlTokens);
+  const waitMs = Math.ceil((missing / HL_RATE_PER_SEC) * 1000);
+  drainTimer = setTimeout(() => {
+    drainTimer = null;
+    refillTokens();
+    while (hlTokens >= 1 && hlWaitQueue.length > 0) {
+      hlTokens -= 1;
+      const resolve = hlWaitQueue.shift()!;
+      resolve();
+    }
+    if (hlWaitQueue.length > 0) scheduleQueueDrain();
+  }, Math.max(10, waitMs));
+}
+
+// Counters for observability — read via getHlRateLimitStats()
+let hlRequestCount = 0;
+let hlErrorCount = 0;
+let hlRateWaitCount = 0;
+
+export function getHlRateLimitStats(): {
+  requests: number;
+  errors: number;
+  rateWaits: number;
+  tokensAvailable: number;
+  queueDepth: number;
+} {
+  refillTokens();
+  return {
+    requests: hlRequestCount,
+    errors: hlErrorCount,
+    rateWaits: hlRateWaitCount,
+    tokensAvailable: Math.floor(hlTokens),
+    queueDepth: hlWaitQueue.length,
+  };
+}
+
+async function hlPost<T>(body: Record<string, unknown>): Promise<T> {
+  if (hlTokens < 1) hlRateWaitCount += 1;
+  await acquireToken();
+  hlRequestCount += 1;
+  try {
+    const res = await fetch(HL_API, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    if (!res.ok) {
+      // Back off hard on 429 — return the tokens so downstream callers don't
+      // stampede, and surface a typed error.
+      if (res.status === 429) {
+        hlTokens = 0;
+        hlLastRefill = Date.now();
+      }
+      hlErrorCount += 1;
+      throw new Error(`Hyperliquid API error: ${res.status}`);
+    }
+    return res.json() as Promise<T>;
+  } catch (err) {
+    hlErrorCount += 1;
+    throw err;
+  }
 }
 
 export interface HLAssetCtx {
@@ -42,23 +132,28 @@ export interface HLCandle {
   n: number;
 }
 
+// These two endpoints are called on every signals scan AND every markets
+// request, so SWR pays off handsomely: on cache expiry, the first caller
+// gets stale data instantly (single-digit ms) and a background refresh
+// fires once — even if ten concurrent callers arrive in that window,
+// they all get the same inflight refresh promise instead of spamming HL.
 export async function getMetaAndCtxs(): Promise<{ meta: HLMeta; assetCtxs: HLAssetCtx[] }> {
-  const cached = cache.get<{ meta: HLMeta; assetCtxs: HLAssetCtx[] }>("hl:metaAndCtxs");
-  if (cached) return cached;
-
-  const data = await hlPost<[HLMeta, HLAssetCtx[]]>({ type: "metaAndAssetCtxs" });
-  const result = { meta: data[0], assetCtxs: data[1] };
-  cache.set("hl:metaAndCtxs", result, 30_000);
-  return result;
+  return cache.getWithRefresh(
+    "hl:metaAndCtxs",
+    async () => {
+      const data = await hlPost<[HLMeta, HLAssetCtx[]]>({ type: "metaAndAssetCtxs" });
+      return { meta: data[0], assetCtxs: data[1] };
+    },
+    30_000
+  );
 }
 
 export async function getAllMids(): Promise<Record<string, string>> {
-  const cached = cache.get<Record<string, string>>("hl:allMids");
-  if (cached) return cached;
-
-  const data = await hlPost<Record<string, string>>({ type: "allMids" });
-  cache.set("hl:allMids", data, 30_000);
-  return data;
+  return cache.getWithRefresh(
+    "hl:allMids",
+    () => hlPost<Record<string, string>>({ type: "allMids" }),
+    30_000
+  );
 }
 
 export async function getCandles(
@@ -124,8 +219,25 @@ export async function getBuilderDexData(dex: string): Promise<{ meta: HLMeta; as
   const cached = cache.get<{ meta: HLMeta; assetCtxs: HLAssetCtx[] }>(cacheKey);
   if (cached) return cached;
 
-  const data = await hlPost<[HLMeta, HLAssetCtx[]]>({ type: "metaAndAssetCtxs", dex });
-  const result = { meta: data[0], assetCtxs: data[1] };
+  // HL's `dex` parameter on `metaAndAssetCtxs` is a relatively recent
+  // addition and the response shape for builder-deployed DEXes isn't
+  // documented as formally as the core endpoint. Validate the tuple shape
+  // defensively so an API change surfaces as a clear error rather than an
+  // opaque runtime failure (undefined.universe, etc).
+  const data = await hlPost<unknown>({ type: "metaAndAssetCtxs", dex });
+  if (
+    !Array.isArray(data) ||
+    data.length < 2 ||
+    typeof data[0] !== "object" ||
+    data[0] === null ||
+    !Array.isArray((data[0] as HLMeta).universe) ||
+    !Array.isArray(data[1])
+  ) {
+    throw new Error(
+      `Hyperliquid builder-dex response for "${dex}" has unexpected shape — API may have changed`
+    );
+  }
+  const result = { meta: data[0] as HLMeta, assetCtxs: data[1] as HLAssetCtx[] };
   cache.set(cacheKey, result, 30_000);
   return result;
 }
