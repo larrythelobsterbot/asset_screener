@@ -119,6 +119,17 @@ export async function getSpotMetaAndCtxs(): Promise<{ meta: HLSpotMeta; spotCtxs
   return result;
 }
 
+export async function getBuilderDexData(dex: string): Promise<{ meta: HLMeta; assetCtxs: HLAssetCtx[] }> {
+  const cacheKey = `hl:builderDex:${dex}`;
+  const cached = cache.get<{ meta: HLMeta; assetCtxs: HLAssetCtx[] }>(cacheKey);
+  if (cached) return cached;
+
+  const data = await hlPost<[HLMeta, HLAssetCtx[]]>({ type: "metaAndAssetCtxs", dex });
+  const result = { meta: data[0], assetCtxs: data[1] };
+  cache.set(cacheKey, result, 30_000);
+  return result;
+}
+
 export async function getFundingHistory(
   coin: string,
   hours: number = 168

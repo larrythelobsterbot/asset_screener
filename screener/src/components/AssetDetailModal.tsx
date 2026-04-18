@@ -1,12 +1,15 @@
 "use client";
 
 import { useEffect, useState, useCallback } from "react";
-import { HL_PERP_SECTOR_MAP, HL_SPOT_STOCKS, SECTORS } from "@/config/sectors";
+import { HL_PERP_SECTOR_MAP, HL_BUILDER_PERP_MAP, ASSET_DESCRIPTIONS, ASSET_HOLDINGS, SECTORS } from "@/config/sectors";
 
-// Reverse lookup: ticker → spot info
-const TICKER_TO_SPOT_INFO: Record<string, { sector: string; label: string }> = {};
-for (const info of Object.values(HL_SPOT_STOCKS)) {
-  TICKER_TO_SPOT_INFO[info.ticker] = { sector: info.sector, label: info.label };
+// Reverse lookup: bare ticker → builder perp info (searches all dexes)
+const BUILDER_TICKER_INFO: Record<string, { sector: string; label: string }> = {};
+for (const [key, info] of Object.entries(HL_BUILDER_PERP_MAP)) {
+  const ticker = key.split(":")[1];
+  if (ticker && !(ticker in BUILDER_TICKER_INFO)) {
+    BUILDER_TICKER_INFO[ticker] = info;
+  }
 }
 import PriceChart from "./PriceChart";
 
@@ -54,6 +57,7 @@ export default function AssetDetailModal({ symbol, onClose }: Props) {
   const [data, setData] = useState<AssetDetail | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
+  const [holdingsOpen, setHoldingsOpen] = useState(false);
 
   const fetchData = useCallback(() => {
     setLoading(true);
@@ -86,10 +90,12 @@ export default function AssetDetailModal({ symbol, onClose }: Props) {
   }, [onClose]);
 
   const perpMapping = HL_PERP_SECTOR_MAP[symbol];
-  const spotMapping = TICKER_TO_SPOT_INFO[symbol];
-  const mapping = perpMapping || spotMapping;
+  const builderMapping = BUILDER_TICKER_INFO[symbol];
+  const mapping = perpMapping || builderMapping;
   const sectorColor = mapping ? SECTORS[mapping.sector as keyof typeof SECTORS]?.color || "#64748B" : "#64748B";
   const sectorLabel = mapping ? SECTORS[mapping.sector as keyof typeof SECTORS]?.label || mapping.sector : "Unknown";
+  const description = ASSET_DESCRIPTIONS[symbol] ?? null;
+  const holdings = ASSET_HOLDINGS[symbol] ?? null;
 
   const lastRsi = data?.indicators.rsi
     ? data.indicators.rsi.filter((v) => v !== null).pop()
@@ -113,19 +119,24 @@ export default function AssetDetailModal({ symbol, onClose }: Props) {
       >
         {/* Header */}
         <div className="flex items-center justify-between p-5 border-b border-white/5">
-          <div className="flex items-center gap-3">
-            <span className="text-xl font-bold text-white">{symbol}</span>
-            <span
-              className="text-[10px] px-2 py-0.5 rounded-full font-medium uppercase tracking-wider"
-              style={{
-                backgroundColor: `${sectorColor}20`,
-                color: sectorColor,
-              }}
-            >
-              {sectorLabel}
-            </span>
-            {mapping && (
-              <span className="text-sm text-gray-400">{mapping.label}</span>
+          <div className="flex flex-col gap-1.5">
+            <div className="flex items-center gap-3">
+              <span className="text-xl font-bold text-white">{symbol}</span>
+              <span
+                className="text-[10px] px-2 py-0.5 rounded-full font-medium uppercase tracking-wider"
+                style={{
+                  backgroundColor: `${sectorColor}20`,
+                  color: sectorColor,
+                }}
+              >
+                {sectorLabel}
+              </span>
+              {mapping && (
+                <span className="text-sm text-gray-400">{mapping.label}</span>
+              )}
+            </div>
+            {description && (
+              <p className="text-xs text-gray-500 max-w-[680px] leading-relaxed">{description}</p>
             )}
           </div>
           <button
@@ -332,6 +343,31 @@ export default function AssetDetailModal({ symbol, onClose }: Props) {
                       </span>
                     ))}
                   </div>
+                </div>
+              )}
+
+              {/* Holdings */}
+              {holdings && (
+                <div className="mt-5 border border-white/5 rounded-xl overflow-hidden">
+                  <button
+                    onClick={() => setHoldingsOpen((o) => !o)}
+                    className="w-full flex items-center justify-between px-4 py-3 text-left hover:bg-white/5 transition-colors"
+                  >
+                    <span className="text-[10px] text-gray-500 uppercase tracking-wider font-medium">
+                      Top Holdings ({holdings.length})
+                    </span>
+                    <span className="text-gray-600 text-xs">{holdingsOpen ? "▲" : "▼"}</span>
+                  </button>
+                  {holdingsOpen && (
+                    <div className="px-4 pb-4 grid grid-cols-2 gap-x-6 gap-y-1.5">
+                      {holdings.map((h, i) => (
+                        <div key={i} className="flex items-center gap-2 text-xs text-gray-400">
+                          <span className="text-gray-700 font-mono w-4 text-right shrink-0">{i + 1}</span>
+                          <span>{h}</span>
+                        </div>
+                      ))}
+                    </div>
+                  )}
                 </div>
               )}
             </>

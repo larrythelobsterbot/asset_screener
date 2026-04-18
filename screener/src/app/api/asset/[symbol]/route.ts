@@ -2,7 +2,7 @@ import { NextResponse } from "next/server";
 import { getCandles, getFundingHistory, getMetaAndCtxs, getAllMids } from "@/lib/hyperliquid";
 import { computeAllIndicators } from "@/lib/indicators";
 import { detectSignals } from "@/lib/signals";
-import { HL_PERP_SECTOR_MAP, HL_SPOT_STOCKS } from "@/config/sectors";
+import { HL_SPOT_STOCKS } from "@/config/sectors";
 
 // Reverse lookup: ticker → @name for spot stocks
 const TICKER_TO_SPOT: Record<string, string> = {};
@@ -17,21 +17,15 @@ export async function GET(
   const { symbol } = params;
 
   try {
-    const isHLPerp = !!HL_PERP_SECTOR_MAP[symbol];
     const spotName = TICKER_TO_SPOT[symbol]; // e.g. "@287" for META
     const isSpotStock = !!spotName;
 
-    if (!isHLPerp && !isSpotStock) {
-      return NextResponse.json({ error: "Asset not found" }, { status: 404 });
-    }
-
-    // For perps, use the symbol directly for candles
-    // For spot stocks, use the @N name for candles
-    const candleCoin = isHLPerp ? symbol : spotName;
+    // For spot stocks, use the @N name for candles; otherwise try as perp directly
+    const candleCoin = isSpotStock ? spotName : symbol;
 
     const [candles, funding, hlData, allMids] = await Promise.all([
       getCandles(candleCoin, "4h", 350).catch(() => []),
-      isHLPerp ? getFundingHistory(symbol).catch(() => []) : Promise.resolve([]),
+      !isSpotStock ? getFundingHistory(symbol).catch(() => []) : Promise.resolve([]),
       getMetaAndCtxs(),
       getAllMids(),
     ]);

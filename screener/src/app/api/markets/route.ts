@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
-import { getMetaAndCtxs } from "@/lib/hyperliquid";
+import { getMetaAndCtxs, getBuilderDexData } from "@/lib/hyperliquid";
 import { getMarkets } from "@/lib/coingecko";
-import { HL_PERP_SECTOR_MAP, SECTORS, Sector } from "@/config/sectors";
+import { HL_PERP_SECTOR_MAP, HL_BUILDER_PERP_MAP, BUILDER_DEXES, SECTORS, Sector } from "@/config/sectors";
 import { AssetData } from "@/lib/types";
 import { cache } from "@/lib/cache";
 
@@ -10,9 +10,10 @@ export async function GET() {
     const cached = cache.get<AssetData[]>("api:markets");
     if (cached) return NextResponse.json(cached);
 
-    const [hlData, cgData] = await Promise.all([
+    const [hlData, cgData, ...builderDexResults] = await Promise.all([
       getMetaAndCtxs(),
       getMarkets(),
+      ...BUILDER_DEXES.map((dex) => getBuilderDexData(dex).catch(() => null)),
     ]);
 
     const assets: AssetData[] = [];
@@ -67,11 +68,67 @@ export async function GET() {
       });
     }
 
-    // CoinGecko assets
+    // HIP-3 builder-deployed perps — deduplicate against standard HL perps AND each other
+    // Seed with all standard HL symbols so builder dexes never shadow a native HL market
+    const seenBuilderSymbols = new Set<string>(assets.map((a) => a.symbol));
+    for (let di = 0; di < BUILDER_DEXES.length; di++) {
+      const dex = BUILDER_DEXES[di];
+      const dexData = builderDexResults[di];
+      if (!dexData) continue;
+
+      const { meta: dexMeta, assetCtxs: dexCtxs } = dexData;
+      for (let i = 0; i < dexMeta.universe.length; i++) {
+        const rawName = dexMeta.universe[i].name; // e.g. "xyz:TSLA" or "TSLA"
+        // Strip the dex prefix if present in the ticker itself
+        const ticker = rawName.includes(":") ? rawName.split(":")[1] : rawName;
+        const mapKey = `${dex}:${ticker}`;
+
+        // Deduplicate: first dex (xyz) wins for each ticker symbol
+        if (seenBuilderSymbols.has(ticker)) continue;
+        seenBuilderSymbols.add(ticker);
+
+        const ctx = dexCtxs[i];
+        const price = parseFloat(ctx.markPx || "0");
+        const volume = parseFloat(ctx.dayNtlVlm || "0");
+        // Skip ghost listings — no price or no trading activity
+        if (price === 0 || volume === 0) continue;
+
+        const prevDayPx = parseFloat(ctx.prevDayPx || "0");
+        const change24h = prevDayPx > 0 ? ((price - prevDayPx) / prevDayPx) * 100 : null;
+
+        const mapping = HL_BUILDER_PERP_MAP[mapKey];
+        const sector: Sector = mapping?.sector ?? "crypto-alt";
+        const label: string = mapping?.label ?? ticker;
+        const sectorColor = SECTORS[sector].color;
+
+        assets.push({
+          symbol: ticker,
+          name: label,
+          sector,
+          sectorColor,
+          price,
+          change1h: null,
+          change4h: null,
+          change24h,
+          change7d: null,
+          volume24h: volume,
+          fundingRate: parseFloat(ctx.funding || "0"),
+          openInterest: parseFloat(ctx.openInterest || "0"),
+          markPrice: price,
+          oraclePrice: parseFloat(ctx.oraclePx || "0"),
+          source: "hyperliquid",
+        });
+      }
+    }
+
+    // CoinGecko assets — skip any symbol already covered by a Hyperliquid perp
+    const hlSymbols = new Set(assets.map((a) => a.symbol));
     for (const coin of cgData) {
+      const sym = coin.symbol.toUpperCase();
+      if (hlSymbols.has(sym)) continue; // HL perp data takes precedence
       const sector: Sector = (coin.market_cap_rank || 999) <= 10 ? "crypto-major" : "crypto-alt";
       assets.push({
-        symbol: coin.symbol.toUpperCase(),
+        symbol: sym,
         name: coin.name,
         sector,
         sectorColor: SECTORS[sector].color,
