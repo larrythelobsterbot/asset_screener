@@ -4,6 +4,7 @@ import { useState, useEffect } from "react";
 import MacroBar from "@/components/MacroBar";
 import TimeframeToggle, { Timeframe } from "@/components/TimeframeToggle";
 import Heatmap from "@/components/Heatmap";
+import ScreenerTable from "@/components/ScreenerTable";
 import SignalScanner from "@/components/SignalScanner";
 import AssetDetailModal from "@/components/AssetDetailModal";
 import { FilterPanel } from "@/components/FilterPanel";
@@ -11,11 +12,30 @@ import { useWatchlist } from "@/lib/useWatchlist";
 import { useFilters, passesFilters } from "@/lib/useFilters";
 import { AssetData } from "@/lib/types";
 
+type View = "heatmap" | "table";
+const VIEW_STORAGE_KEY = "asset-screener-view";
+
 export default function Home() {
   const [timeframe, setTimeframe] = useState<Timeframe>("24h");
   const [selectedAsset, setSelectedAsset] = useState<string | null>(null);
   const [showWatchlist, setShowWatchlist] = useState(false);
   const { watchlist, toggle, count } = useWatchlist();
+
+  // View toggle (heatmap | table). Persisted to localStorage so reloads
+  // stick on the last-used surface. Default = heatmap so existing users
+  // see exactly what they had before.
+  const [view, setView] = useState<View>("heatmap");
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const stored = localStorage.getItem(VIEW_STORAGE_KEY);
+    if (stored === "table" || stored === "heatmap") setView(stored);
+  }, []);
+  function changeView(next: View) {
+    setView(next);
+    if (typeof window !== "undefined") {
+      localStorage.setItem(VIEW_STORAGE_KEY, next);
+    }
+  }
 
   // Filter state
   const { filters, setFilter, clearFilters, activeCount } = useFilters();
@@ -71,6 +91,32 @@ export default function Home() {
           <span className="text-gray-500">Screener</span>
         </h1>
         <div className="flex items-center gap-3">
+          {/* View toggle: Heatmap | Table */}
+          <div className="flex items-center gap-1 bg-surface rounded-lg p-1">
+            <button
+              onClick={() => changeView("heatmap")}
+              className={`px-3 py-1 rounded-md text-xs font-medium transition-all ${
+                view === "heatmap"
+                  ? "bg-white/10 text-white"
+                  : "text-gray-500 hover:text-gray-300"
+              }`}
+              title="Heatmap view"
+            >
+              Heatmap
+            </button>
+            <button
+              onClick={() => changeView("table")}
+              className={`px-3 py-1 rounded-md text-xs font-medium transition-all ${
+                view === "table"
+                  ? "bg-white/10 text-white"
+                  : "text-gray-500 hover:text-gray-300"
+              }`}
+              title="Table view"
+            >
+              Table
+            </button>
+          </div>
+
           {/* Filters button */}
           <button
             onClick={() => setFilterPanelOpen((prev) => !prev)}
@@ -115,15 +161,27 @@ export default function Home() {
         </div>
       </div>
 
-      <Heatmap
-        assets={filteredAssets}
-        isLoading={isLoading}
-        timeframe={timeframe}
-        onSelectAsset={setSelectedAsset}
-        showWatchlistOnly={showWatchlist}
-        watchlist={watchlist}
-        onToggleWatch={toggle}
-      />
+      {view === "heatmap" ? (
+        <Heatmap
+          assets={filteredAssets}
+          isLoading={isLoading}
+          timeframe={timeframe}
+          onSelectAsset={setSelectedAsset}
+          showWatchlistOnly={showWatchlist}
+          watchlist={watchlist}
+          onToggleWatch={toggle}
+        />
+      ) : (
+        <ScreenerTable
+          assets={filteredAssets}
+          isLoading={isLoading}
+          timeframe={timeframe}
+          onSelectAsset={setSelectedAsset}
+          showWatchlistOnly={showWatchlist}
+          watchlist={watchlist}
+          onToggleWatch={toggle}
+        />
+      )}
 
       <div className="px-4 pb-6 mt-2">
         <SignalScanner
