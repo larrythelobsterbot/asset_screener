@@ -22,6 +22,9 @@ import {
   recordEventFire,
   kvGet,
   kvSet,
+  insertSocialSnapshots,
+  latestSocialSnapshots,
+  pruneSocialSnapshots,
 } from "../db";
 
 test("price_snapshots round-trip + latestSnapshots returns newest per symbol", () => {
@@ -92,6 +95,29 @@ test("event_history persists fire timestamps and survives reload", () => {
   recordEventFire("EVTSYM", "rsi_overbought", 1_234_567_999); // overwrite
   const h = loadEventHistory();
   assert.equal(h.get("EVTSYM:rsi_overbought"), 1_234_567_999, "latest fire should win");
+});
+
+test("social_snapshots round-trip + latestSocialSnapshots returns newest per symbol", () => {
+  const now = Date.now();
+  insertSocialSnapshots([
+    { symbol: "BTC", ts: now - 3_600_000, mention_count: 1200, prev_count: 1100, change_pct: 9.09 },
+    { symbol: "BTC", ts: now,             mention_count: 1300, prev_count: 1200, change_pct: 8.33 },
+    { symbol: "HYPE", ts: now,            mention_count: 800,  prev_count: 600,  change_pct: 33.3 },
+  ]);
+  const latest = latestSocialSnapshots(["BTC", "HYPE"]);
+  assert.equal(latest.get("BTC")?.mention_count, 1300, "BTC newest should win");
+  assert.equal(latest.get("HYPE")?.change_pct, 33.3);
+});
+
+test("pruneSocialSnapshots removes only rows older than the cutoff", () => {
+  const now = Date.now();
+  insertSocialSnapshots([
+    { symbol: "PRUNESOCIAL", ts: now - 1000 * 86_400_000, mention_count: 1, prev_count: null, change_pct: null },
+    { symbol: "PRUNESOCIAL", ts: now,                     mention_count: 2, prev_count: null, change_pct: null },
+  ]);
+  const removed = pruneSocialSnapshots(30 * 86_400_000);
+  assert.ok(removed >= 1);
+  assert.equal(latestSocialSnapshots(["PRUNESOCIAL"]).get("PRUNESOCIAL")?.mention_count, 2);
 });
 
 test("kv get/set round-trip", () => {

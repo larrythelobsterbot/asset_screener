@@ -16,6 +16,7 @@ import Sparkline from "./Sparkline";
 import RSIGauge from "./RSIGauge";
 import MomentumCell from "./MomentumCell";
 import type { ScreenerRow } from "@/app/api/screener/route";
+import type { SocialResponse } from "@/app/api/social/trending/route";
 
 const BUILDER_TICKER_INFO: Record<string, { sector: string; label: string }> = {};
 for (const [key, info] of Object.entries(HL_BUILDER_PERP_MAP)) {
@@ -165,25 +166,45 @@ function ConfRow({ label, hit, detail }: { label: string; hit: boolean; detail: 
 export default function AssetDetailModal({ symbol, onClose }: Props) {
   const [data, setData] = useState<AssetDetail | null>(null);
   const [screenerRow, setScreenerRow] = useState<ScreenerRow | null>(null);
+  const [social, setSocial] = useState<{
+    row: { mention_count: number; prev_count: number | null; change_pct: number | null } | null;
+    rank: number | null;
+    total: number | null;
+  } | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
 
   const fetchData = useCallback(() => {
     setLoading(true);
     setError(null);
-    // Fetch in parallel: per-symbol detail + the screener slice (cached
-    // on the server, so this is essentially free after the first hit).
+    // Fetch in parallel: per-symbol detail + the screener slice + the
+    // social trending list. All three are server-cached so opening
+    // multiple panels in succession costs at most one upstream call to
+    // each backend. Elfa is 1-hour cached → at most 1 credit/hour.
     Promise.all([
       fetch(`/api/asset/${symbol}`).then((r) => {
         if (!r.ok) throw new Error(`Failed to load ${symbol}`);
         return r.json();
       }),
       fetch(`/api/screener?tf=1d`).then((r) => r.json()),
+      fetch(`/api/social/trending?tf=24h`).then((r) => r.ok ? r.json() : null).catch(() => null),
     ])
-      .then(([d, rows]: [AssetDetail, ScreenerRow[]]) => {
+      .then(([d, rows, soc]: [AssetDetail, ScreenerRow[], SocialResponse | null]) => {
         setData(d);
         if (Array.isArray(rows)) {
           setScreenerRow(rows.find((r) => r.symbol === symbol) ?? null);
+        }
+        if (soc && Array.isArray(soc.data)) {
+          // Elfa returns rows already sorted desc by current_count, but
+          // sort again defensively so the rank we compute is stable
+          // even if the API changes its sort.
+          const sorted = [...soc.data].sort((a, b) => b.mention_count - a.mention_count);
+          const idx = sorted.findIndex((r) => r.symbol === symbol);
+          setSocial({
+            row: idx >= 0 ? sorted[idx] : null,
+            rank: idx >= 0 ? idx + 1 : null,
+            total: soc.count,
+          });
         }
         setLoading(false);
       })
@@ -529,6 +550,47 @@ export default function AssetDetailModal({ symbol, onClose }: Props) {
                 </div>
               </section>
 
+              {/* Social — only render if we have data for this symbol */}
+              {social?.row && (
+                <section style={{ marginBottom: 24 }}>
+                  <div className="br-label" style={{ marginBottom: 10, paddingBottom: 6, borderBottom: ".5px solid var(--border-soft)" }}>
+                    Social · 24h
+                  </div>
+                  <div style={{
+                    display: "grid",
+                    gridTemplateColumns: "repeat(3, 1fr)",
+                    gap: 1,
+                    background: "var(--border-soft)",
+                    borderRadius: "var(--radius)",
+                    overflow: "hidden",
+                  }}>
+                    <Stat
+                      label="Mentions"
+                      value={social.row.mention_count.toLocaleString()}
+                    />
+                    <Stat
+                      label="24h Change"
+                      value={social.row.change_pct == null
+                        ? "—"
+                        : `${social.row.change_pct > 0 ? "+" : ""}${social.row.change_pct.toFixed(1)}%`}
+                      tone={
+                        social.row.change_pct == null ? undefined :
+                        social.row.change_pct >= 50 ? "warn" :
+                        social.row.change_pct > 0 ? "up" :
+                        "down"
+                      }
+                    />
+                    <Stat
+                      label="Mindshare Rank"
+                      value={social.rank != null && social.total != null
+                        ? `${social.rank} / ${social.total}`
+                        : "—"}
+                      tone={social.rank != null && social.rank <= 10 ? "warn" : undefined}
+                    />
+                  </div>
+                </section>
+              )}
+
               {/* Confluence */}
               <section style={{ marginBottom: 24 }}>
                 <div className="br-label" style={{ marginBottom: 10, paddingBottom: 6, borderBottom: ".5px solid var(--border-soft)" }}>
@@ -557,6 +619,15 @@ export default function AssetDetailModal({ symbol, onClose }: Props) {
                     hit={momentum.c7d != null && Math.abs(momentum.c7d) >= 10}
                     detail={momentum.c7d != null ? `${momentum.c7d.toFixed(1)}% 7D` : "—"}
                   />
+                  {social?.row && (
+                    <ConfRow
+                      label="Social Spike"
+                      hit={social.row.change_pct != null && social.row.change_pct >= 50}
+                      detail={social.row.change_pct != null
+                        ? `${social.row.change_pct.toFixed(0)}% mention Δ`
+                        : "—"}
+                    />
+                  )}
                 </div>
               </section>
 

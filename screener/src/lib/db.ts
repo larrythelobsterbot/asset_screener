@@ -34,13 +34,27 @@ export function getDb(): Database.Database {
 // Versioned via PRAGMA user_version so we can add schema changes without
 // blowing away the local file. Bump VERSION and add a step.
 
-const VERSION = 1;
+const VERSION = 2;
 
 function migrate(db: Database.Database): void {
   const current = db.pragma("user_version", { simple: true }) as number;
   if (current >= VERSION) return;
 
-  db.exec(`
+  if (current < 1) {
+    db.exec(MIGRATION_V1);
+  }
+  if (current < 2) {
+    db.exec(MIGRATION_V2);
+  }
+  db.pragma(`user_version = ${VERSION}`);
+}
+
+// Schema migrations are split into versioned blocks so an existing db
+// only runs the steps it's missing. Adding a new step: bump VERSION,
+// add a new MIGRATION_V<n> block, and append the `if (current < n)`
+// guard above.
+
+const MIGRATION_V1 = `
     -- Time-series of per-symbol market context. One row per symbol per scan.
     -- Used for: multi-horizon sector RS, sparklines, backtests, cache warmup.
     create table if not exists price_snapshots (
@@ -86,10 +100,23 @@ function migrate(db: Database.Database): void {
       value  text not null,
       ts     integer not null
     );
-  `);
+  `;
 
-  db.pragma(`user_version = ${VERSION}`);
-}
+// V2 — social snapshots for Elfa AI mindshare/mention data. One row per
+// (symbol, ts). Symbols stored UPPERCASE for consistency with the rest of
+// the app even though Elfa returns lowercase — caller normalises on read.
+const MIGRATION_V2 = `
+    create table if not exists social_snapshots (
+      symbol         text    not null,
+      ts             integer not null,
+      mention_count  integer not null,
+      prev_count     integer,
+      change_pct     real,
+      primary key (symbol, ts)
+    );
+    create index if not exists idx_social_sym_ts on social_snapshots(symbol, ts desc);
+    create index if not exists idx_social_ts on social_snapshots(ts);
+  `;
 
 // ── price_snapshots ─────────────────────────────────────────────────────
 
@@ -270,6 +297,61 @@ export function recordEventFire(symbol: string, type: string, firedAt: number): 
   ).run(symbol, type, firedAt);
 }
 
+// ── social_snapshots ────────────────────────────────────────────────────
+
+export interface SocialSnapshotRow {
+  symbol: string;
+  ts: number;
+  mention_count: number;
+  prev_count: number | null;
+  change_pct: number | null;
+}
+
+export function insertSocialSnapshots(rows: SocialSnapshotRow[]): void {
+  if (rows.length === 0) return;
+  const db = getDb();
+  const stmt = db.prepare(
+    `insert into social_snapshots (symbol, ts, mention_count, prev_count, change_pct)
+     values (@symbol, @ts, @mention_count, @prev_count, @change_pct)
+     on conflict(symbol, ts) do update set
+       mention_count = excluded.mention_count,
+       prev_count = excluded.prev_count,
+       change_pct = excluded.change_pct`
+  );
+  const insertMany = db.transaction((batch: SocialSnapshotRow[]) => {
+    for (const r of batch) stmt.run(r);
+  });
+  insertMany(rows);
+}
+
+// Latest snapshot per symbol. Same pattern as latestSnapshots() for prices.
+// Symbols passed in are UPPERCASE; we match on what's stored.
+export function latestSocialSnapshots(symbols?: string[]): Map<string, SocialSnapshotRow> {
+  const db = getDb();
+  const rows = (symbols && symbols.length > 0
+    ? db.prepare(
+        `select symbol, ts, mention_count, prev_count, change_pct
+         from social_snapshots
+         where symbol in (${symbols.map(() => "?").join(",")})
+         and ts = (select max(ts) from social_snapshots p2 where p2.symbol = social_snapshots.symbol)`
+      ).all(...symbols)
+    : db.prepare(
+        `select p.symbol, p.ts, p.mention_count, p.prev_count, p.change_pct
+         from social_snapshots p
+         join (select symbol, max(ts) as max_ts from social_snapshots group by symbol) latest
+           on p.symbol = latest.symbol and p.ts = latest.max_ts`
+      ).all()) as SocialSnapshotRow[];
+  const out = new Map<string, SocialSnapshotRow>();
+  for (const r of rows) out.set(r.symbol, r);
+  return out;
+}
+
+export function pruneSocialSnapshots(maxAgeMs: number = 30 * 86_400_000): number {
+  const db = getDb();
+  const cutoff = Date.now() - maxAgeMs;
+  return db.prepare(`delete from social_snapshots where ts < ?`).run(cutoff).changes;
+}
+
 // ── runtime_kv ──────────────────────────────────────────────────────────
 
 export function kvGet(key: string): string | null {
@@ -302,8 +384,9 @@ export function startPruneJob(): void {
     try {
       const sp = prunePriceSnapshots();
       const cp = pruneCandles();
-      if (sp > 0 || cp > 0) {
-        console.info(`[db] pruned ${sp} snapshots, ${cp} candles`);
+      const ss = pruneSocialSnapshots();
+      if (sp > 0 || cp > 0 || ss > 0) {
+        console.info(`[db] pruned ${sp} price, ${cp} candle, ${ss} social snapshots`);
       }
     } catch (err) {
       console.warn(`[db] prune failed:`, err);
