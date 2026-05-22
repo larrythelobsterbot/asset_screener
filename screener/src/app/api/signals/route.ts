@@ -10,6 +10,7 @@ import {
 import { cache } from "@/lib/cache";
 import { logSignalFires } from "@/lib/signalPersistence";
 import { snapshotAt } from "@/lib/db";
+import { maybeDispatchAlerts } from "@/lib/alerter";
 
 // Without this, Next.js 14 prerenders this route statically at build time
 // and serves a frozen snapshot forever. See markets/route.ts for the same
@@ -193,6 +194,20 @@ export async function GET() {
     logSignalFires(allSignals, priceBySymbol).catch((e) =>
       console.warn("[signals] persistence error:", e)
     );
+
+    // Telegram alerting — fire-and-forget. Scores conviction per symbol
+    // and dispatches Strong Buy/Sell alerts that pass the cooldown +
+    // vol-regime gate. No-ops if env isn't configured.
+    maybeDispatchAlerts(allSignals, priceBySymbol)
+      .then((r) => {
+        if (r.considered > 0) {
+          console.info(
+            `[alerter] considered=${r.considered} fired=${r.fired} ` +
+            `cooledDown=${r.cooledDown} failed=${r.failed}`
+          );
+        }
+      })
+      .catch((e) => console.warn("[alerter] dispatch error:", e));
 
     cache.set("api:signals", allSignals, 30_000);
     return NextResponse.json(allSignals);
