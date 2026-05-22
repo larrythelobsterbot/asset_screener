@@ -12,7 +12,17 @@ import { loadEventHistory, recordEventFire } from "./db";
 // to reason about — e.g., "only act on momentum+trend confluence" or
 // "never alert on volume alone". The legacy `type` stays as a fine-grained
 // identifier so existing consumers don't break.
-export type SignalFamily = "momentum" | "trend" | "volume" | "structure" | "funding";
+export type SignalFamily =
+  | "momentum"
+  | "trend"
+  | "volume"
+  | "structure"
+  | "funding"
+  // "social" sits alongside the other families. Currently sourced from
+  // Elfa AI mindshare data (data/social_snapshots). Treated like volume
+  // in the scorer — high attention is a setup, not a direction by
+  // itself; the direction comes from accompanying momentum/trend signals.
+  | "social";
 
 export type SignalType =
   | "rsi_overbought"
@@ -30,7 +40,8 @@ export type SignalType =
   | "golden_cross"
   | "death_cross"
   | "sector_leader"
-  | "sector_laggard";
+  | "sector_laggard"
+  | "social_spike";
 
 export type SignalDirection = "bullish" | "bearish";
 
@@ -72,6 +83,7 @@ export const SIGNAL_FAMILY: Record<SignalType, SignalFamily> = {
   death_cross: "trend",
   sector_leader: "structure",
   sector_laggard: "structure",
+  social_spike: "social",
 };
 
 // In-memory de-bouncer map. Hydrated from SQLite on first use so a PM2
@@ -361,6 +373,12 @@ const FAMILY_WEIGHTS: Record<SignalFamily, number> = {
   structure: 1.1,
   volume: 0.6,
   funding: 0.8,
+  // Social signal carries weight comparable to momentum — mindshare
+  // spikes lead price moves in crypto more often than they lag. The
+  // edge is in *confluence* with TA, which the diversity bonus + the
+  // cross-TF alignment bonus already amplify. Don't over-weight here
+  // or single social-only fires would dominate the scorer.
+  social: 0.9,
 };
 
 // Timeframe weights — longer timeframes carry more weight because they're
@@ -386,6 +404,11 @@ const TYPE_WEIGHTS: Partial<Record<SignalType, number>> = {
   death_cross: 1.5,
   breakout_up: 1.3,
   breakout_down: 1.3,
+  // A real mindshare spike (≥50% Δ in mention count over 24h) is a
+  // high-conviction setup — comparable to a price breakout. Weight
+  // matches breakout_up/down so a TA-breakout + social-spike confluence
+  // lands a heavy contribution to the conviction score.
+  social_spike: 1.3,
 };
 
 export interface ConvictionResult {
@@ -599,6 +622,67 @@ export function detectSectorRelativeStrength(
     void timeframe;
     return rest;
   });
+}
+
+// ── Social-mindshare spike ──────────────────────────────────────────────
+// Given a snapshot of (symbol, mention_count, prev_count, change_pct)
+// tuples from Elfa, emit a `social_spike` signal for each symbol with a
+// genuine spike in attention. We need both criteria to fire:
+//
+//   1. change_pct ≥ SOCIAL_SPIKE_PCT (default 50%). A 50% Δ over 24h is
+//      meaningful but not extreme — extreme spikes (200%+) get the full
+//      strength score via the linear interpolation below.
+//   2. mention_count ≥ SOCIAL_SPIKE_MIN_COUNT (default 100). Filters out
+//      tiny-volume tickers that doubled from 8 → 16 mentions, which is
+//      noise dressed as signal.
+//
+// Direction: bullish by default. Elfa's trending-tokens endpoint doesn't
+// expose sentiment, only counts — and in crypto, raw attention is more
+// often coincident with rallies than dumps. The scorer doesn't lean
+// hard on direction for social_spike anyway (it acts more like
+// volume_spike — sets the stage, the direction comes from accompanying
+// TA signals). Future work: switch to data/keyword-mentions and read
+// sentiment polarity to emit a bearish flavor when warranted.
+export interface SocialSnapshot {
+  symbol: string;            // UPPERCASE
+  mention_count: number;
+  prev_count: number | null;
+  change_pct: number | null;
+}
+
+const SOCIAL_SPIKE_PCT = 50;
+const SOCIAL_SPIKE_MIN_COUNT = 100;
+
+export function detectSocialSpike(snapshot: SocialSnapshot[]): Signal[] {
+  const now = Date.now();
+  const out: Signal[] = [];
+  for (const s of snapshot) {
+    if (s.change_pct == null || !Number.isFinite(s.change_pct)) continue;
+    if (s.mention_count < SOCIAL_SPIKE_MIN_COUNT) continue;
+    if (s.change_pct < SOCIAL_SPIKE_PCT) continue;
+
+    // Strength: linearly scale 50% → 40, 200%+ → 100. Caps protect
+    // against the rare ticker that 10×s its mention count overnight.
+    const strength = Math.min(
+      100,
+      40 + ((s.change_pct - SOCIAL_SPIKE_PCT) / 150) * 60
+    );
+    out.push({
+      symbol: s.symbol,
+      type: "social_spike",
+      family: "social",
+      direction: "bullish",
+      value: s.change_pct,
+      strength,
+      label: `Mindshare spike: ${s.mention_count} mentions (+${s.change_pct.toFixed(0)}% 24h)`,
+      firedAt: now,
+      // Tagged "cross" because mindshare is a cross-sectional signal
+      // not tied to a candle timeframe. Mirrors sector_leader / laggard
+      // and lands in the TIMEFRAME_WEIGHTS["cross"] (0.8) bucket.
+      timeframe: "cross",
+    });
+  }
+  return out;
 }
 
 // Multi-horizon variant — ranks each sector on every available horizon

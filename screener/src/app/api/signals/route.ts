@@ -4,12 +4,14 @@ import { HL_PERP_SECTOR_MAP } from "@/config/sectors";
 import {
   detectSignals,
   detectSectorRelativeStrengthMulti,
+  detectSocialSpike,
   Signal,
   type SectorMultiSnapshot,
+  type SocialSnapshot,
 } from "@/lib/signals";
 import { cache } from "@/lib/cache";
 import { logSignalFires } from "@/lib/signalPersistence";
-import { snapshotAt } from "@/lib/db";
+import { snapshotAt, latestSocialSnapshots } from "@/lib/db";
 import { maybeDispatchAlerts } from "@/lib/alerter";
 
 // Without this, Next.js 14 prerenders this route statically at build time
@@ -89,6 +91,38 @@ export async function GET() {
       topSymbols.has(s.symbol)
     );
     allSignals.push(...sectorSignals);
+
+    // Cross-sectional social spike pass — reads from SQLite social_snapshots
+    // populated hourly by /api/social/trending. Zero Elfa cost: this is a
+    // pure local read. Filter results to the top-40 symbols so we don't
+    // alert on long-tail tickers that aren't tradable on HL anyway.
+    try {
+      const socialMap = latestSocialSnapshots(allMappedSymbols);
+      const socialSnapshot: SocialSnapshot[] = [];
+      for (const sym of allMappedSymbols) {
+        const row = socialMap.get(sym);
+        if (!row) continue;
+        socialSnapshot.push({
+          symbol: sym,
+          mention_count: row.mention_count,
+          prev_count: row.prev_count,
+          change_pct: row.change_pct,
+        });
+      }
+      const socialSignals = detectSocialSpike(socialSnapshot).filter((s) =>
+        topSymbols.has(s.symbol)
+      );
+      allSignals.push(...socialSignals);
+      if (socialSignals.length > 0) {
+        console.info(
+          `[signals] social_spike fired on: ${socialSignals.map((s) => s.symbol).join(", ")}`
+        );
+      }
+    } catch (err) {
+      // Social is optional context — never block the scan if SQLite is
+      // unavailable or the social table is empty (cold-start case).
+      console.warn("[signals] social_spike read failed:", err);
+    }
 
     // Multi-timeframe scan: we run the full signal detector on 1h, 4h, and
     // 1d bars for each symbol. The 4h pass is the most important (matches

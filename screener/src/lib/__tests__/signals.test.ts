@@ -19,10 +19,12 @@ import {
   detectSignals,
   detectSectorRelativeStrength,
   detectSectorRelativeStrengthMulti,
+  detectSocialSpike,
   scoreConviction,
   type Signal,
   type SectorSnapshot,
   type SectorMultiSnapshot,
+  type SocialSnapshot,
 } from "../signals";
 import { detectDivergences, atrPercent, classifyVolRegime } from "../indicators";
 
@@ -169,6 +171,72 @@ test("detectSectorRelativeStrengthMulti skips horizons with no data without drop
   assert.ok(horizons.has("1h"), "should fire on 1h horizon");
   assert.ok(horizons.has("1d"), "should fire on 24h horizon (mapped to 1d)");
   assert.equal(horizons.has("4h"), false, "should not fire on 4h horizon — no data");
+});
+
+// ── Social mindshare spike ─────────────────────────────────────────────
+test("detectSocialSpike fires when change_pct ≥ 50% AND mention_count ≥ 100", () => {
+  const snap: SocialSnapshot[] = [
+    { symbol: "HYPE", mention_count: 1285, prev_count: 850,  change_pct: 51 },
+    { symbol: "BTC",  mention_count: 728,  prev_count: 781,  change_pct: -6.8 },
+    { symbol: "ETH",  mention_count: 445,  prev_count: 358,  change_pct: 24.3 },
+  ];
+  const sigs = detectSocialSpike(snap);
+  const hype = sigs.find((s) => s.symbol === "HYPE");
+  assert.ok(hype, "HYPE at 51% Δ should fire");
+  assert.equal(hype?.type, "social_spike");
+  assert.equal(hype?.family, "social");
+  assert.equal(hype?.direction, "bullish");
+  assert.equal(hype?.timeframe, "cross");
+  assert.ok((hype?.strength ?? 0) >= 40);
+
+  const eth = sigs.find((s) => s.symbol === "ETH");
+  assert.equal(eth, undefined, "ETH at 24.3% should NOT fire (below 50% threshold)");
+
+  const btc = sigs.find((s) => s.symbol === "BTC");
+  assert.equal(btc, undefined, "BTC with negative change should NOT fire");
+});
+
+test("detectSocialSpike skips tiny-volume tickers even at high change_pct", () => {
+  // 10 → 30 mentions is +200% Δ, but absolute count below threshold is
+  // noise. Filter must enforce both conditions.
+  const snap: SocialSnapshot[] = [
+    { symbol: "TINY", mention_count: 30, prev_count: 10, change_pct: 200 },
+  ];
+  const sigs = detectSocialSpike(snap);
+  assert.equal(sigs.length, 0, "low-count spike should not fire");
+});
+
+test("detectSocialSpike strength scales with magnitude", () => {
+  const at = (changePct: number): number | undefined => {
+    const sigs = detectSocialSpike([
+      { symbol: "X", mention_count: 500, prev_count: 250, change_pct: changePct },
+    ]);
+    return sigs[0]?.strength;
+  };
+  const s50  = at(50)  ?? 0;
+  const s100 = at(100) ?? 0;
+  const s200 = at(200) ?? 0;
+  assert.ok(s50 < s100, "+100% should be stronger than +50%");
+  assert.ok(s100 < s200, "+200% should be stronger than +100%");
+  assert.ok(s200 <= 100, "strength caps at 100");
+});
+
+test("scoreConviction with social_spike + TA confluence pushes into Strong Buy", () => {
+  const now = Date.now();
+  const signals: Signal[] = [
+    // 4h breakout + 1d momentum + cross-sectional social spike — exactly
+    // the kind of multi-family confluence the alerter is looking for.
+    { symbol: "HYPE", type: "breakout_up",  family: "structure", direction: "bullish", value: 60, label: "", firedAt: now, timeframe: "4h" },
+    { symbol: "HYPE", type: "ema_bullish",  family: "trend",     direction: "bullish", value: 0.5, label: "", firedAt: now, timeframe: "1d" },
+    { symbol: "HYPE", type: "social_spike", family: "social",    direction: "bullish", value: 80, strength: 65, label: "", firedAt: now, timeframe: "cross" },
+  ];
+  const r = scoreConviction(signals);
+  assert.equal(r.label, "Strong Buy");
+  assert.ok(
+    r.contributingFamilies.includes("social"),
+    "social should appear in the contributing families list"
+  );
+  assert.equal(r.contributingFamilies.length, 3, "3 distinct families should activate diversity bonus");
 });
 
 // ── Conviction composition ─────────────────────────────────────────────
