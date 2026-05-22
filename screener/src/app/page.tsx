@@ -240,6 +240,19 @@ export default function Home() {
             </button>
           )}
 
+          {/* Journal — link out to the trades table view. Same chrome as
+              the watchlist button, no count badge (open count would
+              add a fetch on every page load just for the badge). */}
+          <a
+            href="/journal"
+            className="btn-ghost"
+            title="Open the trade journal"
+            style={{ textDecoration: "none" }}
+          >
+            <span>≡</span>
+            Journal
+          </a>
+
           <TimeframeToggle selected={timeframe} onChange={setTimeframe} />
         </div>
       </div>
