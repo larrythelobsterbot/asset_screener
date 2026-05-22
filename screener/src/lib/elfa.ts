@@ -155,7 +155,16 @@ class ElfaNotConfiguredError extends Error {
   }
 }
 
-async function elfaGet<T>(path: string, costsCredit: boolean = true): Promise<T> {
+// Elfa wraps responses in `{success, data, ...rest}` but the placement of
+// `metadata` varies by endpoint:
+//   - /aggregations/trending-tokens → metadata nested INSIDE data
+//   - /data/top-mentions            → metadata at TOP LEVEL alongside data
+// `elfaGetEnvelope` returns the full envelope so callers that need
+// top-level metadata can read it; `elfaGet` is the legacy convenience
+// that just returns `json.data`.
+interface ElfaEnvelope<T> { success?: boolean; data?: T; error?: string; [k: string]: unknown }
+
+async function elfaGetEnvelope<T>(path: string, costsCredit: boolean = true): Promise<ElfaEnvelope<T>> {
   if (!API_KEY) throw new ElfaNotConfiguredError();
   // Reserve a credit FIRST (atomic SQLite UPDATE), check soft cap
   // AFTER. If we exceed the cap, release the reservation. This closes
@@ -208,12 +217,12 @@ async function elfaGet<T>(path: string, costsCredit: boolean = true): Promise<T>
       totalErrors += 1;
       throw new Error(`Elfa API error: ${res.status}`);
     }
-    const json = (await res.json()) as { success?: boolean; data?: T; error?: string };
+    const json = (await res.json()) as ElfaEnvelope<T>;
     if (json.success === false) {
       totalErrors += 1;
       throw new Error(`Elfa API error: ${json.error ?? "unknown"}`);
     }
-    return (json.data ?? json) as T;
+    return json;
   } catch (err) {
     // Don't double-count budget errors as errors — they're a deliberate
     // refusal, not an upstream fault.
@@ -229,6 +238,13 @@ async function elfaGet<T>(path: string, costsCredit: boolean = true): Promise<T>
     }
     throw err;
   }
+}
+
+// Convenience: unwrap `json.data` (or the whole envelope if no data key).
+// Use this for endpoints where metadata lives INSIDE `data`.
+async function elfaGet<T>(path: string, costsCredit: boolean = true): Promise<T> {
+  const env = await elfaGetEnvelope<T>(path, costsCredit);
+  return (env.data ?? (env as unknown)) as T;
 }
 
 // ── Endpoints ───────────────────────────────────────────────────────────
@@ -271,6 +287,55 @@ export async function getTrendingTokens(opts: {
 // Free — does not count against the daily quota. Use for ops/diagnostic.
 export async function getKeyStatus(): Promise<unknown> {
   return elfaGet(`/v2/key-status`, /* costsCredit */ false);
+}
+
+// ── Top mentions ────────────────────────────────────────────────────────
+// Returns the top N tweets mentioning a ticker over the requested time
+// window, sorted by smart-account engagement. Each item has tweetId,
+// link, engagement counts, and a smart-vs-CT repost breakdown.
+//
+// NOTE: response does NOT include tweet text. We get links the user
+// can click through to X. This is an Elfa policy choice — to read the
+// actual text you'd need to pass `fetchRawTweets: true` (requires a
+// Twitter API key too, which we don't have).
+export interface TopMention {
+  tweetId: string;
+  link: string;
+  likeCount: number;
+  repostCount: number;
+  viewCount: number;
+  quoteCount: number;
+  replyCount: number;
+  bookmarkCount: number;
+  mentionedAt: string;       // ISO timestamp
+  type: "post" | "quote" | "reply";
+  repostBreakdown: { smart: number; ct: number };
+}
+
+export interface TopMentionsResponse {
+  data: TopMention[];
+  metadata: { total: number; page: number; pageSize: number };
+}
+
+export async function getTopMentions(opts: {
+  ticker: string;
+  timeWindow?: TrendingTimeWindow;
+  pageSize?: number;
+}): Promise<TopMentionsResponse> {
+  const params = new URLSearchParams();
+  params.set("ticker", opts.ticker);
+  params.set("timeWindow", opts.timeWindow ?? "24h");
+  params.set("pageSize", String(Math.min(20, Math.max(1, opts.pageSize ?? 5))));
+  // top-mentions puts `metadata` at the top level, not nested under
+  // `data`, so we read the full envelope and recompose.
+  const env = await elfaGetEnvelope<TopMention[]>(`/v2/data/top-mentions?${params}`);
+  const data = Array.isArray(env.data) ? env.data : [];
+  const metadata = (env.metadata as TopMentionsResponse["metadata"]) ?? {
+    total: data.length,
+    page: 1,
+    pageSize: data.length,
+  };
+  return { data, metadata };
 }
 
 export { ElfaBudgetError, ElfaNotConfiguredError };

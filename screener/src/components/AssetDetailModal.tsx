@@ -18,6 +18,7 @@ import MomentumCell from "./MomentumCell";
 import type { ScreenerRow } from "@/app/api/screener/route";
 import type { SocialResponse } from "@/app/api/social/trending/route";
 import type { BtcBinaryResponse } from "@/app/api/btc/binary/route";
+import type { TopMentionsRouteResponse } from "@/app/api/social/top-mentions/[symbol]/route";
 
 const BUILDER_TICKER_INFO: Record<string, { sector: string; label: string }> = {};
 for (const [key, info] of Object.entries(HL_BUILDER_PERP_MAP)) {
@@ -322,6 +323,125 @@ function BtcBinarySection({ binary }: { binary: BtcBinaryResponse }) {
   );
 }
 
+// ── Top mentions list (Elfa) ────────────────────────────────────────────
+// Renders up to 3 tweet cards with link + engagement metrics + relative
+// time. No tweet text available from Elfa's free tier — clicking opens
+// X in a new tab. Smart-account repost count (vs CT-account count) is
+// what makes Elfa's data different from raw twitter scrape; surface it
+// prominently when present.
+
+function compactNum(n: number): string {
+  if (n >= 1e6) return `${(n / 1e6).toFixed(1)}M`;
+  if (n >= 1e3) return `${(n / 1e3).toFixed(1)}K`;
+  return String(n);
+}
+
+function relTimeFrom(iso: string): string {
+  const t = new Date(iso).getTime();
+  if (!Number.isFinite(t)) return "";
+  const diff = Date.now() - t;
+  const min = Math.floor(diff / 60_000);
+  if (min < 1) return "just now";
+  if (min < 60) return `${min}m ago`;
+  const h = Math.floor(min / 60);
+  if (h < 24) return `${h}h ago`;
+  return `${Math.floor(h / 24)}d ago`;
+}
+
+function TopMentionsList({
+  mentions,
+  total,
+}: {
+  mentions: import("@/lib/elfa").TopMention[];
+  total: number;
+}) {
+  const top = mentions.slice(0, 3);
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+      {top.map((m) => {
+        const smart = m.repostBreakdown?.smart ?? 0;
+        const ct = m.repostBreakdown?.ct ?? 0;
+        return (
+          <a
+            key={m.tweetId}
+            href={m.link}
+            target="_blank"
+            rel="noopener noreferrer"
+            style={{
+              display: "block",
+              padding: "8px 12px",
+              background: "var(--bg-chip)",
+              borderRadius: "var(--radius)",
+              border: ".5px solid var(--border-soft)",
+              textDecoration: "none",
+              color: "var(--text)",
+              transition: "background .12s, border-color .12s",
+            }}
+            onMouseOver={(e) => {
+              e.currentTarget.style.background = "var(--bg-chip-h)";
+              e.currentTarget.style.borderColor = "color-mix(in oklab, var(--acc-warn) 30%, transparent)";
+            }}
+            onMouseOut={(e) => {
+              e.currentTarget.style.background = "var(--bg-chip)";
+              e.currentTarget.style.borderColor = "var(--border-soft)";
+            }}
+          >
+            <div style={{
+              display: "flex", justifyContent: "space-between",
+              alignItems: "baseline", gap: 8,
+              fontSize: 11,
+              fontFamily: "var(--font-geist-mono), ui-monospace, monospace",
+            }}>
+              <span style={{ color: "var(--text-mute)" }}>
+                {m.type === "quote" ? "↻ quote" : m.type === "reply" ? "↩ reply" : "✎ post"}
+              </span>
+              <span style={{ color: "var(--text-mute)" }}>{relTimeFrom(m.mentionedAt)}</span>
+            </div>
+            <div style={{
+              display: "flex", gap: 14, marginTop: 6,
+              fontSize: 10,
+              fontFamily: "var(--font-geist-mono), ui-monospace, monospace",
+              color: "var(--text-mute)",
+            }}>
+              <span title="Views">👁 {compactNum(m.viewCount)}</span>
+              <span title="Likes">♥ {compactNum(m.likeCount)}</span>
+              <span title="Reposts">↻ {compactNum(m.repostCount)}</span>
+              <span title="Replies">↩ {compactNum(m.replyCount)}</span>
+              {smart > 0 && (
+                <span
+                  title="Smart-money account reposts (Elfa's verified KOL signal)"
+                  style={{ color: "var(--acc-warn)", marginLeft: "auto" }}
+                >
+                  ★ {smart} smart
+                </span>
+              )}
+              {smart === 0 && ct > 0 && (
+                <span
+                  title="Crypto-twitter (CT) reposts"
+                  style={{ color: "var(--text-mute)", marginLeft: "auto" }}
+                >
+                  CT {ct}
+                </span>
+              )}
+            </div>
+          </a>
+        );
+      })}
+      {total > top.length && (
+        <div style={{
+          fontSize: 10,
+          color: "var(--text-mute)",
+          textAlign: "right",
+          fontFamily: "var(--font-geist-mono), ui-monospace, monospace",
+          padding: "0 4px",
+        }}>
+          {total - top.length} more · click any to open in X
+        </div>
+      )}
+    </div>
+  );
+}
+
 // ── Main component ─────────────────────────────────────────────────────
 
 export default function AssetDetailModal({ symbol, onClose }: Props) {
@@ -335,6 +455,10 @@ export default function AssetDetailModal({ symbol, onClose }: Props) {
   // BTC daily binary outcome (HIP-4). Only fetched when symbol === "BTC".
   // null = not fetched yet; non-null = either real data or { error: ... }.
   const [binary, setBinary] = useState<BtcBinaryResponse | null>(null);
+  // Top tweet mentions (Elfa). Lazy-loaded only after trending lookup
+  // confirms the symbol is in Elfa's universe — saves a credit on
+  // long-tail tickers nobody's talking about.
+  const [topMentions, setTopMentions] = useState<TopMentionsRouteResponse | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
 
@@ -383,6 +507,24 @@ export default function AssetDetailModal({ symbol, onClose }: Props) {
   }, [symbol]);
 
   useEffect(() => { fetchData(); }, [fetchData]);
+
+  // Lazy-load top mentions ONLY after we know the symbol is in Elfa's
+  // trending universe. Skipping the fetch for non-trending symbols
+  // saves a credit per panel open on long-tail tickers — meaningful at
+  // the daily budget level. If the symbol IS trending, the route's
+  // 1h cache means we hit Elfa at most once per (symbol, tf) per hour
+  // regardless of how many users open the same panel.
+  useEffect(() => {
+    if (!social?.row) return;
+    let cancelled = false;
+    fetch(`/api/social/top-mentions/${symbol}?tf=24h`)
+      .then((r) => (r.ok ? r.json() : null))
+      .then((d: TopMentionsRouteResponse | null) => {
+        if (!cancelled && d) setTopMentions(d);
+      })
+      .catch(() => { /* silent — section just doesn't render */ });
+    return () => { cancelled = true; };
+  }, [social, symbol]);
 
   // Close on Escape.
   useEffect(() => {
@@ -663,8 +805,24 @@ export default function AssetDetailModal({ symbol, onClose }: Props) {
                     tone={athPct != null && athPct <= -50 ? "down" : athPct != null && athPct <= -20 ? "warn" : undefined}
                   />
                   <Stat
-                    label="Open Interest"
-                    value={data.stats ? fmtVol(data.stats.openInterest * data.stats.price) : "—"}
+                    label="Funding APR"
+                    value={(() => {
+                      if (!data.stats) return "—";
+                      const apr = data.stats.fundingRate * 8760 * 100;
+                      if (!Number.isFinite(apr)) return "—";
+                      const sign = apr > 0 ? "+" : "";
+                      return `${sign}${apr.toFixed(1)}%`;
+                    })()}
+                    tone={(() => {
+                      if (!data.stats) return undefined;
+                      const apr = Math.abs(data.stats.fundingRate * 8760 * 100);
+                      // Same color logic as the table column. Extreme
+                      // funding flips to red/green; warn band 50–100%.
+                      if (apr < 10) return "mute";
+                      if (apr >= 100) return data.stats.fundingRate > 0 ? "down" : "up";
+                      if (apr >= 50) return "warn";
+                      return data.stats.fundingRate > 0 ? "down" : "up";
+                    })()}
                   />
                   <Stat
                     label="RSI"
@@ -772,6 +930,19 @@ export default function AssetDetailModal({ symbol, onClose }: Props) {
                       tone={social.rank != null && social.rank <= 10 ? "warn" : undefined}
                     />
                   </div>
+                </section>
+              )}
+
+              {/* Top mentions — Elfa-credit'd top tweets for this ticker.
+                  Only rendered when trending lookup confirmed the symbol
+                  has mentions to surface; lazy-loaded so non-trending
+                  symbols never trigger an Elfa call. */}
+              {topMentions && topMentions.mentions.length > 0 && (
+                <section style={{ marginBottom: 24 }}>
+                  <div className="br-label" style={{ marginBottom: 10, paddingBottom: 6, borderBottom: ".5px solid var(--border-soft)" }}>
+                    Top Mentions · 24h
+                  </div>
+                  <TopMentionsList mentions={topMentions.mentions} total={topMentions.total} />
                 </section>
               )}
 

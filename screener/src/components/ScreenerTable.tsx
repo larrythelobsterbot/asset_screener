@@ -30,12 +30,44 @@ type SortKey =
   | "vol_ratio"
   | "ath_pct"
   | "rsi"
-  | "volume24h";
+  | "volume24h"
+  | "funding_apr";
 
 function mapToCandleTF(tf: HeatmapTF): "1h" | "4h" | "1d" {
   if (tf === "1h") return "1h";
   if (tf === "4h") return "4h";
   return "1d";
+}
+
+// Annualized funding APR. HL funds HOURLY (unlike Binance's 8h), so
+// the hourly rate × 24 × 365 = 8760 gives the annualized number.
+// Convention: positive funding = longs pay shorts (overcrowded longs),
+// so we color red. Negative = shorts pay longs (overcrowded shorts),
+// color green. This is the OPPOSITE of price direction — a positive
+// APR means a contrarian short bias makes sense.
+function fundingApr(hourlyRate: number | null): number | null {
+  if (hourlyRate == null || !Number.isFinite(hourlyRate)) return null;
+  return hourlyRate * 8760 * 100; // express as percentage
+}
+
+function fmtFundingApr(apr: number | null): string {
+  if (apr == null) return "—";
+  const sign = apr > 0 ? "+" : "";
+  return `${sign}${apr.toFixed(1)}%`;
+}
+
+// Color tier for funding APR:
+//   |APR| < 10%   = mute (calm tape)
+//   10–50%        = subtle tone (longs/shorts paying noticeable cost)
+//   50–100%       = mustard (extreme — squeeze setup territory)
+//   100%+         = strong red/green (very crowded — high reversal odds)
+function fundingClass(apr: number | null): string {
+  if (apr == null) return "tone-mute";
+  const abs = Math.abs(apr);
+  if (abs < 10) return "tone-mute";
+  if (abs >= 100) return apr > 0 ? "tone-down" : "tone-up";
+  if (abs >= 50) return "tone-warn";
+  return apr > 0 ? "tone-down" : "tone-up";
 }
 
 function fmtPrice(n: number): string {
@@ -151,6 +183,7 @@ export default function ScreenerTable({
           case "ath_pct": return sa?.ath_pct ?? -Infinity;
           case "rsi": return sa?.rsi ?? -Infinity;
           case "volume24h": return a.volume24h;
+          case "funding_apr": return fundingApr(a.fundingRate) ?? -Infinity;
         }
       })();
       const vb = ((): number | string => {
@@ -165,6 +198,7 @@ export default function ScreenerTable({
           case "ath_pct": return sb?.ath_pct ?? -Infinity;
           case "rsi": return sb?.rsi ?? -Infinity;
           case "volume24h": return b.volume24h;
+          case "funding_apr": return fundingApr(b.fundingRate) ?? -Infinity;
         }
       })();
       const dir = sortAsc ? 1 : -1;
@@ -294,6 +328,7 @@ export default function ScreenerTable({
                 <th style={thRight} onClick={() => handleSort("change7d")}>7D%{arr("change7d")}</th>
                 <th style={thRight} onClick={() => handleSort("volume24h")}>Vol 24H{arr("volume24h")}</th>
                 <th style={thRight} onClick={() => handleSort("vol_ratio")}>Vol Ratio{arr("vol_ratio")}</th>
+                <th style={thRight} onClick={() => handleSort("funding_apr")} title="Annualized funding APR. + = longs pay shorts.">Fund APR{arr("funding_apr")}</th>
                 <th style={thRight} onClick={() => handleSort("ath_pct")}>ATH%{arr("ath_pct")}</th>
                 <th style={{ ...thStyle, width: 100, textAlign: "center" }}>Spark</th>
                 <th style={thStyle} onClick={() => handleSort("rsi")}>RSI{arr("rsi")}</th>
@@ -336,6 +371,9 @@ export default function ScreenerTable({
                       ) : (
                         <span style={{ color: "var(--text-mute)" }}>—</span>
                       )}
+                    </td>
+                    <td className={`cell-num ${fundingClass(fundingApr(a.fundingRate))}`}>
+                      {fmtFundingApr(fundingApr(a.fundingRate))}
                     </td>
                     <td className={`cell-num ${
                       sr?.ath_pct == null ? "tone-mute" :

@@ -14,7 +14,7 @@
 
 import { getMid } from "./hyperliquidWs";
 import { getHypePressure } from "./hypurrscan";
-import { insertHypePressureSnapshot, kvGet, kvSet } from "./db";
+import { insertHypePressureSnapshot, hypePressureSnapshotAt, kvGet, kvSet } from "./db";
 import { sendTelegramMessage, isTelegramConfigured } from "./telegram";
 
 const POLL_INTERVAL_MS = 90_000;        // 90s — comfortably under hypurrscan's anon limit
@@ -25,6 +25,29 @@ const ALERT_THRESHOLD_USD = parseFloat(
 // pressure sits above $1M for an extended period.
 const ALERT_COOLDOWN_MS = 60 * 60_000;
 const COOLDOWN_KV_KEY = "hype_pressure_alert_last_ts";
+
+// ── Divergence alert (pressure up + price flat) ─────────────────────────
+// "Pressure rising rapidly while price is flat" is a leading signal —
+// buyers are queueing up but haven't moved the order book yet. Once the
+// TWAPs actually execute, price tends to follow.
+//
+// Trigger criteria (must all hold):
+//   - pressure_1h_usd grew by ≥ DIVERGENCE_PRESSURE_DELTA_USD
+//   - over a window of DIVERGENCE_WINDOW_MS (default 20 min)
+//   - HYPE price moved < DIVERGENCE_PRICE_PCT in absolute terms in the
+//     same window
+// Separate cooldown from the absolute-threshold alert (they can both
+// fire — divergence captures the BUILDUP, threshold captures the
+// already-crossed state).
+const DIVERGENCE_WINDOW_MS = 20 * 60_000;
+const DIVERGENCE_PRESSURE_DELTA_USD = parseFloat(
+  process.env.HYPE_DIVERGENCE_PRESSURE_DELTA_USD || "500000"
+);
+const DIVERGENCE_PRICE_PCT = parseFloat(
+  process.env.HYPE_DIVERGENCE_MAX_PRICE_PCT || "0.5"
+);
+const DIVERGENCE_COOLDOWN_MS = 60 * 60_000;
+const DIVERGENCE_COOLDOWN_KEY = "hype_pressure_divergence_last_ts";
 
 let started = false;
 let timer: ReturnType<typeof setInterval> | null = null;
@@ -94,6 +117,73 @@ async function maybeAlertOnThreshold(
   }
 }
 
+function isOnDivergenceCooldown(now: number): boolean {
+  const last = kvGet(DIVERGENCE_COOLDOWN_KEY);
+  if (!last) return false;
+  const lastMs = parseInt(last, 10);
+  if (!Number.isFinite(lastMs)) return false;
+  return now - lastMs < DIVERGENCE_COOLDOWN_MS;
+}
+
+// Detects "pressure rising fast, price barely moving" — a leading
+// signal that buyers are stacking TWAPs but haven't moved the book yet.
+// Once the TWAPs start executing, the imbalance hits the price.
+//
+// Called AFTER the current snapshot has been persisted, so the lookup
+// against `now - WINDOW` finds the historical row directly (rather
+// than racing the new write).
+async function maybeAlertOnDivergence(
+  currentPressure1h: number,
+  currentHypePrice: number,
+  twapCount: number,
+  now: number
+): Promise<void> {
+  if (!isTelegramConfigured()) return;
+  if (isOnDivergenceCooldown(now)) return;
+
+  const prior = hypePressureSnapshotAt(now - DIVERGENCE_WINDOW_MS);
+  if (!prior) return; // not enough history yet (cold start)
+
+  const pressureDelta = currentPressure1h - prior.pressure_1h_usd;
+  if (pressureDelta < DIVERGENCE_PRESSURE_DELTA_USD) return;
+
+  // Price-flat check. We measure absolute % move — divergence is
+  // about lack of price reaction, not direction.
+  if (prior.hype_price <= 0) return;
+  const pricePct = Math.abs((currentHypePrice - prior.hype_price) / prior.hype_price) * 100;
+  if (pricePct >= DIVERGENCE_PRICE_PCT) return;
+
+  const windowMin = Math.round(DIVERGENCE_WINDOW_MS / 60_000);
+  const ageMin = Math.round((now - prior.ts) / 60_000);
+
+  kvSet(DIVERGENCE_COOLDOWN_KEY, String(now));
+
+  const text = [
+    `⚡ <b>HYPE Pressure Divergence</b>`,
+    ``,
+    `1h pressure: ${fmtUsd(prior.pressure_1h_usd)} → <b>${fmtUsd(currentPressure1h)}</b>`,
+    `(<b>+${fmtUsd(pressureDelta)}</b> in last ${ageMin}min, target window ${windowMin}min)`,
+    ``,
+    `HYPE price barely moved: <code>$${prior.hype_price.toFixed(4)}</code> → <code>$${currentHypePrice.toFixed(4)}</code> (${pricePct.toFixed(2)}%)`,
+    ``,
+    `Buyers stacking TWAPs but the order book hasn't absorbed yet —`,
+    `price tends to follow once executions hit. ${twapCount} active TWAPs.`,
+    ``,
+    `<a href="https://hypurrscan.io/dashboard">hypurrscan dashboard</a>`,
+  ].join("\n");
+
+  const r = await sendTelegramMessage(text);
+  if (!r.ok) {
+    console.warn(`[hype-pressure] divergence alert send failed:`, r.error);
+    kvSet(DIVERGENCE_COOLDOWN_KEY, String(now - DIVERGENCE_COOLDOWN_MS + 5 * 60_000));
+  } else {
+    console.info(
+      `[hype-pressure] DIVERGENCE fired: +${fmtUsd(pressureDelta)} pressure / ${pricePct.toFixed(2)}% price ` +
+      `over ${ageMin}min`
+    );
+  }
+}
+
 async function runOnce(): Promise<void> {
   const hypePrice = getMid("HYPE");
   if (hypePrice == null) {
@@ -116,6 +206,13 @@ async function runOnce(): Promise<void> {
     lastError = null;
     await maybeAlertOnThreshold(
       p.pressure_1h_usd, p.pressure_24h_usd, p.hype_price, p.active_twap_count, now
+    );
+    // Divergence runs independently of the threshold — buy pressure
+    // can be RISING from $200k → $700k (divergence-worthy) without
+    // ever crossing $1M. Both alerts can fire on the same tick (rare
+    // but possible — a sustained build that finally crosses).
+    await maybeAlertOnDivergence(
+      p.pressure_1h_usd, p.hype_price, p.active_twap_count, now
     );
   } catch (err) {
     consecutiveErrors += 1;

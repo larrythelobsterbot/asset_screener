@@ -600,6 +600,22 @@ export function insertBtcBinarySnapshot(row: BtcBinaryRow): void {
   ).run(row);
 }
 
+// Returns the hype-pressure snapshot whose ts is closest to (and ≤)
+// `targetTs`. Used by the divergence detector to compare current
+// pressure against pressure from N minutes ago — without this we'd
+// have to load the full series and filter in JS.
+export function hypePressureSnapshotAt(targetTs: number): HypePressureRow | null {
+  const db = getDb();
+  const row = db.prepare(
+    `select ts, pressure_1h_usd, pressure_24h_usd, hype_price, active_twap_count
+     from hype_pressure_snapshots
+     where ts <= ?
+     order by ts desc
+     limit 1`
+  ).get(targetTs) as HypePressureRow | undefined;
+  return row ?? null;
+}
+
 export function latestBtcBinarySnapshot(): BtcBinaryRow | null {
   const db = getDb();
   const row = db.prepare(
