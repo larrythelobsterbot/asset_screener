@@ -8,14 +8,21 @@
 // We don't test the per-indicator math itself — that's covered by
 // indicators.test.ts sister file — just the SIGNAL-LEVEL behaviour.
 
+// MUST be first: redirects the DAL singleton to a tmpfile so detectSignals
+// (which now persists eventHistory rows via SQLite) doesn't write to the
+// production data/screener.db.
+import "./db-test-setup";
+
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
   detectSignals,
   detectSectorRelativeStrength,
+  detectSectorRelativeStrengthMulti,
   scoreConviction,
   type Signal,
   type SectorSnapshot,
+  type SectorMultiSnapshot,
 } from "../signals";
 import { detectDivergences, atrPercent, classifyVolRegime } from "../indicators";
 
@@ -115,6 +122,53 @@ test("detectSectorRelativeStrength skips sectors below the minimum member count"
   ];
   const signals = detectSectorRelativeStrength(snapshot);
   assert.equal(signals.length, 0, "3 members is below threshold — should not fire");
+});
+
+// ── Multi-horizon sector RS ────────────────────────────────────────────
+test("detectSectorRelativeStrengthMulti emits one signal per horizon for the same outlier", () => {
+  // 8 members per horizon; same shape across 1h / 4h / 24h. We expect
+  // three distinct sector_leader signals on the leader symbol — one per
+  // horizon, each tagged with the matching timeframe (1h / 4h / 1d).
+  const flat = [0.9, 1.1, 0.8, 1.0, 1.2, 0.7];
+  const snap: SectorMultiSnapshot[] = flat.map((c, i) => ({
+    symbol: `FLAT${i}`,
+    sector: "l1",
+    change1h: c,
+    change4h: c,
+    change24h: c,
+  }));
+  snap.push({ symbol: "LEADER", sector: "l1", change1h: 8, change4h: 8, change24h: 8 });
+  snap.push({ symbol: "LAGGARD", sector: "l1", change1h: -5, change4h: -5, change24h: -5 });
+
+  const sigs = detectSectorRelativeStrengthMulti(snap);
+  const leaderSigs = sigs.filter((s) => s.symbol === "LEADER");
+  const laggardSigs = sigs.filter((s) => s.symbol === "LAGGARD");
+  assert.equal(leaderSigs.length, 3, "leader should fire on all 3 horizons");
+  assert.equal(laggardSigs.length, 3, "laggard should fire on all 3 horizons");
+
+  const tfs = new Set(leaderSigs.map((s) => s.timeframe));
+  assert.deepEqual([...tfs].sort(), ["1d", "1h", "4h"], "horizons should map to 1h/4h/1d timeframes");
+});
+
+test("detectSectorRelativeStrengthMulti skips horizons with no data without dropping others", () => {
+  // 8 members with 24h data; only 4 have 1h. 24h pass should fire; 1h
+  // should fire (4 is at the min member threshold); 4h should not fire
+  // (all null).
+  const snap: SectorMultiSnapshot[] = [
+    { symbol: "A", sector: "l1", change1h: 0.5, change24h: 0.9, change4h: null },
+    { symbol: "B", sector: "l1", change1h: 0.6, change24h: 1.1, change4h: null },
+    { symbol: "C", sector: "l1", change1h: 0.7, change24h: 0.8, change4h: null },
+    { symbol: "D", sector: "l1", change1h: 5.0, change24h: 1.0, change4h: null }, // 1h outlier
+    { symbol: "E", sector: "l1", change1h: null, change24h: 1.2, change4h: null },
+    { symbol: "F", sector: "l1", change1h: null, change24h: 0.7, change4h: null },
+    { symbol: "G", sector: "l1", change1h: null, change24h: 8.0, change4h: null }, // 24h outlier
+    { symbol: "H", sector: "l1", change1h: null, change24h: 0.5, change4h: null },
+  ];
+  const sigs = detectSectorRelativeStrengthMulti(snap);
+  const horizons = new Set(sigs.map((s) => s.timeframe));
+  assert.ok(horizons.has("1h"), "should fire on 1h horizon");
+  assert.ok(horizons.has("1d"), "should fire on 24h horizon (mapped to 1d)");
+  assert.equal(horizons.has("4h"), false, "should not fire on 4h horizon — no data");
 });
 
 // ── Conviction composition ─────────────────────────────────────────────

@@ -6,6 +6,7 @@ import {
   type VolRegime,
 } from "./indicators";
 import type { Sector } from "@/config/sectors";
+import { loadEventHistory, recordEventFire } from "./db";
 
 // Grouping signals by family makes downstream consumers (bot, UI) much easier
 // to reason about — e.g., "only act on momentum+trend confluence" or
@@ -73,7 +74,26 @@ export const SIGNAL_FAMILY: Record<SignalType, SignalFamily> = {
   sector_laggard: "structure",
 };
 
-const eventHistory = new Map<string, number>();
+// In-memory de-bouncer map. Hydrated from SQLite on first use so a PM2
+// restart doesn't refire every persistent signal at once; writes are
+// mirrored to SQLite synchronously (cheap — single-row insert/update).
+// Module-level lazy init so tests that don't touch signals don't pay
+// the load cost.
+let eventHistory: Map<string, number> | null = null;
+
+function getEventHistory(): Map<string, number> {
+  if (eventHistory) return eventHistory;
+  try {
+    eventHistory = loadEventHistory();
+  } catch (err) {
+    // If SQLite isn't available (tests, broken disk) we silently degrade
+    // to an in-memory map. Refire behaviour is then "as if just restarted",
+    // which is exactly the legacy behaviour — no regression.
+    console.warn("[signals] event history hydrate failed, using in-memory only:", err);
+    eventHistory = new Map();
+  }
+  return eventHistory;
+}
 
 const PERSISTENCE: Partial<Record<SignalType, number>> = {
   macd_bullish: 24 * 3_600_000,
@@ -96,13 +116,28 @@ function fireEvent(
   // Returns a partial signal so the caller can stamp family + volRegime via
   // the `tag()` helper. Keeping those two fields out here prevents us from
   // having to thread the regime through every fireEvent call.
+  const history = getEventHistory();
   const key = `${symbol}:${type}`;
   const now = Date.now();
-  const lastFired = eventHistory.get(key);
+  const lastFired = history.get(key);
   const persist = PERSISTENCE[type] || 24 * 3_600_000;
   if (lastFired && now - lastFired < persist) return null;
-  eventHistory.set(key, now);
+  history.set(key, now);
+  try {
+    recordEventFire(symbol, type, now);
+  } catch (err) {
+    // Write failure is non-fatal — the in-memory map still de-bounces
+    // for this process lifetime. Logged so we know if disk goes bad.
+    console.warn(`[signals] persist fire(${symbol}:${type}) failed:`, err);
+  }
   return { symbol, type, direction, value, label, firedAt: now };
+}
+
+// Test-only escape hatch: clear the in-memory cache so a follow-up call
+// re-hydrates from SQLite. Used by db.test.ts to prove that recorded
+// fires survive a "restart".
+export function _resetEventHistoryForTests(): void {
+  eventHistory = null;
 }
 
 export function detectSignals(
@@ -438,7 +473,7 @@ export function scoreConviction(signals: Signal[]): ConvictionResult {
 }
 
 // ── Sector-relative strength ────────────────────────────────────────────
-// Given a snapshot of (symbol, sector, 24h%) tuples across the universe,
+// Given a snapshot of (symbol, sector, change%) tuples across the universe,
 // emit signals for assets that are significantly outperforming or
 // underperforming their sector median. This is the piece that turns
 // "L1 sector +1.2% with SOL +4.8%" into a concrete "SOL sector-leader"
@@ -454,14 +489,91 @@ export function scoreConviction(signals: Signal[]): ConvictionResult {
 //   strategy (breakout traders long leaders; mean-reversion traders fade
 //   leaders / buy laggards). We emit both flavors and let the bot's
 //   strategy rules decide.
+// - The legacy single-arg signature (24h-only) is preserved so existing
+//   callers keep working unchanged. The horizon-aware multi-arg signature
+//   accepts a richer snapshot shape and emits per-horizon signals tagged
+//   with the corresponding timeframe.
 export interface SectorSnapshot {
   symbol: string;
   sector: Sector;
   change24h: number | null;
 }
 
+// Horizon-keyed change shape — used by the multi-arg sector-RS pass.
+// Any horizon may be null; we skip the horizon for that symbol but still
+// rank the symbol on the horizons that do have data.
+export interface SectorMultiSnapshot {
+  symbol: string;
+  sector: Sector;
+  change1h?: number | null;
+  change4h?: number | null;
+  change24h?: number | null;
+}
+
+export type SectorHorizon = "1h" | "4h" | "24h";
+
 const SECTOR_RS_MIN_MEMBERS = 4;
 const SECTOR_RS_Z_THRESHOLD = 1.5; // ≈ top/bottom ~7% by Z-score
+
+// Horizon → timeframe tag mapping. 24h sector RS lives at the daily
+// timeframe; 4h at the 4h scan; 1h at the 1h scan. This lets the
+// conviction scorer reuse the timeframe-alignment bonus naturally.
+const HORIZON_TF: Record<SectorHorizon, Timeframe> = {
+  "1h": "1h",
+  "4h": "4h",
+  "24h": "1d",
+};
+
+function rankSectorHorizon(
+  members: Array<{ symbol: string; change: number }>,
+  sector: Sector,
+  horizon: SectorHorizon,
+  firedAt: number
+): Signal[] {
+  if (members.length < SECTOR_RS_MIN_MEMBERS) return [];
+
+  // Median + MAD (median absolute deviation) — robust vs outlier-dragged
+  // mean/stddev, which matters when one coin pumps 40% and distorts the
+  // sector stats we're trying to measure deviation against.
+  const sorted = [...members].sort((a, b) => a.change - b.change);
+  const median = sorted[Math.floor(sorted.length / 2)].change;
+  const absDevs = members.map((m) => Math.abs(m.change - median)).sort((a, b) => a - b);
+  const mad = absDevs[Math.floor(absDevs.length / 2)] || 0.0001;
+  // 1.4826 scales MAD to an estimate of σ for a normal distribution.
+  const sigma = mad * 1.4826;
+  const tf = HORIZON_TF[horizon];
+
+  const out: Signal[] = [];
+  for (const m of members) {
+    const z = (m.change - median) / sigma;
+    if (z >= SECTOR_RS_Z_THRESHOLD) {
+      out.push({
+        symbol: m.symbol,
+        type: "sector_leader",
+        family: "structure",
+        direction: "bullish",
+        value: z,
+        strength: Math.min(100, ((z - SECTOR_RS_Z_THRESHOLD) / 2) * 80 + 40),
+        label: `Sector leader in ${sector} (${horizon}): ${m.change.toFixed(1)}% vs median ${median.toFixed(1)}% (z=${z.toFixed(1)})`,
+        firedAt,
+        timeframe: tf,
+      });
+    } else if (z <= -SECTOR_RS_Z_THRESHOLD) {
+      out.push({
+        symbol: m.symbol,
+        type: "sector_laggard",
+        family: "structure",
+        direction: "bearish",
+        value: z,
+        strength: Math.min(100, ((Math.abs(z) - SECTOR_RS_Z_THRESHOLD) / 2) * 80 + 40),
+        label: `Sector laggard in ${sector} (${horizon}): ${m.change.toFixed(1)}% vs median ${median.toFixed(1)}% (z=${z.toFixed(1)})`,
+        firedAt,
+        timeframe: tf,
+      });
+    }
+  }
+  return out;
+}
 
 export function detectSectorRelativeStrength(
   snapshot: SectorSnapshot[]
@@ -476,47 +588,53 @@ export function detectSectorRelativeStrength(
 
   const now = Date.now();
   const signals: Signal[] = [];
-
   for (const [sector, members] of bySector) {
-    if (members.length < SECTOR_RS_MIN_MEMBERS) continue;
+    signals.push(...rankSectorHorizon(members, sector, "24h", now));
+  }
+  // Legacy callers expect the 24h pass without the timeframe tag (so the
+  // old conviction bookkeeping that treats "cross" specially isn't
+  // accidentally activated). Strip the timeframe for backward-compat.
+  return signals.map((s) => {
+    const { timeframe, ...rest } = s;
+    void timeframe;
+    return rest;
+  });
+}
 
-    // Median + MAD (median absolute deviation) — robust vs outlier-dragged
-    // mean/stddev, which matters when one coin pumps 40% and distorts the
-    // sector stats we're trying to measure deviation against.
-    const sorted = [...members].sort((a, b) => a.change - b.change);
-    const median = sorted[Math.floor(sorted.length / 2)].change;
-    const absDevs = members.map((m) => Math.abs(m.change - median)).sort((a, b) => a - b);
-    const mad = absDevs[Math.floor(absDevs.length / 2)] || 0.0001;
-    // 1.4826 scales MAD to an estimate of σ for a normal distribution.
-    const sigma = mad * 1.4826;
+// Multi-horizon variant — ranks each sector on every available horizon
+// (1h / 4h / 24h) and emits a signal per (symbol, horizon) outlier.
+// Caller is responsible for assembling the SectorMultiSnapshot list,
+// typically by joining the live HL ctx (24h, via prevDayPx) with the
+// snapshotAt() lookup table for 1h-ago and 4h-ago marks.
+export function detectSectorRelativeStrengthMulti(
+  snapshot: SectorMultiSnapshot[]
+): Signal[] {
+  const byHorizon: Record<SectorHorizon, Map<Sector, Array<{ symbol: string; change: number }>>> = {
+    "1h": new Map(),
+    "4h": new Map(),
+    "24h": new Map(),
+  };
 
-    for (const m of members) {
-      const z = (m.change - median) / sigma;
-      if (z >= SECTOR_RS_Z_THRESHOLD) {
-        signals.push({
-          symbol: m.symbol,
-          type: "sector_leader",
-          family: "structure",
-          direction: "bullish",
-          value: z,
-          strength: Math.min(100, ((z - SECTOR_RS_Z_THRESHOLD) / 2) * 80 + 40),
-          label: `Sector leader in ${sector}: ${m.change.toFixed(1)}% vs median ${median.toFixed(1)}% (z=${z.toFixed(1)})`,
-          firedAt: now,
-        });
-      } else if (z <= -SECTOR_RS_Z_THRESHOLD) {
-        signals.push({
-          symbol: m.symbol,
-          type: "sector_laggard",
-          family: "structure",
-          direction: "bearish",
-          value: z,
-          strength: Math.min(100, ((Math.abs(z) - SECTOR_RS_Z_THRESHOLD) / 2) * 80 + 40),
-          label: `Sector laggard in ${sector}: ${m.change.toFixed(1)}% vs median ${median.toFixed(1)}% (z=${z.toFixed(1)})`,
-          firedAt: now,
-        });
-      }
+  for (const s of snapshot) {
+    const fields: Array<{ h: SectorHorizon; v: number | null | undefined }> = [
+      { h: "1h", v: s.change1h },
+      { h: "4h", v: s.change4h },
+      { h: "24h", v: s.change24h },
+    ];
+    for (const { h, v } of fields) {
+      if (v == null || !Number.isFinite(v)) continue;
+      const m = byHorizon[h].get(s.sector) ?? [];
+      m.push({ symbol: s.symbol, change: v });
+      byHorizon[h].set(s.sector, m);
     }
   }
 
-  return signals;
+  const now = Date.now();
+  const out: Signal[] = [];
+  for (const horizon of Object.keys(byHorizon) as SectorHorizon[]) {
+    for (const [sector, members] of byHorizon[horizon]) {
+      out.push(...rankSectorHorizon(members, sector, horizon, now));
+    }
+  }
+  return out;
 }

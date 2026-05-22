@@ -1,4 +1,5 @@
 import { cache } from "./cache";
+import { upsertCandles, getCandlesFromCache, type CandleRow } from "./db";
 
 const HL_API = "https://api.hyperliquid.xyz/info";
 
@@ -161,6 +162,63 @@ export async function getAllMids(): Promise<Record<string, string>> {
   );
 }
 
+// Layered candle storage:
+//   1. In-memory cache, keyed by (coin, interval) ONLY — not by count —
+//      so a caller asking for 200 bars and another asking for 350 bars
+//      hit the same memory slot. The cached array is the largest seen
+//      window; we slice the requested tail off it.
+//   2. SQLite candles_cache table — survives PM2 restarts and lets the
+//      cold-start path serve sparklines/indicators without HL calls.
+//   3. Hyperliquid fetch — only when both above miss.
+//
+// HL returns the most recent `count * interval_ms` candles ending at
+// endTime. Treating count as part of the cache key (the old behaviour)
+// meant /api/asset (count=350) and /api/signals (count=350 for 4h but
+// 200 for 1h, 300 for 1d) couldn't share — and worse, two routes asking
+// for the same TF with the same count *with different endTime* would
+// thrash on the route-cache boundary. Keying on (coin, interval) and
+// caching the largest window observed fixes both.
+
+const HL_CANDLE_TTL_MS = 300_000;
+
+function intervalMs(interval: string): number {
+  switch (interval) {
+    case "1h": return 3_600_000;
+    case "4h": return 14_400_000;
+    case "1d": return 86_400_000;
+    default:   return 14_400_000;
+  }
+}
+
+function tailSlice(rows: HLCandle[], count: number): HLCandle[] {
+  return rows.length <= count ? rows : rows.slice(rows.length - count);
+}
+
+function candleRowsToHL(rows: CandleRow[]): HLCandle[] {
+  // SQLite stores numerics; HL's wire format uses strings. We re-stringify
+  // here so downstream code (which already calls parseFloat) is unchanged.
+  return rows.map((r) => ({
+    t: r.t,
+    T: r.t + intervalMs(r.interval),
+    o: String(r.o), h: String(r.h), l: String(r.l), c: String(r.c),
+    v: String(r.v),
+    n: 0,
+  }));
+}
+
+function hlToCandleRows(coin: string, interval: string, candles: HLCandle[]): CandleRow[] {
+  return candles.map((c) => ({
+    symbol: coin,
+    interval,
+    t: c.t,
+    o: parseFloat(c.o),
+    h: parseFloat(c.h),
+    l: parseFloat(c.l),
+    c: parseFloat(c.c),
+    v: parseFloat(c.v),
+  }));
+}
+
 export async function getCandles(
   coin: string,
   interval: string = "4h",
@@ -168,14 +226,27 @@ export async function getCandles(
 ): Promise<HLCandle[]> {
   const cacheKey = `hl:candles:${coin}:${interval}`;
   const cached = cache.get<HLCandle[]>(cacheKey);
-  if (cached) return cached;
+  if (cached && cached.length >= count) return tailSlice(cached, count);
 
-  const intervalMs: Record<string, number> = {
-    "1h": 3_600_000,
-    "4h": 14_400_000,
-    "1d": 86_400_000,
-  };
-  const ms = intervalMs[interval] || 14_400_000;
+  // L2: SQLite. If we have enough rows AND the newest one is fresher than
+  // the in-memory TTL, serve from disk + populate the memory cache.
+  try {
+    const dbRows = getCandlesFromCache(coin, interval, count);
+    if (dbRows.length >= count) {
+      const newest = dbRows[dbRows.length - 1];
+      const age = Date.now() - newest.t - intervalMs(interval);
+      if (age < HL_CANDLE_TTL_MS) {
+        const hl = candleRowsToHL(dbRows);
+        cache.set(cacheKey, hl, HL_CANDLE_TTL_MS);
+        return tailSlice(hl, count);
+      }
+    }
+  } catch (err) {
+    console.warn(`[hl.getCandles] sqlite read failed for ${coin}:${interval}:`, err);
+  }
+
+  // L3: hit HL.
+  const ms = intervalMs(interval);
   const endTime = Date.now();
   const startTime = endTime - count * ms;
 
@@ -184,7 +255,13 @@ export async function getCandles(
     req: { coin, interval, startTime, endTime },
   });
 
-  cache.set(cacheKey, data, 300_000);
+  cache.set(cacheKey, data, HL_CANDLE_TTL_MS);
+  // Fire-and-forget persistence — the response doesn't wait on disk.
+  try {
+    upsertCandles(hlToCandleRows(coin, interval, data));
+  } catch (err) {
+    console.warn(`[hl.getCandles] sqlite write failed for ${coin}:${interval}:`, err);
+  }
   return data;
 }
 

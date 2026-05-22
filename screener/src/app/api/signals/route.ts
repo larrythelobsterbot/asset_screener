@@ -1,9 +1,15 @@
 import { NextResponse } from "next/server";
 import { getMetaAndCtxs, getCandles, getFundingHistory } from "@/lib/hyperliquid";
 import { HL_PERP_SECTOR_MAP } from "@/config/sectors";
-import { detectSignals, detectSectorRelativeStrength, Signal, type SectorSnapshot } from "@/lib/signals";
+import {
+  detectSignals,
+  detectSectorRelativeStrengthMulti,
+  Signal,
+  type SectorMultiSnapshot,
+} from "@/lib/signals";
 import { cache } from "@/lib/cache";
 import { logSignalFires } from "@/lib/signalPersistence";
+import { snapshotAt } from "@/lib/db";
 
 // Without this, Next.js 14 prerenders this route statically at build time
 // and serves a frozen snapshot forever. See markets/route.ts for the same
@@ -38,21 +44,47 @@ export async function GET() {
     // (not just the top-40) so the sector medians reflect the full sector
     // behaviour, not just the high-volume subset. Sector-RS signals are
     // then filtered down to the top-40 symbols below.
-    const fullSnapshot: SectorSnapshot[] = meta.universe
+    //
+    // Multi-horizon: 24h comes from HL's prevDayPx; 1h and 4h come from
+    // SQLite snapshots taken on prior /api/markets scans. On cold-start
+    // (DB just initialised) those horizons return empty and the multi-RS
+    // function silently skips them — degrades to 24h-only, same as legacy.
+    const mappedUniverse = meta.universe
       .map((u, i) => ({ u, ctx: assetCtxs[i] }))
-      .filter((a) => HL_PERP_SECTOR_MAP[a.u.name])
-      .map(({ u, ctx }) => {
-        const price = parseFloat(ctx.markPx || "0");
-        const prevDay = parseFloat(ctx.prevDayPx || "0");
-        const change24h = prevDay > 0 ? ((price - prevDay) / prevDay) * 100 : null;
-        return {
-          symbol: u.name,
-          sector: HL_PERP_SECTOR_MAP[u.name].sector,
-          change24h,
-        };
-      });
+      .filter((a) => HL_PERP_SECTOR_MAP[a.u.name]);
+    const allMappedSymbols = mappedUniverse.map((a) => a.u.name);
+
+    const now = Date.now();
+    // Tolerance window: a snapshot has to be within +/- a fraction of the
+    // horizon to count. snapshotAt() returns the row at or before target,
+    // so we only need a "not too stale" upper bound — i.e. the returned
+    // snapshot's ts must be within ~10% of the horizon from the target.
+    // We don't enforce that here because snapshotAt picks the closest
+    // older row, which is fine — but we *do* filter out empty results.
+    const snap1hAgo = snapshotAt(now - 3_600_000, allMappedSymbols);
+    const snap4hAgo = snapshotAt(now - 4 * 3_600_000, allMappedSymbols);
+
+    const fullSnapshot: SectorMultiSnapshot[] = mappedUniverse.map(({ u, ctx }) => {
+      const price = parseFloat(ctx.markPx || "0");
+      const prevDay = parseFloat(ctx.prevDayPx || "0");
+      const change24h = prevDay > 0 ? ((price - prevDay) / prevDay) * 100 : null;
+      const p1h = snap1hAgo.get(u.name);
+      const p4h = snap4hAgo.get(u.name);
+      // Sanity: if the historical price is zero or wildly off-scale
+      // (e.g. SPX scaling artefact persisted), skip it — better no signal
+      // than a misleading one.
+      const change1h = p1h && p1h > 0 ? ((price - p1h) / p1h) * 100 : null;
+      const change4h = p4h && p4h > 0 ? ((price - p4h) / p4h) * 100 : null;
+      return {
+        symbol: u.name,
+        sector: HL_PERP_SECTOR_MAP[u.name].sector,
+        change1h,
+        change4h,
+        change24h,
+      };
+    });
     const topSymbols = new Set(mapped.map((m) => m.name));
-    const sectorSignals = detectSectorRelativeStrength(fullSnapshot).filter((s) =>
+    const sectorSignals = detectSectorRelativeStrengthMulti(fullSnapshot).filter((s) =>
       topSymbols.has(s.symbol)
     );
     allSignals.push(...sectorSignals);

@@ -4,6 +4,19 @@ import { getMarkets } from "@/lib/coingecko";
 import { HL_PERP_SECTOR_MAP, HL_BUILDER_PERP_MAP, BUILDER_DEXES, SECTORS, Sector } from "@/config/sectors";
 import { AssetData } from "@/lib/types";
 import { cache } from "@/lib/cache";
+import {
+  insertPriceSnapshots,
+  startPruneJob,
+  snapshotAt,
+  getCandlesFromCache,
+  type PriceSnapshotRow,
+} from "@/lib/db";
+
+// Kick the periodic prune job once per process. Idempotent — repeated
+// calls are no-ops. This is the natural place to hook startup because
+// /api/markets is the most-hit route, so the prune timer is alive
+// shortly after process boot.
+startPruneJob();
 
 // Without this, Next.js 14 App Router prerenders this route at BUILD TIME
 // and the built-in response gets served forever — meaning every price in
@@ -24,6 +37,12 @@ export async function GET() {
     ]);
 
     const assets: AssetData[] = [];
+    // Time-series snapshot rows accumulated alongside the response shape.
+    // We collect raw HL data here (closest to the source) rather than
+    // re-deriving from AssetData later, which avoids the markPrice/change24h
+    // round-trip floating-point loss.
+    const snapshotTs = Date.now();
+    const snapshotRows: PriceSnapshotRow[] = [];
 
     // ALL Hyperliquid perps — use sector map if available, otherwise auto-classify
     const { meta, assetCtxs } = hlData;
@@ -62,6 +81,8 @@ export async function GET() {
         sectorColor = SECTORS["crypto-alt"].color;
       }
 
+      const fundingRate = parseFloat(ctx.funding || "0");
+      const openInterest = parseFloat(ctx.openInterest || "0");
       assets.push({
         symbol: name,
         name: label,
@@ -73,11 +94,20 @@ export async function GET() {
         change24h,
         change7d: null,
         volume24h: volume,
-        fundingRate: parseFloat(ctx.funding || "0"),
-        openInterest: parseFloat(ctx.openInterest || "0"),
+        fundingRate,
+        openInterest,
         markPrice: price,
         oraclePrice: parseFloat(ctx.oraclePx || "0"),
         source: "hyperliquid",
+      });
+      snapshotRows.push({
+        symbol: name,
+        ts: snapshotTs,
+        mark: price,
+        prev_day: prevDayPx > 0 ? prevDayPx : null,
+        funding: fundingRate,
+        oi: openInterest,
+        volume,
       });
     }
 
@@ -129,6 +159,8 @@ export async function GET() {
         const label: string = mapping?.label ?? ticker;
         const sectorColor = SECTORS[sector].color;
 
+        const fundingRate = parseFloat(ctx.funding || "0");
+        const openInterest = parseFloat(ctx.openInterest || "0");
         assets.push({
           symbol: ticker,
           name: label,
@@ -140,11 +172,20 @@ export async function GET() {
           change24h,
           change7d: null,
           volume24h: volume,
-          fundingRate: parseFloat(ctx.funding || "0"),
-          openInterest: parseFloat(ctx.openInterest || "0"),
+          fundingRate,
+          openInterest,
           markPrice: price,
           oraclePrice: parseFloat(ctx.oraclePx || "0"),
           source: "hyperliquid",
+        });
+        snapshotRows.push({
+          symbol: ticker,
+          ts: snapshotTs,
+          mark: price,
+          prev_day: prevDayPx > 0 ? prevDayPx : null,
+          funding: fundingRate,
+          oi: openInterest,
+          volume,
         });
       }
     }
@@ -185,7 +226,54 @@ export async function GET() {
       });
     }
 
+    // ── Backfill 1h / 4h / 7d change% from local data ─────────────────
+    // No new HL calls. Sources:
+    //   change1h  ← price_snapshots taken 1h ago by a prior scan
+    //   change4h  ← price_snapshots taken 4h ago
+    //   change7d  ← 1d candles from candles_cache (populated by signals + modal)
+    // Missing data leaves the field at null — same as before this change.
+    // On cold start (first hour after first deploy) all three will be null
+    // for everything; the heatmap already handles null gracefully.
+    const hlSymbolsForBackfill = assets
+      .filter((a) => a.source === "hyperliquid")
+      .map((a) => a.symbol);
+    const snap1h = snapshotAt(snapshotTs - 3_600_000, hlSymbolsForBackfill);
+    const snap4h = snapshotAt(snapshotTs - 4 * 3_600_000, hlSymbolsForBackfill);
+    for (const a of assets) {
+      if (a.source !== "hyperliquid") continue;
+      const p1 = snap1h.get(a.symbol);
+      const p4 = snap4h.get(a.symbol);
+      if (p1 && p1 > 0) a.change1h = ((a.price - p1) / p1) * 100;
+      if (p4 && p4 > 0) a.change4h = ((a.price - p4) / p4) * 100;
+      // 7d: 1d candles oldest-first. The last bar is "today (in progress)"
+      // so the close 7 bars ago is candles[length - 8]. Need at least 8.
+      try {
+        const dailies = getCandlesFromCache(a.symbol, "1d", 10);
+        if (dailies.length >= 8) {
+          const sevenAgo = dailies[dailies.length - 8].c;
+          if (sevenAgo > 0) a.change7d = ((a.price - sevenAgo) / sevenAgo) * 100;
+        }
+      } catch {
+        // ignore — leave as null
+      }
+    }
+
     cache.set("api:markets", assets, 30_000);
+
+    // Fire-and-forget time-series snapshot. Only HL-sourced rows are
+    // captured (assembled in the perp + builder-dex loops above) — we
+    // don't dilute the table with CG rows that lack OI/funding.
+    // setImmediate keeps the SQLite write strictly off the response's
+    // critical path; a ~230-row transaction in WAL mode runs in single-
+    // digit ms so this is a defensive measure rather than a hot fix.
+    setImmediate(() => {
+      try {
+        insertPriceSnapshots(snapshotRows);
+      } catch (err) {
+        console.warn(`[markets] snapshot insert failed:`, err);
+      }
+    });
+
     return NextResponse.json(assets, {
       headers: { "Cache-Control": "no-store, no-cache, must-revalidate", "CDN-Cache-Control": "no-store" },
     });
