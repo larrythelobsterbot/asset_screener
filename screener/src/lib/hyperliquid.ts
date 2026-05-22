@@ -307,6 +307,50 @@ export async function getSpotMetaAndCtxs(): Promise<{ meta: HLSpotMeta; spotCtxs
   return result;
 }
 
+// ── HIP-4 outcomes ────────────────────────────────────────────────────
+// Schema (current): { outcomes: OutcomeSpec[], questions: QuestionSpec[] }
+// Outcomes are individual binary contracts; questions group multiple
+// outcomes that all settle together (exactly one resolves Yes). The
+// recurring daily BTC binary is a single outcome (no question wrapper).
+//
+// description follows a pipe-delimited mini-language:
+//   class:priceBinary|underlying:BTC|expiry:20260523-0600|targetPrice:77451|period:1d
+//
+// Outcome asset ID encoding (per docs/asset-ids):
+//   asset_id = 100_000_000 + 10 * outcome + side
+//   yes = side 0, no = side 1
+//   spot coin string: "#" + (10*outcome+side)    e.g. "#800"
+//
+// We cache for 30s — outcomeMeta only changes daily at 06:00 UTC when
+// the new contract gets deployed, but a tighter TTL means we pick up
+// the new contract within 30s of rollover.
+
+export interface OutcomeSpec {
+  outcome: number;
+  name: string;
+  description: string;
+  sideSpecs: Array<{ name: string }>;
+}
+
+export interface OutcomeMeta {
+  outcomes: OutcomeSpec[];
+  questions: Array<{
+    question: number;
+    name: string;
+    description: string;
+    fallbackOutcome?: number;
+    namedOutcomes?: number[];
+  }>;
+}
+
+export async function getOutcomeMeta(): Promise<OutcomeMeta> {
+  return cache.getWithRefresh(
+    "hl:outcomeMeta",
+    () => hlPost<OutcomeMeta>({ type: "outcomeMeta" }),
+    30_000
+  );
+}
+
 export async function getBuilderDexData(dex: string): Promise<{ meta: HLMeta; assetCtxs: HLAssetCtx[] }> {
   const cacheKey = `hl:builderDex:${dex}`;
   const cached = cache.get<{ meta: HLMeta; assetCtxs: HLAssetCtx[] }>(cacheKey);

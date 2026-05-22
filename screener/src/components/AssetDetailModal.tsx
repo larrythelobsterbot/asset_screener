@@ -17,6 +17,7 @@ import RSIGauge from "./RSIGauge";
 import MomentumCell from "./MomentumCell";
 import type { ScreenerRow } from "@/app/api/screener/route";
 import type { SocialResponse } from "@/app/api/social/trending/route";
+import type { BtcBinaryResponse } from "@/app/api/btc/binary/route";
 
 const BUILDER_TICKER_INFO: Record<string, { sector: string; label: string }> = {};
 for (const [key, info] of Object.entries(HL_BUILDER_PERP_MAP)) {
@@ -161,6 +162,166 @@ function ConfRow({ label, hit, detail }: { label: string; hit: boolean; detail: 
   );
 }
 
+// ── BTC daily binary section (HIP-4) ───────────────────────────────────
+// Compact card showing target price, expiry countdown, market-implied
+// vs model-implied probability, and divergence. Highlights mustard
+// when |divergence| ≥ 10% (the threshold suggested in the LTF research
+// notes for "the market and the model disagree enough to investigate").
+
+function formatTimeRemaining(ms: number): string {
+  if (ms <= 0) return "expired";
+  const h = Math.floor(ms / 3_600_000);
+  const m = Math.floor((ms % 3_600_000) / 60_000);
+  if (h >= 24) {
+    const d = Math.floor(h / 24);
+    return `${d}d ${h % 24}h`;
+  }
+  if (h > 0) return `${h}h ${m}m`;
+  return `${m}m`;
+}
+
+function BtcBinarySection({ binary }: { binary: BtcBinaryResponse }) {
+  const marketPct = binary.market_probability * 100;
+  const modelPct = binary.model_probability != null ? binary.model_probability * 100 : null;
+  const divergencePct = binary.divergence != null ? binary.divergence * 100 : null;
+  // Highlight when |divergence| crosses the threshold for "worth a look".
+  const hot = divergencePct != null && Math.abs(divergencePct) >= 10;
+  // Direction-of-divergence color: model > market = model thinks YES
+  // is underpriced (positive divergence, green); inverse otherwise.
+  const divTone =
+    divergencePct == null ? "tone-mute" :
+    divergencePct >= 10 ? "tone-up" :
+    divergencePct <= -10 ? "tone-down" :
+    "tone-mute";
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+      {/* Top row: target + countdown */}
+      <div style={{
+        display: "grid",
+        gridTemplateColumns: "1fr auto",
+        gap: 12,
+        alignItems: "baseline",
+        padding: "8px 12px",
+        background: "var(--bg-chip)",
+        borderRadius: "var(--radius)",
+        border: ".5px solid var(--border-soft)",
+      }}>
+        <div>
+          <div style={{
+            fontSize: 9, color: "var(--text-mute)",
+            letterSpacing: ".14em", textTransform: "uppercase",
+          }}>
+            Settles ≥ Target?
+          </div>
+          <div style={{
+            fontSize: 18,
+            fontFamily: "var(--font-geist-mono), ui-monospace, monospace",
+            color: "var(--text-strong)",
+            marginTop: 2,
+          }}>
+            ${binary.target_price.toLocaleString(undefined, { maximumFractionDigits: 2 })}
+          </div>
+        </div>
+        <div style={{ textAlign: "right" }}>
+          <div style={{
+            fontSize: 9, color: "var(--text-mute)",
+            letterSpacing: ".14em", textTransform: "uppercase",
+          }}>
+            Expires In
+          </div>
+          <div style={{
+            fontSize: 18,
+            fontFamily: "var(--font-geist-mono), ui-monospace, monospace",
+            color: "var(--text)",
+            marginTop: 2,
+          }}>
+            {formatTimeRemaining(binary.ms_to_expiry)}
+          </div>
+        </div>
+      </div>
+
+      {/* Probability comparison */}
+      <div style={{
+        display: "grid",
+        gridTemplateColumns: "1fr 1fr 1fr",
+        gap: 1,
+        background: "var(--border-soft)",
+        borderRadius: "var(--radius)",
+        overflow: "hidden",
+        border: hot
+          ? ".5px solid color-mix(in oklab, var(--acc-warn) 35%, transparent)"
+          : undefined,
+      }}>
+        <div style={{ padding: "10px 12px", background: "var(--bg-card)" }}>
+          <div style={{ fontSize: 9, color: "var(--text-mute)", letterSpacing: ".14em", textTransform: "uppercase" }}>
+            Market
+          </div>
+          <div style={{
+            fontSize: 16,
+            fontFamily: "var(--font-geist-mono), ui-monospace, monospace",
+            color: "var(--text-strong)",
+            marginTop: 4,
+          }}>
+            {marketPct.toFixed(1)}%
+          </div>
+        </div>
+        <div style={{ padding: "10px 12px", background: "var(--bg-card)" }}>
+          <div style={{ fontSize: 9, color: "var(--text-mute)", letterSpacing: ".14em", textTransform: "uppercase" }}>
+            Model
+          </div>
+          <div style={{
+            fontSize: 16,
+            fontFamily: "var(--font-geist-mono), ui-monospace, monospace",
+            color: modelPct == null ? "var(--text-mute)" : "var(--text-strong)",
+            marginTop: 4,
+          }}>
+            {modelPct == null ? "—" : `${modelPct.toFixed(1)}%`}
+          </div>
+        </div>
+        <div style={{ padding: "10px 12px", background: hot ? "color-mix(in oklab, var(--acc-warn) 10%, var(--bg-card))" : "var(--bg-card)" }}>
+          <div style={{ fontSize: 9, color: "var(--text-mute)", letterSpacing: ".14em", textTransform: "uppercase" }}>
+            Divergence
+          </div>
+          <div
+            className={divTone}
+            style={{
+              fontSize: 16,
+              fontFamily: "var(--font-geist-mono), ui-monospace, monospace",
+              marginTop: 4,
+              color: hot ? "var(--acc-warn)" : undefined,
+            }}
+          >
+            {divergencePct == null ? "—" : `${divergencePct > 0 ? "+" : ""}${divergencePct.toFixed(1)}%`}
+          </div>
+        </div>
+      </div>
+
+      {/* Metadata row */}
+      <div style={{
+        display: "flex",
+        justifyContent: "space-between",
+        fontSize: 10,
+        color: "var(--text-mute)",
+        fontFamily: "var(--font-geist-mono), ui-monospace, monospace",
+        padding: "0 4px",
+      }}>
+        <span>YES <code>{binary.yes_price.toFixed(4)}</code> · NO <code>{binary.no_price.toFixed(4)}</code></span>
+        <span>
+          {binary.realized_vol_30d != null
+            ? `σ ${(binary.realized_vol_30d * 100).toFixed(0)}%`
+            : "σ —"}
+          {Math.abs(binary.parity_sum - 1) > 0.01 && (
+            <span style={{ color: "var(--acc-warn)", marginLeft: 8 }}>
+              parity {binary.parity_sum.toFixed(4)}
+            </span>
+          )}
+        </span>
+      </div>
+    </div>
+  );
+}
+
 // ── Main component ─────────────────────────────────────────────────────
 
 export default function AssetDetailModal({ symbol, onClose }: Props) {
@@ -171,6 +332,9 @@ export default function AssetDetailModal({ symbol, onClose }: Props) {
     rank: number | null;
     total: number | null;
   } | null>(null);
+  // BTC daily binary outcome (HIP-4). Only fetched when symbol === "BTC".
+  // null = not fetched yet; non-null = either real data or { error: ... }.
+  const [binary, setBinary] = useState<BtcBinaryResponse | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
 
@@ -178,9 +342,12 @@ export default function AssetDetailModal({ symbol, onClose }: Props) {
     setLoading(true);
     setError(null);
     // Fetch in parallel: per-symbol detail + the screener slice + the
-    // social trending list. All three are server-cached so opening
-    // multiple panels in succession costs at most one upstream call to
-    // each backend. Elfa is 1-hour cached → at most 1 credit/hour.
+    // social trending list + (BTC only) the HIP-4 binary outcome state.
+    // All routes are server-cached so opening multiple panels in
+    // succession costs at most one upstream call to each backend.
+    // The binary fetch is gated on symbol === "BTC" to save a request
+    // for every other asset; Promise.resolve(null) for the rest.
+    const isBtc = symbol === "BTC";
     Promise.all([
       fetch(`/api/asset/${symbol}`).then((r) => {
         if (!r.ok) throw new Error(`Failed to load ${symbol}`);
@@ -188,8 +355,12 @@ export default function AssetDetailModal({ symbol, onClose }: Props) {
       }),
       fetch(`/api/screener?tf=1d`).then((r) => r.json()),
       fetch(`/api/social/trending?tf=24h`).then((r) => r.ok ? r.json() : null).catch(() => null),
+      isBtc
+        ? fetch(`/api/btc/binary`).then((r) => r.ok ? r.json() : null).catch(() => null)
+        : Promise.resolve(null),
     ])
-      .then(([d, rows, soc]: [AssetDetail, ScreenerRow[], SocialResponse | null]) => {
+      .then(([d, rows, soc, bin]: [AssetDetail, ScreenerRow[], SocialResponse | null, BtcBinaryResponse | null]) => {
+        setBinary(bin);
         setData(d);
         if (Array.isArray(rows)) {
           setScreenerRow(rows.find((r) => r.symbol === symbol) ?? null);
@@ -440,6 +611,19 @@ export default function AssetDetailModal({ symbol, onClose }: Props) {
                   </p>
                 )}
               </section>
+
+              {/* HIP-4 daily BTC binary — only rendered for BTC and only
+                  when the binary fetch succeeded. Cards out target
+                  price, expiry countdown, market vs model probability,
+                  and divergence. */}
+              {binary && symbol === "BTC" && (
+                <section style={{ marginBottom: 24 }}>
+                  <div className="br-label" style={{ marginBottom: 10, paddingBottom: 6, borderBottom: ".5px solid var(--border-soft)" }}>
+                    Daily Binary · HIP-4
+                  </div>
+                  <BtcBinarySection binary={binary} />
+                </section>
+              )}
 
               {/* Momentum */}
               <section style={{ marginBottom: 24 }}>

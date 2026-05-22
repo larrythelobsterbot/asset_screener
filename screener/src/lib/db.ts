@@ -34,7 +34,7 @@ export function getDb(): Database.Database {
 // Versioned via PRAGMA user_version so we can add schema changes without
 // blowing away the local file. Bump VERSION and add a step.
 
-const VERSION = 5;
+const VERSION = 6;
 
 function migrate(db: Database.Database): void {
   const current = db.pragma("user_version", { simple: true }) as number;
@@ -45,6 +45,7 @@ function migrate(db: Database.Database): void {
   if (current < 3) db.exec(MIGRATION_V3);
   if (current < 4) db.exec(MIGRATION_V4);
   if (current < 5) db.exec(MIGRATION_V5);
+  if (current < 6) db.exec(MIGRATION_V6);
   db.pragma(`user_version = ${VERSION}`);
 }
 
@@ -151,6 +152,27 @@ const MIGRATION_V4 = `
       last_fired_at  integer not null,
       primary key (symbol, type, timeframe)
     );
+  `;
+
+// V6 — Daily BTC binary outcome (HIP-4) time series. Polled every 60s
+// alongside the existing TWAP pressure poller. Each contract day has a
+// fresh `target_price` and `expiry_ms`; rows from prior contracts stay
+// in the table for backtests. We index on ts (the snapshot time, not
+// the contract expiry) so range queries by clock time are fast.
+//
+// target_price is the strike: payout = $1 if BTC mark >= target at
+// expiry, $0 otherwise. yes_price / no_price are the live market mids.
+const MIGRATION_V6 = `
+    create table if not exists btc_binary_snapshots (
+      ts            integer primary key,
+      target_price  real    not null,
+      expiry_ms     integer not null,
+      yes_price     real    not null,
+      no_price      real    not null,
+      btc_mid       real    not null
+    );
+    create index if not exists idx_btc_binary_ts on btc_binary_snapshots(ts desc);
+    create index if not exists idx_btc_binary_expiry on btc_binary_snapshots(expiry_ms desc);
   `;
 
 // V5 — social_snapshots gains a `time_window` column. The route
@@ -552,6 +574,47 @@ export function pruneHypePressureSnapshots(maxAgeMs: number = 30 * 86_400_000): 
     .run(Date.now() - maxAgeMs).changes;
 }
 
+// ── btc_binary_snapshots (HIP-4 daily BTC binary, v6) ───────────────────
+
+export interface BtcBinaryRow {
+  ts: number;
+  target_price: number;
+  expiry_ms: number;
+  yes_price: number;
+  no_price: number;
+  btc_mid: number;
+}
+
+export function insertBtcBinarySnapshot(row: BtcBinaryRow): void {
+  const db = getDb();
+  db.prepare(
+    `insert into btc_binary_snapshots
+       (ts, target_price, expiry_ms, yes_price, no_price, btc_mid)
+     values (@ts, @target_price, @expiry_ms, @yes_price, @no_price, @btc_mid)
+     on conflict(ts) do update set
+       target_price = excluded.target_price,
+       expiry_ms = excluded.expiry_ms,
+       yes_price = excluded.yes_price,
+       no_price = excluded.no_price,
+       btc_mid = excluded.btc_mid`
+  ).run(row);
+}
+
+export function latestBtcBinarySnapshot(): BtcBinaryRow | null {
+  const db = getDb();
+  const row = db.prepare(
+    `select ts, target_price, expiry_ms, yes_price, no_price, btc_mid
+     from btc_binary_snapshots order by ts desc limit 1`
+  ).get() as BtcBinaryRow | undefined;
+  return row ?? null;
+}
+
+export function pruneBtcBinarySnapshots(maxAgeMs: number = 30 * 86_400_000): number {
+  const db = getDb();
+  return db.prepare(`delete from btc_binary_snapshots where ts < ?`)
+    .run(Date.now() - maxAgeMs).changes;
+}
+
 // ── runtime_kv ──────────────────────────────────────────────────────────
 
 export function kvGet(key: string): string | null {
@@ -611,9 +674,10 @@ export function startPruneJob(): void {
       const cp = pruneCandles();
       const ss = pruneSocialSnapshots();
       const hp = pruneHypePressureSnapshots();
-      if (sp > 0 || cp > 0 || ss > 0 || hp > 0) {
+      const bb = pruneBtcBinarySnapshots();
+      if (sp > 0 || cp > 0 || ss > 0 || hp > 0 || bb > 0) {
         console.info(
-          `[db] pruned ${sp} price, ${cp} candle, ${ss} social, ${hp} hype-pressure snapshots`
+          `[db] pruned ${sp} price, ${cp} candle, ${ss} social, ${hp} hype-pressure, ${bb} btc-binary snapshots`
         );
       }
     } catch (err) {
