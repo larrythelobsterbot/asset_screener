@@ -17,6 +17,7 @@ import type { Signal } from "./signals";
 import { scoreConviction, type ConvictionResult, SIGNAL_FAMILY } from "./signals";
 import { sendTelegramMessage, escapeHtml, isTelegramConfigured } from "./telegram";
 import { kvGet, kvSet } from "./db";
+import { priorityOf, sectorOf } from "@/config/sectors";
 
 // 4-hour cooldown per (symbol, direction). Matches the 4h primary timeframe —
 // if the setup is still valid 4h later it's worth re-alerting; sooner than
@@ -89,9 +90,13 @@ function formatAlert(
     return `• ${escapeHtml(s.label)} <code>${escapeHtml(fam)}${escapeHtml(tag)}</code>`;
   }).join("\n");
 
+  // Sector tag for readability — at-a-glance "commodity setup" vs
+  // "crypto-alt noise" distinction in the alert.
+  const sector = sectorOf(symbol);
+  const sectorTag = `<i>${escapeHtml(sector)}</i>`;
   const priceLine = currentPrice != null
-    ? `<b>${escapeHtml(symbol)}</b> @ <code>$${currentPrice.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</code>`
-    : `<b>${escapeHtml(symbol)}</b>`;
+    ? `<b>${escapeHtml(symbol)}</b> · ${sectorTag} · @ <code>$${currentPrice.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</code>`
+    : `<b>${escapeHtml(symbol)}</b> · ${sectorTag}`;
 
   return [
     `${dot} <b>${escapeHtml(label)}</b> · ${escapeHtml(direction)} · score <code>${score}</code>`,
@@ -141,7 +146,12 @@ export async function maybeDispatchAlerts(
   let considered = 0;
 
   for (const [symbol, signals] of bySymbol) {
-    const conviction = scoreConviction(signals);
+    // Pass the sector-priority multiplier so high-priority sectors
+    // (commodities = 1.4x, stocks = 1.3x, indices = 1.2x — see
+    // sectors.ts SECTORS) get amplified scoring. A neutral-conviction
+    // commodity setup that would have stayed below the alert threshold
+    // can clear it once the multiplier compounds with confluence.
+    const conviction = scoreConviction(signals, priorityOf(symbol));
     const absScore = Math.abs(conviction.score);
     if (absScore < STRONG_THRESHOLD) continue;
     if (conviction.volRegime === "quiet") continue;

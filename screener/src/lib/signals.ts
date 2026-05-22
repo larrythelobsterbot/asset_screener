@@ -441,7 +441,16 @@ export interface ConvictionResult {
   byTimeframe: Partial<Record<Timeframe, { score: number; count: number }>>;
 }
 
-export function scoreConviction(signals: Signal[]): ConvictionResult {
+export function scoreConviction(
+  signals: Signal[],
+  // Sector-priority multiplier applied to the final score. Default 1
+  // = no boost. Used by the alerter to amplify high-priority asset
+  // classes (commodities = 1.4, stocks = 1.3, indices = 1.2 — see
+  // sectors.ts SECTORS). Applied AFTER diversity + cross-TF bonuses
+  // so the priority compounds with confluence rather than replacing
+  // it. Resolver lives in sectors.ts to keep this lib sector-agnostic.
+  sectorPriority: number = 1,
+): ConvictionResult {
   let score = 0;
   const familySet = new Set<SignalFamily>();
   let bull = 0;
@@ -492,6 +501,12 @@ export function scoreConviction(signals: Signal[]): ConvictionResult {
     const aligned = tfScores.filter((x) => Math.sign(x) === netDir).length;
     if (aligned >= 2) score *= 1 + 0.1 * (aligned - 1);
   }
+
+  // Final step: sector-priority multiplier. Compounds with diversity +
+  // cross-TF bonuses so a commodity setup that already had confluence
+  // gets the boost it deserves; a single-signal commodity move at
+  // baseline conviction still won't cross the Strong Buy threshold.
+  if (sectorPriority !== 1) score *= sectorPriority;
 
   let label: ConvictionResult["label"];
   if (score >= 3.5) label = "Strong Buy";

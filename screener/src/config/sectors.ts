@@ -18,23 +18,33 @@ export interface SectorConfig {
   id: Sector;
   label: string;
   color: string;
+  // Conviction-score multiplier for signals on assets in this sector.
+  // Defaults to 1.0. >1.0 means signals fire alerts more easily; <1.0
+  // means they need to clear a higher bar. Tunes the alert/heatmap
+  // priority WITHOUT changing the underlying signal logic — useful
+  // when the user is focused on a specific asset class.
+  priority?: number;
 }
 
 export const SECTORS: Record<Sector, SectorConfig> = {
-  majors: { id: "majors", label: "Majors", color: "#F0B90B" },
-  stocks: { id: "stocks", label: "Stocks", color: "#3B82F6" },
-  indices: { id: "indices", label: "Indices", color: "#FCD34D" },
-  commodities: { id: "commodities", label: "Commodities", color: "#F59E0B" },
-  forex: { id: "forex", label: "Forex", color: "#38BDF8" },
-  preipo: { id: "preipo", label: "Pre-IPO", color: "#8B5CF6" },
-  l1: { id: "l1", label: "Layer 1s", color: "#3B82F6" },
-  defi: { id: "defi", label: "DeFi", color: "#10B981" },
-  meme: { id: "meme", label: "Memecoins", color: "#EC4899" },
-  ai: { id: "ai", label: "AI & Data", color: "#A78BFA" },
-  gaming: { id: "gaming", label: "Gaming", color: "#F97316" },
-  infra: { id: "infra", label: "Infrastructure", color: "#64748B" },
-  "crypto-major": { id: "crypto-major", label: "Crypto Majors", color: "#06B6D4" },
-  "crypto-alt": { id: "crypto-alt", label: "Crypto Alts", color: "#F43F5E" },
+  majors:        { id: "majors",        label: "Majors",          color: "#F0B90B" },
+  // Commodities + stocks are boosted: macro-driven, slower-moving, and
+  // generally less noisy than crypto. A 1.4x multiplier means a Buy
+  // setup that would have landed at conviction=2.8 (Neutral) clears
+  // to ~3.9 (Strong Buy) here. Tune via env if needed.
+  stocks:        { id: "stocks",        label: "Stocks",          color: "#3B82F6", priority: 1.3 },
+  indices:       { id: "indices",       label: "Indices",         color: "#FCD34D", priority: 1.2 },
+  commodities:   { id: "commodities",   label: "Commodities",     color: "#F59E0B", priority: 1.4 },
+  forex:         { id: "forex",         label: "Forex",           color: "#38BDF8" },
+  preipo:        { id: "preipo",        label: "Pre-IPO",         color: "#8B5CF6" },
+  l1:            { id: "l1",            label: "Layer 1s",        color: "#3B82F6" },
+  defi:          { id: "defi",          label: "DeFi",            color: "#10B981" },
+  meme:          { id: "meme",          label: "Memecoins",       color: "#EC4899" },
+  ai:            { id: "ai",            label: "AI & Data",       color: "#A78BFA" },
+  gaming:        { id: "gaming",        label: "Gaming",          color: "#F97316" },
+  infra:         { id: "infra",         label: "Infrastructure",  color: "#64748B" },
+  "crypto-major":{ id: "crypto-major",  label: "Crypto Majors",   color: "#06B6D4" },
+  "crypto-alt":  { id: "crypto-alt",    label: "Crypto Alts",     color: "#F43F5E" },
 };
 
 // Hyperliquid PERP ticker → sector mapping
@@ -395,6 +405,79 @@ export const HL_BUILDER_PERP_MAP: Record<string, { sector: Sector; label: string
   "flx:BTC":       { sector: "majors",      label: "Bitcoin (Felix)" },
   "flx:XMR":       { sector: "l1",          label: "Monero (Felix)" },
   "flx:USDE":      { sector: "crypto-alt",  label: "USDe (Felix)" },
+
+  // ── xyz: stocks discovered in audit (2026-05-22) ──────────────────────
+  // Previously fell through to crypto-alt. Hand-tagged by ticker.
+  "xyz:ARM":       { sector: "stocks",      label: "Arm Holdings" },
+  "xyz:ASML":      { sector: "stocks",      label: "ASML Holding" },
+  "xyz:BX":        { sector: "stocks",      label: "Blackstone" },
+  "xyz:EBAY":      { sector: "stocks",      label: "eBay" },
+  "xyz:LITE":      { sector: "stocks",      label: "Lumentum" },
+  "xyz:MRVL":      { sector: "stocks",      label: "Marvell" },
+  "xyz:RKLB":      { sector: "stocks",      label: "Rocket Lab" },
+  "xyz:ZM":        { sector: "stocks",      label: "Zoom" },
+  "xyz:BIRD":      { sector: "stocks",      label: "Allbirds" },
+  "cash:CAR":      { sector: "stocks",      label: "Avis Budget (CAR)" },
+
+  // ── xyz: commodities discovered in audit ──────────────────────────────
+  "xyz:CORN":      { sector: "commodities", label: "Corn Futures" },
+  "xyz:WHEAT":     { sector: "commodities", label: "Wheat Futures" },
+  "xyz:TTF":       { sector: "commodities", label: "TTF Natural Gas (EU)" },
+  "xyz:DRAM":      { sector: "commodities", label: "DRAM Memory Index" },
+  "vntl:SOY":      { sector: "commodities", label: "Soybeans" },
+  "vntl:WHEAT":    { sector: "commodities", label: "Wheat (Variational)" },
+
+  // ── xyz: indices / ETFs discovered in audit ───────────────────────────
+  "xyz:EWT":       { sector: "indices",     label: "iShares MSCI Taiwan ETF" },
+  "xyz:EWZ":       { sector: "indices",     label: "iShares MSCI Brazil ETF" },
+  "xyz:IBOV":      { sector: "indices",     label: "Brazil Bovespa Index" },
+  "xyz:NIFTY":     { sector: "indices",     label: "India Nifty 50" },
+  "xyz:XLE":       { sector: "indices",     label: "Energy Select Sector ETF" },
+  "xyz:VOL":       { sector: "indices",     label: "Volatility Index" },
+  // CBRS — uncertain identity; tagging as indices/basket (high $258
+  // price suggests synthetic/basket rather than a single equity).
+  "xyz:CBRS":      { sector: "indices",     label: "CBRS Basket" },
+  // H100 — could be Hang Seng Tech 100 OR an NVIDIA H100 GPU index.
+  // Tagging indices for now; relabel if the user has better info.
+  "xyz:H100":      { sector: "indices",     label: "H100 Index" },
+
+  // ── xyz: pre-IPO ──────────────────────────────────────────────────────
+  "xyz:SPCX":      { sector: "preipo",      label: "SpaceX (xyz)" },
+
+  // ── xyz: forex ────────────────────────────────────────────────────────
+  "xyz:GBP":       { sector: "forex",       label: "British Pound" },
+  "xyz:KRW":       { sector: "forex",       label: "Korean Won" },
+
+  // ── PURRDAT — Hyperliquid ecosystem data token ────────────────────────
+  // Behaves like an L1 ecosystem token, not equity/commodity.
+  "xyz:PURRDAT":   { sector: "infra",       label: "Purr Data" },
+
+  // ── Cross-DEX duplicates so the precedence picker has labels ──────────
+  // These are dedup'd in /api/markets/route.ts (first dex wins), so they
+  // won't actually surface in the UI given the existing xyz / vntl
+  // entries. Mapping them anyway lets a future precedence change route
+  // them to the right sector instead of crypto-alt.
+  "km:AAPL":       { sector: "stocks",      label: "Apple (KM)" },
+  "km:GOOGL":      { sector: "stocks",      label: "Alphabet (KM)" },
+  "km:MU":         { sector: "stocks",      label: "Micron (KM)" },
+  "km:NVDA":       { sector: "stocks",      label: "Nvidia (KM)" },
+  "km:PLTR":       { sector: "stocks",      label: "Palantir (KM)" },
+  "km:TSLA":       { sector: "stocks",      label: "Tesla (KM)" },
+  "km:GOLD":       { sector: "commodities", label: "Gold (KM)" },
+  "km:SILVER":     { sector: "commodities", label: "Silver (KM)" },
+  "cash:AMZN":     { sector: "stocks",      label: "Amazon (cash)" },
+  "cash:BTC":      { sector: "majors",      label: "Bitcoin (cash)" },
+  "cash:ETH":      { sector: "majors",      label: "Ethereum (cash)" },
+  "cash:GOOGL":    { sector: "stocks",      label: "Alphabet (cash)" },
+  "cash:HOOD":     { sector: "stocks",      label: "Robinhood (cash)" },
+  "cash:INTC":     { sector: "stocks",      label: "Intel (cash)" },
+  "cash:META":     { sector: "stocks",      label: "Meta (cash)" },
+  "cash:MSFT":     { sector: "stocks",      label: "Microsoft (cash)" },
+  "cash:NVDA":     { sector: "stocks",      label: "Nvidia (cash)" },
+  "cash:TSLA":     { sector: "stocks",      label: "Tesla (cash)" },
+  "cash:GOLD":     { sector: "commodities", label: "Gold (cash)" },
+  "cash:SILVER":   { sector: "commodities", label: "Silver (cash)" },
+  "cash:EWY":      { sector: "indices",     label: "MSCI Korea ETF (cash)" },
 };
 
 // Top holdings for index/ETF/basket assets — shown as a collapsible list in the detail modal
@@ -618,3 +701,58 @@ export const MACRO_INDICATORS = [
   { symbol: "SPX", label: "S&P 500", source: "live" as const },
   { symbol: "PAXG", label: "Gold", source: "live" as const },
 ];
+
+// ── Symbol → sector lookup ─────────────────────────────────────────────
+// Resolves a bare ticker to its sector by searching the three maps in
+// precedence order: native HL perp → spot stock → builder DEX perp.
+// Falls back to "crypto-alt" (the same fallback /api/markets uses).
+//
+// Cached so signal-scoring hot paths don't re-search HL_BUILDER_PERP_MAP
+// (a 100+-entry object scan) on every signal.
+const _sectorOfCache = new Map<string, Sector>();
+
+// Reverse map: bare ticker → first matching builder entry. Built once
+// the first time sectorOf() runs. Subsequent calls are O(1).
+let _builderTickerIndex: Map<string, Sector> | null = null;
+function buildBuilderTickerIndex(): Map<string, Sector> {
+  const idx = new Map<string, Sector>();
+  for (const [key, info] of Object.entries(HL_BUILDER_PERP_MAP)) {
+    const ticker = key.includes(":") ? key.split(":")[1] : key;
+    // First wins — matches the dedup precedence in /api/markets.
+    if (ticker && !idx.has(ticker)) idx.set(ticker, info.sector);
+  }
+  return idx;
+}
+
+// Reverse map: bare ticker → spot stock sector. e.g. "TSLA" → "stocks".
+const _spotStockTickerToSector = new Map<string, Sector>();
+for (const info of Object.values(HL_SPOT_STOCKS)) {
+  _spotStockTickerToSector.set(info.ticker, info.sector);
+}
+
+export function sectorOf(symbol: string): Sector {
+  const cached = _sectorOfCache.get(symbol);
+  if (cached) return cached;
+  let s: Sector | undefined;
+  // 1. Native HL perp
+  s = HL_PERP_SECTOR_MAP[symbol]?.sector;
+  // 2. HIP-3 spot stock (the spot pair's bare ticker)
+  if (!s) s = _spotStockTickerToSector.get(symbol);
+  // 3. Builder DEX perp (any dex)
+  if (!s) {
+    if (!_builderTickerIndex) _builderTickerIndex = buildBuilderTickerIndex();
+    s = _builderTickerIndex.get(symbol);
+  }
+  // 4. Fallback — matches /api/markets behaviour for unmapped perps.
+  s = s ?? "crypto-alt";
+  _sectorOfCache.set(symbol, s);
+  return s;
+}
+
+// Returns the conviction-score multiplier for `symbol`'s sector.
+// Used by the alerter to amplify high-priority asset classes
+// (commodities = 1.4, stocks = 1.3, indices = 1.2 — see SECTORS).
+export function priorityOf(symbol: string): number {
+  const cfg = SECTORS[sectorOf(symbol)];
+  return cfg?.priority ?? 1;
+}
