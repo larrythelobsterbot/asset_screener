@@ -7,7 +7,7 @@ import { cache } from "@/lib/cache";
 import {
   insertPriceSnapshots,
   startPruneJob,
-  snapshotAt,
+  snapshotAtBounded,
   getCandlesFromCache,
   type PriceSnapshotRow,
 } from "@/lib/db";
@@ -254,8 +254,12 @@ export async function GET() {
     const hlSymbolsForBackfill = assets
       .filter((a) => a.source === "hyperliquid")
       .map((a) => a.symbol);
-    const snap1h = snapshotAt(snapshotTs - 3_600_000, hlSymbolsForBackfill);
-    const snap4h = snapshotAt(snapshotTs - 4 * 3_600_000, hlSymbolsForBackfill);
+    // Bounded — reject snapshots more than 30min (1h horizon) / 1h (4h
+    // horizon) off the target. After downtime, an unbounded lookup
+    // could pair the live price with a row from days ago and ship a
+    // garbage % change to the UI.
+    const snap1h = snapshotAtBounded(snapshotTs - 3_600_000, 30 * 60_000, hlSymbolsForBackfill);
+    const snap4h = snapshotAtBounded(snapshotTs - 4 * 3_600_000, 60 * 60_000, hlSymbolsForBackfill);
     for (const a of assets) {
       if (a.source !== "hyperliquid") continue;
       const p1 = snap1h.get(a.symbol);

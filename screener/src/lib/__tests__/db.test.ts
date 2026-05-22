@@ -15,11 +15,13 @@ import {
   insertPriceSnapshots,
   latestSnapshots,
   snapshotAt,
+  snapshotAtBounded,
   prunePriceSnapshots,
   upsertCandles,
   getCandlesFromCache,
   loadEventHistory,
   recordEventFire,
+  eventHistoryKey,
   kvGet,
   kvSet,
   insertSocialSnapshots,
@@ -39,16 +41,38 @@ test("price_snapshots round-trip + latestSnapshots returns newest per symbol", (
   assert.equal(latest.get("ETH")?.mark, 3000);
 });
 
-test("snapshotAt returns the row at or before the target timestamp", () => {
+test("snapshotAt returns the row at or before the target timestamp (with ts)", () => {
   const base = Date.now() + 1_000_000; // shift so we don't collide with prior test
   insertPriceSnapshots([
     { symbol: "SOL", ts: base + 0,       mark: 100, prev_day: 99, funding: 0, oi: 1, volume: 1 },
     { symbol: "SOL", ts: base + 60_000,  mark: 105, prev_day: 99, funding: 0, oi: 1, volume: 1 },
     { symbol: "SOL", ts: base + 120_000, mark: 110, prev_day: 99, funding: 0, oi: 1, volume: 1 },
   ]);
-  // Target halfway between t1 and t2 — should return t1's mark.
+  // Target halfway between t1 and t2 — should return t1's row (mark + ts).
   const m = snapshotAt(base + 90_000, ["SOL"]);
-  assert.equal(m.get("SOL"), 105);
+  const row = m.get("SOL");
+  assert.equal(row?.mark, 105);
+  assert.equal(row?.ts, base + 60_000, "should also return the actual matched ts");
+});
+
+test("snapshotAtBounded drops rows older than the tolerance window", () => {
+  // Insert a fresh row + an ancient row for the same symbol so we know
+  // snapshotAt would return the ancient one if no row is fresh enough.
+  const base = Date.now() + 9_000_000;
+  insertPriceSnapshots([
+    { symbol: "BNDX", ts: base - 50 * 86_400_000, mark: 1, prev_day: null, funding: null, oi: null, volume: null },
+  ]);
+  // Target = now-ish; tolerance = 30 min. Ancient row is 50 days off the
+  // target → must be filtered out.
+  const m = snapshotAtBounded(base, 30 * 60_000, ["BNDX"]);
+  assert.equal(m.get("BNDX"), undefined, "ancient row should be filtered out by tolerance");
+
+  // Now add a close-enough row and verify it IS returned.
+  insertPriceSnapshots([
+    { symbol: "BNDX", ts: base - 5 * 60_000, mark: 42, prev_day: null, funding: null, oi: null, volume: null },
+  ]);
+  const m2 = snapshotAtBounded(base, 30 * 60_000, ["BNDX"]);
+  assert.equal(m2.get("BNDX"), 42, "row within tolerance should be returned");
 });
 
 test("prunePriceSnapshots removes only rows older than the cutoff", () => {
@@ -91,10 +115,14 @@ test("getCandlesFromCache returns oldest-first slice", () => {
 });
 
 test("event_history persists fire timestamps and survives reload", () => {
-  recordEventFire("EVTSYM", "rsi_overbought", 1_234_567_890);
-  recordEventFire("EVTSYM", "rsi_overbought", 1_234_567_999); // overwrite
+  // Same (symbol, type, tf) — second call should overwrite the first.
+  recordEventFire("EVTSYM", "rsi_overbought", 1_234_567_890, "4h");
+  recordEventFire("EVTSYM", "rsi_overbought", 1_234_567_999, "4h");
+  // Different tf — should be a separate row, not collide.
+  recordEventFire("EVTSYM", "rsi_overbought", 1_234_000_000, "1d");
   const h = loadEventHistory();
-  assert.equal(h.get("EVTSYM:rsi_overbought"), 1_234_567_999, "latest fire should win");
+  assert.equal(h.get(eventHistoryKey("EVTSYM", "rsi_overbought", "4h")), 1_234_567_999, "4h latest fire should win");
+  assert.equal(h.get(eventHistoryKey("EVTSYM", "rsi_overbought", "1d")), 1_234_000_000, "1d row separate from 4h");
 });
 
 test("social_snapshots round-trip + latestSocialSnapshots returns newest per symbol", () => {
@@ -157,6 +185,46 @@ test("getCandlesFromCache: enforces newest-N-bars ordering for any count <= stor
     base + 48 * 14_400_000,
     base + 49 * 14_400_000,
   ]);
+});
+
+test("eventHistory: same signal type on a different timeframe is NOT suppressed", async () => {
+  // Regression test for the audit finding: pre-fix, fireEvent keyed by
+  // (symbol, type) only, so a fire on 1h would suppress the same type
+  // on 4h+1d for 24h. With the TF-aware key, each timeframe should fire
+  // independently.
+  const { detectSignals, _resetEventHistoryForTests } = await import("../signals");
+
+  // Series that deterministically forces breakout_up on the last bar.
+  const closes: number[] = [];
+  const highs: number[] = [];
+  const lows: number[] = [];
+  for (let i = 0; i < 79; i++) {
+    closes.push(100);
+    highs.push(100.5);
+    lows.push(99.5);
+  }
+  closes.push(150);
+  highs.push(150);
+  lows.push(99.5);
+  const volumes = closes.map(() => 1000);
+
+  _resetEventHistoryForTests();
+
+  // Fire on 1h — expect breakout_up to land.
+  const sig1h = detectSignals("XTFSYM", closes, volumes, highs, lows, undefined, undefined, "1h");
+  assert.ok(sig1h.find((s) => s.type === "breakout_up"), "1h should fire");
+
+  // Re-fire on 4h — must NOT be suppressed by the 1h fire.
+  const sig4h = detectSignals("XTFSYM", closes, volumes, highs, lows, undefined, undefined, "4h");
+  assert.ok(sig4h.find((s) => s.type === "breakout_up"), "4h should also fire (different TF bucket)");
+
+  // And on 1d — same.
+  const sig1d = detectSignals("XTFSYM", closes, volumes, highs, lows, undefined, undefined, "1d");
+  assert.ok(sig1d.find((s) => s.type === "breakout_up"), "1d should also fire");
+
+  // BUT firing 1h AGAIN should be suppressed (within the persistence window).
+  const sig1hAgain = detectSignals("XTFSYM", closes, volumes, highs, lows, undefined, undefined, "1h");
+  assert.equal(sig1hAgain.find((s) => s.type === "breakout_up"), undefined, "1h repeat should be suppressed");
 });
 
 test("eventHistory: breakout_up does not refire across a simulated restart", async () => {

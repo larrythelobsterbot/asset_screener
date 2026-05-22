@@ -6,7 +6,7 @@ import {
   type VolRegime,
 } from "./indicators";
 import type { Sector } from "@/config/sectors";
-import { loadEventHistory, recordEventFire } from "./db";
+import { loadEventHistory, recordEventFire, eventHistoryKey } from "./db";
 
 // Grouping signals by family makes downstream consumers (bot, UI) much easier
 // to reason about — e.g., "only act on momentum+trend confluence" or
@@ -123,24 +123,30 @@ function fireEvent(
   type: SignalType,
   direction: SignalDirection,
   value: number,
-  label: string
+  label: string,
+  timeframe?: Timeframe,
 ): Omit<Signal, "family" | "volRegime"> | null {
   // Returns a partial signal so the caller can stamp family + volRegime via
   // the `tag()` helper. Keeping those two fields out here prevents us from
   // having to thread the regime through every fireEvent call.
+  //
+  // De-bouncer key INCLUDES timeframe: the signals route scans 1h, 4h, 1d
+  // sequentially, and we want multi-TF confluence — a macd_bullish on 1h
+  // must not suppress the same signal on 4h+1d (that would silently
+  // undercount the conviction scorer's cross-TF alignment bonus).
   const history = getEventHistory();
-  const key = `${symbol}:${type}`;
+  const key = eventHistoryKey(symbol, type, timeframe);
   const now = Date.now();
   const lastFired = history.get(key);
   const persist = PERSISTENCE[type] || 24 * 3_600_000;
   if (lastFired && now - lastFired < persist) return null;
   history.set(key, now);
   try {
-    recordEventFire(symbol, type, now);
+    recordEventFire(symbol, type, now, timeframe);
   } catch (err) {
     // Write failure is non-fatal — the in-memory map still de-bounces
     // for this process lifetime. Logged so we know if disk goes bad.
-    console.warn(`[signals] persist fire(${symbol}:${type}) failed:`, err);
+    console.warn(`[signals] persist fire(${key}) failed:`, err);
   }
   return { symbol, type, direction, value, label, firedAt: now };
 }
@@ -191,6 +197,16 @@ export function detectSignals(
     timeframe,
   });
 
+  // Local fireEvent that captures `timeframe` from this scan so every
+  // persistent-window signal gets de-bounced per (symbol, type, tf)
+  // rather than globally. Keeps the per-call-site signature compact.
+  const fire = (
+    type: SignalType,
+    direction: SignalDirection,
+    value: number,
+    label: string,
+  ) => fireEvent(symbol, type, direction, value, label, timeframe);
+
   // RSI
   const rsiVal = ind.rsi[last];
   if (rsiVal !== null) {
@@ -220,11 +236,11 @@ export function detectSignals(
   const closesForDiv = closes.slice(Math.max(0, last - 30), last + 1);
   const div = detectDivergences(closesForDiv, rsiForDiv, 30);
   if (div.bullish) {
-    const s = fireEvent(symbol, "rsi_divergence_bullish", "bullish", 0, div.description ?? "Bullish RSI divergence");
+    const s = fire("rsi_divergence_bullish", "bullish", 0, div.description ?? "Bullish RSI divergence");
     if (s) signals.push(tag({ ...s, strength: 75 }));
   }
   if (div.bearish) {
-    const s = fireEvent(symbol, "rsi_divergence_bearish", "bearish", 0, div.description ?? "Bearish RSI divergence");
+    const s = fire("rsi_divergence_bearish", "bearish", 0, div.description ?? "Bearish RSI divergence");
     if (s) signals.push(tag({ ...s, strength: 75 }));
   }
 
@@ -234,11 +250,11 @@ export function detectSignals(
     const prev = m.macd[last - 1]! - m.signal[last - 1]!;
     const curr = m.macd[last]! - m.signal[last]!;
     if (prev < 0 && curr >= 0) {
-      const s = fireEvent(symbol, "macd_bullish", "bullish", curr, "MACD Bullish Cross");
+      const s = fire("macd_bullish", "bullish", curr, "MACD Bullish Cross");
       if (s) signals.push(tag(s));
     }
     if (prev > 0 && curr <= 0) {
-      const s = fireEvent(symbol, "macd_bearish", "bearish", curr, "MACD Bearish Cross");
+      const s = fire("macd_bearish", "bearish", curr, "MACD Bearish Cross");
       if (s) signals.push(tag(s));
     }
   }
@@ -263,11 +279,11 @@ export function detectSignals(
     const highest = Math.max(...highs.slice(last - 20, last));
     const lowest = Math.min(...lows.slice(last - 20, last));
     if (closes[last] > highest) {
-      const s = fireEvent(symbol, "breakout_up", "bullish", closes[last], `Breakout Up`);
+      const s = fire("breakout_up", "bullish", closes[last], `Breakout Up`);
       if (s) signals.push(tag(s));
     }
     if (closes[last] < lowest) {
-      const s = fireEvent(symbol, "breakout_down", "bearish", closes[last], `Breakout Down`);
+      const s = fire("breakout_down", "bearish", closes[last], `Breakout Down`);
       if (s) signals.push(tag(s));
     }
   }
@@ -326,11 +342,11 @@ export function detectSignals(
     const prev = ind.ema13[last - 1]! - ind.ema25[last - 1]!;
     const curr = ind.ema13[last]! - ind.ema25[last]!;
     if (prev < 0 && curr >= 0) {
-      const s = fireEvent(symbol, "ema_bullish", "bullish", curr, "EMA 13/25 Bullish Cross");
+      const s = fire("ema_bullish", "bullish", curr, "EMA 13/25 Bullish Cross");
       if (s) signals.push(tag(s));
     }
     if (prev > 0 && curr <= 0) {
-      const s = fireEvent(symbol, "ema_bearish", "bearish", curr, "EMA 13/25 Bearish Cross");
+      const s = fire("ema_bearish", "bearish", curr, "EMA 13/25 Bearish Cross");
       if (s) signals.push(tag(s));
     }
   }
@@ -347,11 +363,11 @@ export function detectSignals(
     const prev = ind.ma100[last - 1]! - ind.ma300[last - 1]!;
     const curr = ind.ma100[last]! - ind.ma300[last]!;
     if (prev < 0 && curr >= 0) {
-      const s = fireEvent(symbol, "golden_cross", "bullish", curr, "Golden Cross (MA100/300)");
+      const s = fire("golden_cross", "bullish", curr, "Golden Cross (MA100/300)");
       if (s) signals.push(tag(s));
     }
     if (prev > 0 && curr <= 0) {
-      const s = fireEvent(symbol, "death_cross", "bearish", curr, "Death Cross (MA100/300)");
+      const s = fire("death_cross", "bearish", curr, "Death Cross (MA100/300)");
       if (s) signals.push(tag(s));
     }
   }

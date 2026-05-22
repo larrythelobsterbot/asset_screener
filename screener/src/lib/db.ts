@@ -34,7 +34,7 @@ export function getDb(): Database.Database {
 // Versioned via PRAGMA user_version so we can add schema changes without
 // blowing away the local file. Bump VERSION and add a step.
 
-const VERSION = 3;
+const VERSION = 4;
 
 function migrate(db: Database.Database): void {
   const current = db.pragma("user_version", { simple: true }) as number;
@@ -43,6 +43,7 @@ function migrate(db: Database.Database): void {
   if (current < 1) db.exec(MIGRATION_V1);
   if (current < 2) db.exec(MIGRATION_V2);
   if (current < 3) db.exec(MIGRATION_V3);
+  if (current < 4) db.exec(MIGRATION_V4);
   db.pragma(`user_version = ${VERSION}`);
 }
 
@@ -130,6 +131,27 @@ const MIGRATION_V3 = `
     create index if not exists idx_hype_pressure_ts on hype_pressure_snapshots(ts desc);
   `;
 
+// V4 — make event_history timeframe-aware. The v1 PK was (symbol, type)
+// which collapsed multi-TF scans into one suppression bucket: a
+// macd_bullish on 1h would silently suppress the same on 4h+1d for the
+// 24h persistence window, undercutting cross-TF conviction scoring.
+//
+// We DROP the old table rather than carry forward stale rows. The
+// suppression window is at most 48h (golden/death cross), so a fresh
+// table means at worst one duplicate fire of each persistent signal
+// per (symbol, type, tf) over the next 48h, which is the right
+// outcome — those should fire across timeframes anyway.
+const MIGRATION_V4 = `
+    drop table if exists event_history;
+    create table event_history (
+      symbol         text    not null,
+      type           text    not null,
+      timeframe      text    not null default '_',
+      last_fired_at  integer not null,
+      primary key (symbol, type, timeframe)
+    );
+  `;
+
 // ── price_snapshots ─────────────────────────────────────────────────────
 
 export interface PriceSnapshotRow {
@@ -183,15 +205,22 @@ export function latestSnapshots(symbols?: string[]): Map<string, PriceSnapshotRo
 
 // Get snapshot of all symbols at or before a target timestamp. Used for
 // multi-horizon sector-RS: e.g. "what was each symbol's mark 4h ago".
-// Returns symbol → mark price.
-export function snapshotAt(targetTs: number, symbols?: string[]): Map<string, number> {
+//
+// Returns symbol → { mark, ts }. The ts is the ACTUAL timestamp of the
+// matched row, which can be older than `targetTs`. Callers MUST inspect
+// it and reject rows that are too old for their horizon — otherwise,
+// after a process downtime, a "1h change" could be computed against a
+// snapshot from days or weeks ago (still within the 30-day retention),
+// producing garbage signals on resume. See `snapshotAtBounded` for the
+// safe wrapper.
+export function snapshotAt(targetTs: number, symbols?: string[]): Map<string, { mark: number; ts: number }> {
   const db = getDb();
   // For each symbol, the row with the greatest ts <= targetTs. Window
   // function would be cleaner but better-sqlite3 supports it; using a
   // correlated subquery for portability.
   const rows = (symbols && symbols.length > 0
     ? db.prepare(
-        `select p.symbol, p.mark
+        `select p.symbol, p.mark, p.ts
          from price_snapshots p
          where p.symbol in (${symbols.map(() => "?").join(",")})
          and p.ts = (
@@ -200,15 +229,39 @@ export function snapshotAt(targetTs: number, symbols?: string[]): Map<string, nu
          )`
       ).all(...symbols, targetTs)
     : db.prepare(
-        `select p.symbol, p.mark
+        `select p.symbol, p.mark, p.ts
          from price_snapshots p
          where p.ts = (
            select max(ts) from price_snapshots p2
            where p2.symbol = p.symbol and p2.ts <= ?
          )`
-      ).all(targetTs)) as Array<{ symbol: string; mark: number }>;
+      ).all(targetTs)) as Array<{ symbol: string; mark: number; ts: number }>;
+  const out = new Map<string, { mark: number; ts: number }>();
+  for (const r of rows) out.set(r.symbol, { mark: r.mark, ts: r.ts });
+  return out;
+}
+
+// Wrapper around snapshotAt that drops rows where the matched ts is more
+// than `maxAgeMs` away from `targetTs`. This is what callers should use
+// when they want "the price at horizon N ago" — without this guard, a
+// gap in snapshots can hand back a row from much earlier and produce
+// nonsense % changes downstream.
+//
+// `maxAgeMs` is symmetric around the target: a 1h-ago target with
+// 30min tolerance accepts rows from 30-90min ago. Defaults to half the
+// distance from now to target, capped at 30 minutes.
+export function snapshotAtBounded(
+  targetTs: number,
+  maxAgeMs: number,
+  symbols?: string[],
+): Map<string, number> {
+  const rows = snapshotAt(targetTs, symbols);
   const out = new Map<string, number>();
-  for (const r of rows) out.set(r.symbol, r.mark);
+  for (const [sym, row] of rows) {
+    if (Math.abs(targetTs - row.ts) <= maxAgeMs) {
+      out.set(sym, row.mark);
+    }
+  }
   return out;
 }
 
@@ -288,25 +341,41 @@ export function pruneCandles(): number {
   return total;
 }
 
-// ── event_history (signal de-bouncer) ───────────────────────────────────
+// ── event_history (signal de-bouncer, TF-aware) ─────────────────────────
+// Key includes `timeframe` so a fire on one TF doesn't suppress the same
+// signal type on another TF. The `_` sentinel is used for TF-less /
+// cross-sectional signals (sector_leader, social_spike) so they get
+// their own suppression bucket separate from per-TF scans.
+
+// Build a stable in-memory key from (symbol, type, tf-or-sentinel).
+// Exported so callers don't have to know the encoding.
+export function eventHistoryKey(symbol: string, type: string, timeframe?: string | null): string {
+  return `${symbol}:${type}:${timeframe ?? "_"}`;
+}
 
 export function loadEventHistory(): Map<string, number> {
   const db = getDb();
   const rows = db.prepare(
-    `select symbol, type, last_fired_at from event_history`
-  ).all() as Array<{ symbol: string; type: string; last_fired_at: number }>;
+    `select symbol, type, timeframe, last_fired_at from event_history`
+  ).all() as Array<{ symbol: string; type: string; timeframe: string; last_fired_at: number }>;
   const m = new Map<string, number>();
-  for (const r of rows) m.set(`${r.symbol}:${r.type}`, r.last_fired_at);
+  for (const r of rows) m.set(eventHistoryKey(r.symbol, r.type, r.timeframe), r.last_fired_at);
   return m;
 }
 
-export function recordEventFire(symbol: string, type: string, firedAt: number): void {
+export function recordEventFire(
+  symbol: string,
+  type: string,
+  firedAt: number,
+  timeframe?: string | null,
+): void {
   const db = getDb();
+  const tf = timeframe ?? "_";
   db.prepare(
-    `insert into event_history (symbol, type, last_fired_at)
-     values (?, ?, ?)
-     on conflict(symbol, type) do update set last_fired_at = excluded.last_fired_at`
-  ).run(symbol, type, firedAt);
+    `insert into event_history (symbol, type, timeframe, last_fired_at)
+     values (?, ?, ?, ?)
+     on conflict(symbol, type, timeframe) do update set last_fired_at = excluded.last_fired_at`
+  ).run(symbol, type, tf, firedAt);
 }
 
 // ── social_snapshots ────────────────────────────────────────────────────

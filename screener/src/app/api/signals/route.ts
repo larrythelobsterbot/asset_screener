@@ -11,7 +11,7 @@ import {
 } from "@/lib/signals";
 import { cache } from "@/lib/cache";
 import { logSignalFires } from "@/lib/signalPersistence";
-import { snapshotAt, latestSocialSnapshots } from "@/lib/db";
+import { snapshotAtBounded, latestSocialSnapshots } from "@/lib/db";
 import { maybeDispatchAlerts } from "@/lib/alerter";
 
 // Without this, Next.js 14 prerenders this route statically at build time
@@ -58,14 +58,18 @@ export async function GET() {
     const allMappedSymbols = mappedUniverse.map((a) => a.u.name);
 
     const now = Date.now();
-    // Tolerance window: a snapshot has to be within +/- a fraction of the
-    // horizon to count. snapshotAt() returns the row at or before target,
-    // so we only need a "not too stale" upper bound — i.e. the returned
-    // snapshot's ts must be within ~10% of the horizon from the target.
-    // We don't enforce that here because snapshotAt picks the closest
-    // older row, which is fine — but we *do* filter out empty results.
-    const snap1hAgo = snapshotAt(now - 3_600_000, allMappedSymbols);
-    const snap4hAgo = snapshotAt(now - 4 * 3_600_000, allMappedSymbols);
+    // Bounded snapshot lookups: reject rows older than the tolerance so
+    // an extended downtime (when snapshots are sparse) can't accidentally
+    // pair a now-price with a snapshot from days ago — that would compute
+    // nonsense % changes downstream.
+    //   - 1h horizon → 30min tolerance (snapshot 30–90min ago acceptable)
+    //   - 4h horizon → 1h tolerance (snapshot 3–5h ago acceptable)
+    // Symbols with no fresh-enough snapshot simply don't get a change1h /
+    // change4h value, which the sector-RS pass handles gracefully.
+    const TOLERANCE_1H = 30 * 60_000;
+    const TOLERANCE_4H = 60 * 60_000;
+    const snap1hAgo = snapshotAtBounded(now - 3_600_000, TOLERANCE_1H, allMappedSymbols);
+    const snap4hAgo = snapshotAtBounded(now - 4 * 3_600_000, TOLERANCE_4H, allMappedSymbols);
 
     const fullSnapshot: SectorMultiSnapshot[] = mappedUniverse.map(({ u, ctx }) => {
       const price = parseFloat(ctx.markPx || "0");
