@@ -25,6 +25,12 @@ interface Props {
   showWatchlistOnly: boolean;
   watchlist: Set<string>;
   onToggleWatch: (symbol: string) => void;
+  // Hide-list. When showHidden=false page.tsx already filtered these out
+  // before the assets prop. When true, hidden tiles render dimmed so the
+  // user can spot and unhide them via the tile's ✕/↻ button.
+  hidden?: Set<string>;
+  onToggleHide?: (symbol: string) => void;
+  showHidden?: boolean;
 }
 
 // ── Squarify ─────────────────────────────────────────────────────────────
@@ -134,6 +140,7 @@ const HEADER_H = 22;
 export default function Heatmap({
   assets, isLoading, timeframe,
   onSelectAsset, showWatchlistOnly, watchlist,
+  hidden, onToggleHide,
 }: Props) {
   const wrapRef = useRef<HTMLDivElement | null>(null);
   const [dim, setDim] = useState({ w: 1200, h: 700 });
@@ -350,6 +357,8 @@ export default function Heatmap({
                   h={t.h}
                   change={changeFor(t.asset, timeframe)}
                   onClick={() => onSelectAsset(t.asset.symbol)}
+                  isHidden={hidden?.has(t.asset.symbol) ?? false}
+                  onToggleHide={onToggleHide}
                 />
               ))}
             </div>

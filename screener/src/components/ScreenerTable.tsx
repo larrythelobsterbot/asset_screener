@@ -74,6 +74,12 @@ interface Props {
   showWatchlistOnly: boolean;
   watchlist: Set<string>;
   onToggleWatch: (symbol: string) => void;
+  // Hide-list. When showHidden is false, page.tsx has already filtered
+  // these out of `assets`. When true, hidden assets are passed through
+  // and we dim them so the user can spot + unhide.
+  hidden?: Set<string>;
+  onToggleHide?: (symbol: string) => void;
+  showHidden?: boolean;
   // Optional text filter from the top-bar search input (case-insensitive,
   // matches name OR symbol). Empty/undefined = no filter.
   searchQuery?: string;
@@ -82,6 +88,11 @@ interface Props {
 export default function ScreenerTable({
   assets, isLoading, timeframe, onSelectAsset,
   showWatchlistOnly, watchlist, onToggleWatch,
+  hidden, onToggleHide,
+  // showHidden is consumed by page.tsx's filteredAssets memo — by the
+  // time the table receives `assets` it's already had hidden items
+  // included/excluded. We accept the prop for future use (and to keep
+  // the API symmetric with Heatmap) but intentionally don't read it.
   searchQuery,
 }: Props) {
   const candleTf = mapToCandleTF(timeframe);
@@ -287,7 +298,7 @@ export default function ScreenerTable({
                 <th style={{ ...thStyle, width: 100, textAlign: "center" }}>Spark</th>
                 <th style={thStyle} onClick={() => handleSort("rsi")}>RSI{arr("rsi")}</th>
                 <th style={thStyle}>MAs ({candleTf})</th>
-                <th style={{ ...thStyle, width: 28 }} />
+                <th style={{ ...thStyle, width: 56 }} />
               </tr>
             </thead>
             <tbody>
@@ -295,13 +306,14 @@ export default function ScreenerTable({
                 const sr = screenerBySymbol.get(a.symbol) ?? null;
                 const sectorColor = SECTORS[a.sector]?.color ?? "#64748B";
                 const isWatched = watchlist.has(a.symbol);
+                const isHidden = hidden?.has(a.symbol) ?? false;
                 const sparkTone = sr && sr.sparkline.length > 1
                   ? (sr.sparkline[sr.sparkline.length - 1] >= sr.sparkline[0] ? "tone-up" : "tone-down")
                   : "tone-mute";
                 return (
                   <tr
                     key={a.symbol}
-                    className="screener-row"
+                    className={`screener-row${isHidden ? " row-hidden" : ""}`}
                     onClick={() => onSelectAsset(a.symbol)}
                   >
                     <td className="cell-rank">{String(i + 1).padStart(2, "0")}</td>
@@ -342,14 +354,25 @@ export default function ScreenerTable({
                     <td className="cell-mas">
                       <MAGrid row={sr} />
                     </td>
-                    <td className="cell-watch">
-                      <button
-                        onClick={(e) => { e.stopPropagation(); onToggleWatch(a.symbol); }}
-                        className={isWatched ? "star star-on" : "star"}
-                        title={isWatched ? "Remove from watchlist" : "Add to watchlist"}
-                      >
-                        {isWatched ? "★" : "☆"}
-                      </button>
+                    <td className="cell-actions">
+                      <div className="row-actions">
+                        <button
+                          onClick={(e) => { e.stopPropagation(); onToggleWatch(a.symbol); }}
+                          className={isWatched ? "row-btn star star-on" : "row-btn star"}
+                          title={isWatched ? "Remove from watchlist" : "Add to watchlist"}
+                        >
+                          {isWatched ? "★" : "☆"}
+                        </button>
+                        {onToggleHide && (
+                          <button
+                            onClick={(e) => { e.stopPropagation(); onToggleHide(a.symbol); }}
+                            className={isHidden ? "row-btn hide-btn hide-on" : "row-btn hide-btn"}
+                            title={isHidden ? "Unhide this asset" : "Hide this asset (remove from screener)"}
+                          >
+                            {isHidden ? "↻" : "✕"}
+                          </button>
+                        )}
+                      </div>
                     </td>
                   </tr>
                 );
@@ -437,23 +460,45 @@ export default function ScreenerTable({
           border-radius: 3px;
           font-family: var(--font-geist-mono), ui-monospace, monospace;
         }
-        :global(.cell-watch) {
+        :global(.cell-actions) {
           text-align: right;
           padding-right: 14px !important;
-          width: 28px;
+          width: 56px;
         }
-        :global(.cell-watch .star) {
+        :global(.row-actions) {
+          display: inline-flex;
+          gap: 6px;
+          justify-content: flex-end;
+          align-items: center;
+        }
+        :global(.row-btn) {
           background: transparent; border: 0; cursor: pointer;
-          font-size: 14px;
+          font-size: 13px;
           color: var(--text-mute);
           opacity: 0;
           transition: opacity .15s, color .15s;
           padding: 0;
+          line-height: 1;
         }
-        :global(.screener-row:hover .star) { opacity: 1; }
-        :global(.cell-watch .star.star-on) {
+        :global(.screener-row:hover .row-btn) { opacity: 1; }
+        :global(.row-btn.star-on) {
           color: var(--acc-star);
           opacity: 1;
+        }
+        :global(.row-btn.hide-btn:hover) {
+          color: var(--acc-down);
+        }
+        :global(.row-btn.hide-on) {
+          color: var(--acc-warn);
+          opacity: 1;
+        }
+        /* Rows marked as hidden — only visible when Show Hidden is on.
+           Dim the entire row so the user can spot+unhide them quickly. */
+        :global(.screener-row.row-hidden) {
+          opacity: 0.45;
+        }
+        :global(.screener-row.row-hidden:hover) {
+          opacity: 0.85;
         }
       `}</style>
     </div>

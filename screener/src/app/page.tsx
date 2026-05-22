@@ -10,6 +10,7 @@ import SignalScanner from "@/components/SignalScanner";
 import AssetDetailModal from "@/components/AssetDetailModal";
 import { FilterPanel } from "@/components/FilterPanel";
 import { useWatchlist } from "@/lib/useWatchlist";
+import { useHidelist } from "@/lib/useHidelist";
 import { useFilters, passesFilters } from "@/lib/useFilters";
 import { AssetData } from "@/lib/types";
 
@@ -21,6 +22,8 @@ export default function Home() {
   const [selectedAsset, setSelectedAsset] = useState<string | null>(null);
   const [showWatchlist, setShowWatchlist] = useState(false);
   const { watchlist, toggle, count } = useWatchlist();
+  const { hidden, toggle: toggleHide, count: hiddenCount } = useHidelist();
+  const [showHidden, setShowHidden] = useState(false);
   const [searchQuery, setSearchQuery] = useState("");
 
   const [view, setView] = useState<View>("heatmap");
@@ -55,10 +58,16 @@ export default function Home() {
     return () => clearInterval(id);
   }, []);
 
-  // Filter pipeline: filter panel rules → search query (applied here so
-  // the heatmap and table see the same filtered universe).
+  // Filter pipeline: filter panel rules → hide list → search query.
+  // Hide list is applied here (not just at view level) so signals,
+  // sector RS, and screener data downstream all skip hidden assets.
+  // When `showHidden` is on, hidden assets DO appear (dimmed) so the
+  // user can review + unhide.
   const filteredAssets = useMemo(() => {
     let arr = allAssets.filter((a) => passesFilters(a, filters));
+    if (!showHidden) {
+      arr = arr.filter((a) => !hidden.has(a.symbol));
+    }
     if (searchQuery.trim()) {
       const q = searchQuery.trim().toLowerCase();
       arr = arr.filter(
@@ -66,7 +75,7 @@ export default function Home() {
       );
     }
     return arr;
-  }, [allAssets, filters, searchQuery]);
+  }, [allAssets, filters, searchQuery, hidden, showHidden]);
 
   const passingSymbols: Set<string> | null =
     allAssets.length === 0 ? null : new Set(filteredAssets.map((a) => a.symbol));
@@ -155,11 +164,32 @@ export default function Home() {
           <button
             onClick={() => setShowWatchlist(!showWatchlist)}
             className={`btn-ghost ${showWatchlist ? "on-watch" : ""}`}
+            title="Show only watchlisted (starred) assets"
           >
             <span>{showWatchlist ? "★" : "☆"}</span>
             Watchlist
             {count > 0 && <span className="btn-count">{count}</span>}
           </button>
+
+          {/* Hidden — only rendered if user has hidden at least one asset.
+              Hides the chrome unless it's relevant. */}
+          {hiddenCount > 0 && (
+            <button
+              onClick={() => setShowHidden(!showHidden)}
+              className="btn-ghost"
+              style={showHidden ? {
+                color: "var(--acc-warn)",
+                borderColor: "color-mix(in oklab, var(--acc-warn) 40%, transparent)",
+              } : undefined}
+              title={showHidden
+                ? "Hide the hidden assets again"
+                : "Show hidden assets (dimmed) so you can review or unhide"}
+            >
+              <span>{showHidden ? "◉" : "◯"}</span>
+              Hidden
+              <span className="btn-count">{hiddenCount}</span>
+            </button>
+          )}
 
           <TimeframeToggle selected={timeframe} onChange={setTimeframe} />
         </div>
@@ -175,6 +205,9 @@ export default function Home() {
           showWatchlistOnly={showWatchlist}
           watchlist={watchlist}
           onToggleWatch={toggle}
+          hidden={hidden}
+          onToggleHide={toggleHide}
+          showHidden={showHidden}
         />
       ) : (
         <ScreenerTable
@@ -185,6 +218,9 @@ export default function Home() {
           showWatchlistOnly={showWatchlist}
           watchlist={watchlist}
           onToggleWatch={toggle}
+          hidden={hidden}
+          onToggleHide={toggleHide}
+          showHidden={showHidden}
         />
       )}
 
