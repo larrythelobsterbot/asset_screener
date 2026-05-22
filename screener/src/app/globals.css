@@ -2,27 +2,218 @@
 @tailwind components;
 @tailwind utilities;
 
+/* ──────────────────────────────────────────────────────────────────────────
+   Bracket design system — Trade.xyz-aligned terminal aesthetic.
+   Single mustard-yellow accent. Mono-first typography. Pure-black ground.
+   See docs/design-handoff (Bracket Redesign) for the full token reference.
+   ──────────────────────────────────────────────────────────────────────── */
+
 :root {
-  --background: #0A0A0F;
-  --foreground: #F9FAFB;
+  /* Surface */
+  --bg:           #000000;
+  --bg-elev:      #0c0c0a;
+  --bg-card:      #08080a;
+  --bg-macro:     #000000;
+  --bg-chip:      rgba(255, 255, 255, 0.03);
+  --bg-chip-h:    rgba(212, 197, 72, 0.08);
+  --bg-row-h:     rgba(212, 197, 72, 0.05);
+  --border:       rgba(255, 255, 255, 0.06);
+  --border-soft:  rgba(255, 255, 255, 0.03);
+  --border-strong:rgba(212, 197, 72, 0.4);
+
+  /* Text */
+  --text:         #c9c8c4;
+  --text-mute:    #6b6a64;
+  --text-strong:  #f5f4ee;
+
+  /* Accent */
+  --acc-up:       #4ade80;
+  --acc-down:     #f87171;
+  --acc-warn:     #d4c548;
+  --acc-star:     #d4c548;
+  --accent:       #d4c548;
+
+  /* Heatmap intensity scale (six-step). Caller picks the step by
+     Math.abs(change): < 0.5 → 10, < 1 → 22, < 2 → 38, < 5 → 55,
+     < 10 → 72, else → 88. */
+  --heat-up-10:   rgba(74, 222, 128, 0.08);
+  --heat-up-22:   rgba(74, 222, 128, 0.18);
+  --heat-up-38:   rgba(74, 222, 128, 0.32);
+  --heat-up-55:   rgba(34, 197, 94,  0.50);
+  --heat-up-72:   rgba(22, 163, 74,  0.68);
+  --heat-up-88:   rgba(21, 128, 61,  0.85);
+  --heat-down-10: rgba(248, 113, 113, 0.08);
+  --heat-down-22: rgba(248, 113, 113, 0.20);
+  --heat-down-38: rgba(248, 113, 113, 0.34);
+  --heat-down-55: rgba(239, 68, 68,   0.52);
+  --heat-down-72: rgba(220, 38, 38,   0.70);
+  --heat-down-88: rgba(185, 28, 28,   0.85);
+
+  --radius: 2px;
+
+  /* Legacy aliases kept so any not-yet-restyled component still resolves
+     to *something* sensible during the migration. Remove once all
+     components are on the new tokens. */
+  --background: #000000;
+  --foreground: #f5f4ee;
 }
 
-body {
-  background: var(--background);
-  color: var(--foreground);
-  font-family: var(--font-satoshi), system-ui, sans-serif;
+/* ──────────────────────────────────────────────────────────────────────────
+   Base
+   ──────────────────────────────────────────────────────────────────────── */
+
+html, body {
+  background: var(--bg);
+  color: var(--text);
+  /* Mono-first: Geist Mono drives body AND mono. The Bracket aesthetic is
+     intentionally typewriter-rigid; sans is unused below the .legacy-sans
+     escape hatch (kept for any third-party widget we don't control). */
+  font-family: var(--font-geist-mono), ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-feature-settings: "ss01", "cv11";
+  -webkit-font-smoothing: antialiased;
 }
 
-body::before {
-  content: "";
-  position: fixed;
-  inset: 0;
-  z-index: 0;
-  pointer-events: none;
-  opacity: 0.03;
-  background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 256 256' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='noise'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23noise)'/%3E%3C/svg%3E");
-}
+* { font-variant-numeric: tabular-nums; }
 
-::-webkit-scrollbar { width: 6px; }
+::-webkit-scrollbar { width: 6px; height: 8px; }
 ::-webkit-scrollbar-track { background: transparent; }
-::-webkit-scrollbar-thumb { background: #374151; border-radius: 3px; }
+::-webkit-scrollbar-thumb { background: var(--border-strong); border-radius: 4px; }
+
+/* ──────────────────────────────────────────────────────────────────────────
+   Bracket pseudo helpers
+   Applied via classes so React markup stays free of literal `[` and `]`.
+   .sym         → wraps any inline ticker (`BTC` → `[BTC]`)
+   .br-label    → bracket-frames an uppercase section label with extra spaces
+                  (`MOMENTUM` → `[ MOMENTUM ]`)
+   .tone-up     → suffixes a ` ▲` glyph (small)
+   .tone-down   → suffixes a ` ▼` glyph (small)
+   ──────────────────────────────────────────────────────────────────────── */
+
+.sym {
+  font-family: var(--font-geist-mono), ui-monospace, monospace;
+  letter-spacing: 0.02em;
+  font-weight: 600;
+  color: var(--text-strong);
+}
+.sym::before { content: "["; color: var(--text-mute); margin-right: 1px; transition: color .12s; }
+.sym::after  { content: "]"; color: var(--text-mute); margin-left: 1px; transition: color .12s; }
+
+/* Section header with spaces inside the brackets — "[ MOMENTUM ]" */
+.br-label {
+  color: var(--text-mute);
+  letter-spacing: 0.18em;
+  text-transform: uppercase;
+  font-size: 10px;
+  font-weight: 600;
+}
+.br-label::before { content: "[ "; color: var(--text-mute); }
+.br-label::after  { content: " ]"; color: var(--text-mute); }
+
+/* Triangle indicators — opt-in via .pct-tri so only the directional %
+   cells (1h/4h/24h/7d) get them. ATH%, vol ratio, RSI etc. stay plain. */
+.pct-tri.tone-up::after  { content: " ▲"; font-size: 9px; margin-left: 4px; vertical-align: 1px; }
+.pct-tri.tone-down::after { content: " ▼"; font-size: 9px; margin-left: 4px; vertical-align: 1px; }
+
+/* Tone colors */
+.tone-up    { color: var(--acc-up); }
+.tone-down  { color: var(--acc-down); }
+.tone-flat  { color: var(--text-mute); }
+.tone-mute  { color: var(--text-mute); }
+.tone-warn  { color: var(--acc-warn); }
+
+/* Density modifiers — applied to a table wrapper, drive row padding. */
+.density-compact { --row-pad: 4px; }
+.density-regular { --row-pad: 7px; }
+.density-comfy   { --row-pad: 11px; }
+
+/* Pulse dot used in the screener header. */
+.pulse {
+  width: 7px; height: 7px; border-radius: 50%;
+  background: var(--acc-warn);
+  box-shadow: 0 0 0 2px color-mix(in oklab, var(--acc-warn) 25%, transparent);
+  animation: bracket-pulse 1.6s ease-in-out infinite;
+  display: inline-block;
+}
+@keyframes bracket-pulse {
+  0%, 100% { opacity: 1; }
+  50%      { opacity: 0.4; }
+}
+
+/* Sector dot — squared, 6px (10px in side panel via override). */
+.sec-dot {
+  display: inline-block;
+  width: 6px; height: 6px; border-radius: 1px;
+  vertical-align: middle;
+  flex-shrink: 0;
+}
+
+/* Segmented control container + buttons */
+.seg {
+  display: inline-flex; padding: 2px;
+  background: var(--bg-chip);
+  border: 0.5px solid var(--border);
+  border-radius: var(--radius);
+}
+.seg > button {
+  padding: 4px 10px;
+  font-size: 11px; font-weight: 500;
+  color: var(--text-mute);
+  border-radius: calc(var(--radius));
+  transition: color .12s, background .12s, box-shadow .12s;
+  background: transparent;
+  border: 0;
+  cursor: pointer;
+  font-family: inherit;
+}
+.seg > button:hover:not(.on) { color: var(--text); }
+.seg > button.on {
+  background: var(--bg-elev);
+  color: var(--acc-warn);
+  box-shadow: 0 0 0 .5px color-mix(in oklab, var(--acc-warn) 40%, transparent);
+}
+
+/* Ghost button (Filters / Watchlist) */
+.btn-ghost {
+  display: inline-flex; align-items: center; gap: 6px;
+  padding: 5px 10px; font-size: 11px; font-weight: 500;
+  border: 0.5px solid var(--border);
+  border-radius: var(--radius);
+  color: var(--text-mute);
+  background: var(--bg-chip);
+  cursor: pointer;
+  transition: color .12s, border-color .12s, background .12s;
+  font-family: inherit;
+}
+.btn-ghost:hover {
+  color: var(--acc-warn);
+  border-color: color-mix(in oklab, var(--acc-warn) 35%, transparent);
+}
+.btn-ghost.on-watch {
+  color: var(--acc-star);
+  border-color: color-mix(in oklab, var(--acc-star) 40%, transparent);
+}
+.btn-count {
+  background: var(--bg-elev); color: var(--text);
+  padding: 1px 4px; border-radius: 3px; font-size: 9px;
+  font-family: var(--font-geist-mono), ui-monospace, monospace;
+}
+
+/* Search input */
+.search {
+  display: flex; align-items: center; gap: 8px;
+  padding: 6px 10px;
+  background: var(--bg-chip);
+  border: 0.5px solid var(--border);
+  border-radius: var(--radius);
+  width: 280px; max-width: 100%;
+  transition: border-color .15s, background .15s;
+}
+.search:focus-within { border-color: var(--border-strong); background: var(--bg-elev); }
+.search input {
+  flex: 1; min-width: 0;
+  background: transparent;
+  border: 0; outline: 0;
+  font-size: 12px; color: var(--text);
+  font-family: inherit;
+}
+.search input::placeholder { color: var(--text-mute); }

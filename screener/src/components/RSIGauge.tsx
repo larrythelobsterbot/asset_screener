@@ -1,62 +1,126 @@
 "use client";
 
-// 0-100 RSI gauge strip. Shows a 3-zone bar (oversold | neutral | overbought)
-// with a dot at the current value. Designed for the screener table — fits
-// in a ~80px wide cell next to the numeric RSI.
+// Bracket-style horizontal RSI bar. 0–100 track with shaded zones at
+// 0–30 (oversold, red tint) and 70–100 (overbought, green tint) — at
+// extremes the indicator implies a tradable signal regardless of trend
+// direction, so the zone tint is informational, not directional.
+//
+// Two flavors:
+//   default  — table row width (small, 70px), inline with the price row
+//   `large`  — side-panel hero gauge (fat 32px track with grid ticks)
+//
+// Value is clamped to [0, 100] so misbehaving inputs don't push the dot
+// past the bar.
 
 interface Props {
   value: number | null;
   width?: number;
-  height?: number;
-  showLabel?: boolean;
+  large?: boolean;
 }
 
-export default function RSIGauge({ value, width = 80, height = 14, showLabel = true }: Props) {
+export default function RSIGauge({ value, width = 70, large = false }: Props) {
   if (value == null || !Number.isFinite(value)) {
+    return <span style={{ color: "var(--text-mute)", fontSize: 10 }}>—</span>;
+  }
+  const v = Math.max(0, Math.min(100, value));
+  const state = v < 30 ? "os" : v > 70 ? "ob" : "neu";
+
+  if (large) {
+    // Side-panel hero gauge — 32px tall, with 20/40/60/80 grid ticks.
     return (
-      <span className="text-gray-600 text-[10px] font-mono">—</span>
+      <div>
+        <div
+          style={{
+            position: "relative",
+            height: 32,
+            background: "var(--bg-chip)",
+            borderRadius: 4,
+            overflow: "hidden",
+            marginBottom: 6,
+          }}
+        >
+          <div style={{
+            position: "absolute", top: 0, bottom: 0, left: 0, width: "30%",
+            background: "color-mix(in oklab, var(--acc-down) 22%, transparent)",
+          }} />
+          <div style={{
+            position: "absolute", top: 0, bottom: 0, left: "70%", right: 0,
+            background: "color-mix(in oklab, var(--acc-up) 22%, transparent)",
+          }} />
+          {[20, 40, 60, 80].map((t) => (
+            <span key={t} style={{
+              position: "absolute", top: 0, bottom: 0, left: `${t}%`,
+              width: 1, background: "var(--border-soft)",
+            }} />
+          ))}
+          <div style={{
+            position: "absolute", top: "50%", left: `${v}%`,
+            transform: "translate(-50%, -50%)",
+            width: 18, height: 18, borderRadius: "50%",
+            background: state === "ob" ? "var(--acc-up)" : state === "os" ? "var(--acc-down)" : "var(--text-strong)",
+            boxShadow: "0 0 0 3px var(--bg-card), 0 2px 8px rgba(0,0,0,0.4)",
+          }} />
+        </div>
+        <div style={{
+          display: "flex", justifyContent: "space-between",
+          fontSize: 9, color: "var(--text-mute)",
+          fontFamily: "var(--font-geist-mono), ui-monospace, monospace",
+        }}>
+          <span>0</span><span>30</span><span>50</span><span>70</span><span>100</span>
+        </div>
+        <div style={{
+          marginTop: 8, fontSize: 11,
+          letterSpacing: ".12em", textTransform: "uppercase",
+          color: "var(--text)",
+        }}>
+          {state === "ob" ? "Overbought" : state === "os" ? "Oversold" : "Neutral"}
+        </div>
+      </div>
     );
   }
 
-  // Clamp so misbehaving inputs don't overflow the bar.
-  const v = Math.max(0, Math.min(100, value));
-  const dotX = (v / 100) * (width - 6); // 6 = dot diameter
-
-  // 3-zone fill: red (0-30), neutral (30-70), green (70-100). Widths in %
-  // since SVG nested rects don't need to be pixel-aligned.
-  const oversoldW = (30 / 100) * width;
-  const overboughtX = (70 / 100) * width;
-  const overboughtW = width - overboughtX;
-
-  // Dot color matches the zone the value sits in, so an "overbought" RSI
-  // doesn't render as a neutral-looking marker.
+  // Table-row variant: compact horizontal bar + numeric value.
   const dotColor =
-    v >= 70 ? "#EF4444" : v <= 30 ? "#10B981" : "#E5E7EB";
+    state === "ob" ? "var(--acc-up)" :
+    state === "os" ? "var(--acc-down)" :
+    "var(--text-strong)";
 
   return (
-    <div className="flex items-center gap-1.5">
-      <svg width={width} height={height} aria-hidden="true">
-        {/* Background bar */}
-        <rect x={0} y={height / 2 - 1.5} width={width} height={3} rx={1.5}
-          fill="rgba(255,255,255,0.05)" />
-        {/* Oversold zone */}
-        <rect x={0} y={height / 2 - 1.5} width={oversoldW} height={3} rx={1.5}
-          fill="rgba(16,185,129,0.25)" />
-        {/* Overbought zone */}
-        <rect x={overboughtX} y={height / 2 - 1.5} width={overboughtW} height={3} rx={1.5}
-          fill="rgba(239,68,68,0.25)" />
-        {/* Current value dot */}
-        <circle cx={dotX + 3} cy={height / 2} r={3} fill={dotColor} />
-      </svg>
-      {showLabel && (
-        <span
-          className={`text-[10px] font-mono ${
-            v >= 70 ? "text-red-400" : v <= 30 ? "text-emerald-400" : "text-gray-400"
-          }`}
-        >
-          {v.toFixed(0)}
-        </span>
-      )}
+    <div style={{ display: "flex", alignItems: "center", gap: 6, width }}>
+      <div style={{
+        position: "relative",
+        height: 4,
+        borderRadius: 2,
+        background: "var(--bg-chip)",
+        flex: 1,
+        minWidth: 40,
+        overflow: "hidden",
+      }}>
+        <div style={{
+          position: "absolute", top: 0, bottom: 0, left: 0, width: "30%",
+          background: "color-mix(in oklab, var(--acc-down) 18%, transparent)",
+        }} />
+        <div style={{
+          position: "absolute", top: 0, bottom: 0, left: "70%", right: 0,
+          background: "color-mix(in oklab, var(--acc-up) 18%, transparent)",
+        }} />
+        <div style={{
+          position: "absolute", top: "50%", left: `${v}%`,
+          transform: "translate(-50%, -50%)",
+          width: 8, height: 8, borderRadius: "50%",
+          background: dotColor,
+          boxShadow: "0 0 0 1.5px var(--bg-card)",
+        }} />
+      </div>
+      <span style={{
+        fontSize: 10,
+        color: "var(--text-mute)",
+        fontFamily: "var(--font-geist-mono), ui-monospace, monospace",
+        width: 18,
+        textAlign: "right",
+      }}>
+        {Math.round(v)}
+      </span>
     </div>
   );
 }

@@ -31,9 +31,13 @@ export default function RootLayout({
   return (
     <html lang="en">
       <body
-        className={`${satoshi.variable} ${geistMono.variable} antialiased min-h-screen bg-base text-white`}
+        className={`${satoshi.variable} ${geistMono.variable} antialiased min-h-screen`}
+        style={{ background: "var(--bg)", color: "var(--text)" }}
       >
-        <div className="relative z-10">{children}</div>
+        {/* No wrapper z-index — the Bracket aesthetic is flat. The detail
+            side panel renders at z-40/z-41 via its own portal-like position
+            fixed (see AssetDetailPanel). */}
+        {children}
       </body>
     </html>
   );

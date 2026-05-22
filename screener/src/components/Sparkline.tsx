@@ -1,22 +1,31 @@
 "use client";
 
-// Minimal SVG sparkline. Renders a polyline scaled to the component's
-// (width, height) box. Colors itself green if the series finished above
-// where it started, red otherwise — matches the screener-row palette.
-// Empty / single-point series render as a flat dash so the column doesn't
-// jump in size between rows that have data and rows that don't.
+// SVG sparkline. The Bracket redesign drives all color through CSS:
+// stroke + fill both use `currentColor`, so the parent's `.tone-up` /
+// `.tone-down` class decides the spark's color. This keeps the spark in
+// sync with the % cell it represents without duplicating logic.
 
 interface Props {
   data: number[];
   width?: number;
   height?: number;
-  // If provided, override the auto-derived stroke color. Used when the
-  // caller wants the sparkline tinted by sector instead of by net direction.
-  color?: string;
+  // When true, paint a faint filled area below the line (used in the
+  // side panel hero chart). Tiles + table rows typically don't fill so
+  // the line reads crisp against the row background.
+  fill?: boolean;
+  strokeWidth?: number;
 }
 
-export default function Sparkline({ data, width = 70, height = 22, color }: Props) {
+export default function Sparkline({
+  data,
+  width = 80,
+  height = 24,
+  fill = false,
+  strokeWidth = 1.25,
+}: Props) {
   if (!data || data.length < 2) {
+    // Render an inert dash so the column doesn't reflow between rows
+    // with and without data.
     return (
       <svg width={width} height={height} aria-hidden="true">
         <line
@@ -27,35 +36,46 @@ export default function Sparkline({ data, width = 70, height = 22, color }: Prop
     );
   }
 
+  // Normalize values to [0, 1] so the line uses the full y-range.
   const min = Math.min(...data);
   const max = Math.max(...data);
-  const range = max - min || 1; // guard against flat series
+  const range = max - min || 1;
 
-  // Polyline points, scaled to (width × height) with 1px padding so the
-  // stroke doesn't get clipped at the box edges.
-  const stepX = (width - 2) / (data.length - 1);
-  const points = data
-    .map((v, i) => {
-      const x = 1 + i * stepX;
-      // Invert y so higher prices render at the top of the box.
-      const y = 1 + ((max - v) / range) * (height - 2);
-      return `${x.toFixed(2)},${y.toFixed(2)}`;
-    })
-    .join(" ");
+  const pad = 1.5;
+  const n = data.length;
+  const x = (i: number) => pad + (i / (n - 1)) * (width - 2 * pad);
+  const y = (v: number) => pad + (1 - (v - min) / range) * (height - 2 * pad);
 
-  const isUp = data[data.length - 1] >= data[0];
-  const stroke = color ?? (isUp ? "#10B981" : "#EF4444");
+  let d = "";
+  for (let i = 0; i < n; i++) {
+    d += (i === 0 ? "M" : "L") + x(i).toFixed(2) + " " + y(data[i]).toFixed(2);
+  }
+  const last = data[n - 1];
 
   return (
-    <svg width={width} height={height} aria-hidden="true">
-      <polyline
-        points={points}
+    <svg
+      width={width}
+      height={height}
+      viewBox={`0 0 ${width} ${height}`}
+      aria-hidden="true"
+      style={{ display: "block" }}
+    >
+      {fill && (
+        <path
+          d={d + ` L${x(n - 1)} ${height} L${x(0)} ${height} Z`}
+          fill="currentColor"
+          opacity="0.12"
+        />
+      )}
+      <path
+        d={d}
         fill="none"
-        stroke={stroke}
-        strokeWidth={1.25}
-        strokeLinecap="round"
+        stroke="currentColor"
+        strokeWidth={strokeWidth}
         strokeLinejoin="round"
+        strokeLinecap="round"
       />
+      <circle cx={x(n - 1)} cy={y(last)} r={1.6} fill="currentColor" />
     </svg>
   );
 }

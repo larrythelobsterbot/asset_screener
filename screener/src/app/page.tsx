@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useEffect } from "react";
+import { useState, useEffect, useMemo } from "react";
 import MacroBar from "@/components/MacroBar";
 import TimeframeToggle, { Timeframe } from "@/components/TimeframeToggle";
 import Heatmap from "@/components/Heatmap";
@@ -20,10 +20,8 @@ export default function Home() {
   const [selectedAsset, setSelectedAsset] = useState<string | null>(null);
   const [showWatchlist, setShowWatchlist] = useState(false);
   const { watchlist, toggle, count } = useWatchlist();
+  const [searchQuery, setSearchQuery] = useState("");
 
-  // View toggle (heatmap | table). Persisted to localStorage so reloads
-  // stick on the last-used surface. Default = heatmap so existing users
-  // see exactly what they had before.
   const [view, setView] = useState<View>("heatmap");
   useEffect(() => {
     if (typeof window === "undefined") return;
@@ -37,11 +35,9 @@ export default function Home() {
     }
   }
 
-  // Filter state
   const { filters, setFilter, clearFilters, activeCount } = useFilters();
   const [filterPanelOpen, setFilterPanelOpen] = useState(false);
 
-  // Markets data — single source of truth for filtering
   const [allAssets, setAllAssets] = useState<AssetData[]>([]);
   const [isLoading, setIsLoading] = useState(true);
 
@@ -50,30 +46,32 @@ export default function Home() {
       try {
         const res = await fetch("/api/markets");
         if (res.ok) setAllAssets(await res.json());
-        // On error: keep existing state (don't hide signals)
-      } catch {
-        // ignore — keep existing allAssets
-      } finally {
-        setIsLoading(false);
-      }
+      } catch { /* keep existing state */ }
+      finally { setIsLoading(false); }
     }
     load();
     const id = setInterval(load, 30_000);
     return () => clearInterval(id);
   }, []);
 
-  // Derived values — recomputed on every render when allAssets or filters change
-  const filteredAssets = allAssets.filter((a) => passesFilters(a, filters));
+  // Filter pipeline: filter panel rules → search query (applied here so
+  // the heatmap and table see the same filtered universe).
+  const filteredAssets = useMemo(() => {
+    let arr = allAssets.filter((a) => passesFilters(a, filters));
+    if (searchQuery.trim()) {
+      const q = searchQuery.trim().toLowerCase();
+      arr = arr.filter(
+        (a) => a.symbol.toLowerCase().includes(q) || a.name.toLowerCase().includes(q)
+      );
+    }
+    return arr;
+  }, [allAssets, filters, searchQuery]);
 
-  // null = data not loaded yet → SignalScanner shows all signals
   const passingSymbols: Set<string> | null =
-    allAssets.length === 0
-      ? null
-      : new Set(filteredAssets.map((a) => a.symbol));
+    allAssets.length === 0 ? null : new Set(filteredAssets.map((a) => a.symbol));
 
   return (
-    <div className="min-h-screen flex flex-col">
-      {/* Slide-in filter panel (fixed position, conditionally rendered) */}
+    <div style={{ minHeight: "100vh", display: "flex", flexDirection: "column", background: "var(--bg)" }}>
       {filterPanelOpen && (
         <FilterPanel
           filters={filters}
@@ -85,82 +83,82 @@ export default function Home() {
 
       <MacroBar />
 
-      <div className="flex items-center justify-between px-6 py-4">
-        <h1 className="text-lg font-bold tracking-tight">
-          <span className="text-white">Asset</span>{" "}
-          <span className="text-gray-500">Screener</span>
-        </h1>
-        <div className="flex items-center gap-3">
-          {/* View toggle: Heatmap | Table */}
-          <div className="flex items-center gap-1 bg-surface rounded-lg p-1">
-            <button
-              onClick={() => changeView("heatmap")}
-              className={`px-3 py-1 rounded-md text-xs font-medium transition-all ${
-                view === "heatmap"
-                  ? "bg-white/10 text-white"
-                  : "text-gray-500 hover:text-gray-300"
-              }`}
-              title="Heatmap view"
-            >
+      {/* ── Top bar ─────────────────────────────────────────── */}
+      <div className="topbar">
+        <div className="topbar-l">
+          {/* Title: Asset[Screener] — "Asset" muted, "[Screener]" mustard
+              with mute brackets via .title-bracket class. */}
+          <h1 className="title">
+            <span className="title-1">Asset</span>
+            <span className="title-2 sym">Screener</span>
+          </h1>
+
+          {/* Search input — filters table + heatmap by name OR symbol */}
+          <label className="search">
+            <span className="search-icon">⌕</span>
+            <input
+              type="text"
+              placeholder="Search symbol or name…"
+              value={searchQuery}
+              onChange={(e) => setSearchQuery(e.target.value)}
+            />
+            {searchQuery && (
+              <button
+                className="search-clear"
+                onClick={() => setSearchQuery("")}
+                aria-label="Clear search"
+                style={{ background: "transparent", border: 0, color: "var(--text-mute)", cursor: "pointer", padding: "2px 4px" }}
+              >
+                ✕
+              </button>
+            )}
+          </label>
+        </div>
+
+        <div className="topbar-r">
+          {/* View toggle */}
+          <div className="seg">
+            <button onClick={() => changeView("heatmap")} className={view === "heatmap" ? "on" : ""}>
               Heatmap
             </button>
-            <button
-              onClick={() => changeView("table")}
-              className={`px-3 py-1 rounded-md text-xs font-medium transition-all ${
-                view === "table"
-                  ? "bg-white/10 text-white"
-                  : "text-gray-500 hover:text-gray-300"
-              }`}
-              title="Table view"
-            >
+            <button onClick={() => changeView("table")} className={view === "table" ? "on" : ""}>
               Table
             </button>
           </div>
 
-          {/* Filters button */}
+          {/* Filters */}
           <button
-            onClick={() => setFilterPanelOpen((prev) => !prev)}
-            className={`relative flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium transition-all border ${
-              activeCount > 0
-                ? "bg-violet-600/20 border-violet-500/50 text-violet-300"
-                : "bg-transparent border-white/10 text-gray-500 hover:text-gray-300 hover:border-white/20"
-            }`}
+            onClick={() => setFilterPanelOpen((p) => !p)}
+            className="btn-ghost"
+            style={activeCount > 0 ? {
+              color: "var(--acc-warn)",
+              borderColor: "color-mix(in oklab, var(--acc-warn) 40%, transparent)",
+            } : undefined}
           >
-            <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <svg width="11" height="11" fill="none" stroke="currentColor" viewBox="0 0 24 24">
               <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2}
                 d="M3 4a1 1 0 011-1h16a1 1 0 011 1v2a1 1 0 01-.293.707L13 13.414V19a1 1 0 01-.553.894l-4 2A1 1 0 017 21v-7.586L3.293 6.707A1 1 0 013 6V4z"
               />
             </svg>
             Filters
-            {activeCount > 0 && (
-              <span className="absolute -top-1.5 -right-1.5 bg-violet-500 text-white text-[10px] font-bold rounded-full w-4 h-4 flex items-center justify-center">
-                {activeCount}
-              </span>
-            )}
+            {activeCount > 0 && <span className="btn-count">{activeCount}</span>}
           </button>
 
-          {/* Watchlist button */}
+          {/* Watchlist */}
           <button
             onClick={() => setShowWatchlist(!showWatchlist)}
-            className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium transition-all border ${
-              showWatchlist
-                ? "bg-yellow-400/10 border-yellow-400/30 text-yellow-400"
-                : "bg-transparent border-white/10 text-gray-500 hover:text-gray-300 hover:border-white/20"
-            }`}
+            className={`btn-ghost ${showWatchlist ? "on-watch" : ""}`}
           >
-            <span>{showWatchlist ? "\u2605" : "\u2606"}</span>
+            <span>{showWatchlist ? "★" : "☆"}</span>
             Watchlist
-            {count > 0 && (
-              <span className="text-[10px] font-mono bg-white/10 px-1.5 py-0.5 rounded">
-                {count}
-              </span>
-            )}
+            {count > 0 && <span className="btn-count">{count}</span>}
           </button>
 
           <TimeframeToggle selected={timeframe} onChange={setTimeframe} />
         </div>
       </div>
 
+      {/* ── Main surface ────────────────────────────────────── */}
       {view === "heatmap" ? (
         <Heatmap
           assets={filteredAssets}
@@ -183,7 +181,7 @@ export default function Home() {
         />
       )}
 
-      <div className="px-4 pb-6 mt-2">
+      <div style={{ padding: "0 24px 24px" }}>
         <SignalScanner
           onSelectAsset={setSelectedAsset}
           allowedSymbols={passingSymbols}
@@ -196,6 +194,38 @@ export default function Home() {
           onClose={() => setSelectedAsset(null)}
         />
       )}
+
+      <style jsx>{`
+        .topbar {
+          display: flex; justify-content: space-between; align-items: center;
+          padding: 18px 24px 14px;
+          gap: 16px;
+        }
+        .topbar-l {
+          display: flex; align-items: center; gap: 18px; min-width: 0; flex: 1;
+        }
+        .topbar-r {
+          display: flex; align-items: center; gap: 8px; flex-shrink: 0;
+          flex-wrap: wrap;
+        }
+        .title {
+          margin: 0; font-size: 14px; font-weight: 500;
+          letter-spacing: -0.01em;
+        }
+        :global(.title-1) {
+          color: var(--text-mute);
+          margin-right: 0.35ch;
+          font-family: var(--font-geist-mono), ui-monospace, monospace;
+        }
+        :global(.title-2) {
+          color: var(--acc-warn);
+          font-weight: 500;
+        }
+        :global(.search-icon) {
+          color: var(--text-mute);
+          font-size: 13px;
+        }
+      `}</style>
     </div>
   );
 }

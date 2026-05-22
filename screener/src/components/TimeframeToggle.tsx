@@ -1,5 +1,8 @@
 "use client";
 
+// Timeframe segmented control — uses the global .seg class so the visual
+// stays in sync with the Heatmap/Table view toggle.
+
 const TIMEFRAMES = ["1h", "4h", "24h", "7d"] as const;
 export type Timeframe = (typeof TIMEFRAMES)[number];
 
@@ -10,16 +13,13 @@ interface Props {
 
 export default function TimeframeToggle({ selected, onChange }: Props) {
   return (
-    <div className="flex items-center gap-1 bg-surface rounded-lg p-1">
+    <div className="seg">
       {TIMEFRAMES.map((tf) => (
         <button
           key={tf}
           onClick={() => onChange(tf)}
-          className={`px-3 py-1.5 rounded-md text-xs font-medium uppercase transition-all ${
-            selected === tf
-              ? "bg-white/10 text-white shadow-sm"
-              : "text-gray-500 hover:text-gray-300"
-          }`}
+          className={selected === tf ? "on" : ""}
+          style={{ textTransform: "uppercase" }}
         >
           {tf}
         </button>

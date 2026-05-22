@@ -9,13 +9,16 @@ import Sparkline from "./Sparkline";
 import RSIGauge from "./RSIGauge";
 import MAGrid from "./MAGrid";
 
-// The screener table is the "research" view — dense, sortable, MA-grid +
-// sparklines + RSI gauges. Coexists with the heatmap; toggled at page level.
+// Dense Bracket-style table view.
 //
-// Data model: we LEFT JOIN pre-filtered AssetData against the response of
-// /api/screener?tf=X. Symbols missing from the screener payload still
-// render (showing — for indicator cells) so the user isn't confused by a
-// row count that doesn't match the heatmap.
+// Visual hooks (CSS in globals.css owns the heavy lifting):
+//   .sym         — bracket-wraps the ticker via pseudo-elements
+//   .pct-tri     — triangle ▲/▼ via pseudo-element, scoped to dir % cells
+//   .tone-up/-down/-flat — text color via CSS var
+//
+// Row hover state (mustard ring + sym/name color shift) lives in
+// globals.css too. Hover styles defined here would lose specificity to
+// the `transition` line, so we keep them centralized.
 
 type SortKey =
   | "name"
@@ -29,9 +32,6 @@ type SortKey =
   | "rsi"
   | "volume24h";
 
-// Heatmap TF -> screener candle TF. "24h" and "7d" both map to 1d candles
-// because the MA grid is fundamentally a chart-level concept and "daily MA"
-// is what users intuit when they pick either of those buckets.
 function mapToCandleTF(tf: HeatmapTF): "1h" | "4h" | "1d" {
   if (tf === "1h") return "1h";
   if (tf === "4h") return "4h";
@@ -44,20 +44,22 @@ function fmtPrice(n: number): string {
   return n.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 }
 
-function fmtPct(n: number | null): string {
+function fmtPct(n: number | null, zeroDash: boolean = false): string {
   if (n == null || !Number.isFinite(n)) return "—";
+  if (Math.abs(n) < 0.005) return zeroDash ? "—" : "0.00%";
   const sign = n > 0 ? "+" : "";
   return `${sign}${n.toFixed(2)}%`;
 }
 
-function pctColor(n: number | null): string {
-  if (n == null) return "text-gray-600";
-  if (n > 0) return "text-emerald-400";
-  if (n < 0) return "text-red-400";
-  return "text-gray-400";
+function toneClass(n: number | null): string {
+  if (n == null) return "tone-mute";
+  if (n > 0.005) return "tone-up";
+  if (n < -0.005) return "tone-down";
+  return "tone-flat";
 }
 
 function fmtVol(n: number): string {
+  if (n >= 1e12) return `$${(n / 1e12).toFixed(2)}T`;
   if (n >= 1e9) return `$${(n / 1e9).toFixed(2)}B`;
   if (n >= 1e6) return `$${(n / 1e6).toFixed(1)}M`;
   if (n >= 1e3) return `$${(n / 1e3).toFixed(0)}K`;
@@ -72,11 +74,15 @@ interface Props {
   showWatchlistOnly: boolean;
   watchlist: Set<string>;
   onToggleWatch: (symbol: string) => void;
+  // Optional text filter from the top-bar search input (case-insensitive,
+  // matches name OR symbol). Empty/undefined = no filter.
+  searchQuery?: string;
 }
 
 export default function ScreenerTable({
   assets, isLoading, timeframe, onSelectAsset,
   showWatchlistOnly, watchlist, onToggleWatch,
+  searchQuery,
 }: Props) {
   const candleTf = mapToCandleTF(timeframe);
   const [screenerRows, setScreenerRows] = useState<ScreenerRow[]>([]);
@@ -84,37 +90,22 @@ export default function ScreenerTable({
   const [sortKey, setSortKey] = useState<SortKey>("volume24h");
   const [sortAsc, setSortAsc] = useState(false);
 
-  // Re-fetch when the candle TF changes. We don't bother polling on a
-  // timer here because /api/screener has its own 60s server cache; the
-  // heatmap's polling already drives /api/markets churn.
   useEffect(() => {
     let cancelled = false;
     setScreenerLoading(true);
-    fetch(`/api/screener?tf=${candleTf}`)
+    const fetchOnce = () => fetch(`/api/screener?tf=${candleTf}`)
       .then((r) => r.json())
       .then((data: ScreenerRow[]) => {
         if (cancelled) return;
         if (Array.isArray(data)) setScreenerRows(data);
         setScreenerLoading(false);
       })
-      .catch(() => {
-        if (!cancelled) setScreenerLoading(false);
-      });
-    const interval = setInterval(() => {
-      fetch(`/api/screener?tf=${candleTf}`)
-        .then((r) => r.json())
-        .then((data: ScreenerRow[]) => {
-          if (!cancelled && Array.isArray(data)) setScreenerRows(data);
-        })
-        .catch(() => {});
-    }, 60_000);
-    return () => {
-      cancelled = true;
-      clearInterval(interval);
-    };
+      .catch(() => { if (!cancelled) setScreenerLoading(false); });
+    fetchOnce();
+    const interval = setInterval(fetchOnce, 60_000);
+    return () => { cancelled = true; clearInterval(interval); };
   }, [candleTf]);
 
-  // Map for O(1) row enrichment.
   const screenerBySymbol = useMemo(() => {
     const m = new Map<string, ScreenerRow>();
     for (const r of screenerRows) m.set(r.symbol, r);
@@ -122,10 +113,15 @@ export default function ScreenerTable({
   }, [screenerRows]);
 
   const visibleAssets = useMemo(() => {
-    return showWatchlistOnly
-      ? assets.filter((a) => watchlist.has(a.symbol))
-      : assets;
-  }, [assets, showWatchlistOnly, watchlist]);
+    let arr = showWatchlistOnly ? assets.filter((a) => watchlist.has(a.symbol)) : assets;
+    if (searchQuery && searchQuery.trim()) {
+      const q = searchQuery.trim().toLowerCase();
+      arr = arr.filter((a) =>
+        a.symbol.toLowerCase().includes(q) || a.name.toLowerCase().includes(q)
+      );
+    }
+    return arr;
+  }, [assets, showWatchlistOnly, watchlist, searchQuery]);
 
   const sorted = useMemo(() => {
     const arr = [...visibleAssets];
@@ -173,21 +169,27 @@ export default function ScreenerTable({
     if (sortKey === key) setSortAsc(!sortAsc);
     else {
       setSortKey(key);
-      // Sensible per-column default: most users want desc on numeric cols
-      // (highest first) and asc on name.
+      // name is the only one we want asc by default; everything else
+      // reads "biggest first" more naturally.
       setSortAsc(key === "name");
     }
   };
 
-  const sortArrow = (key: SortKey) =>
-    sortKey === key ? (sortAsc ? " ▲" : " ▼") : "";
+  const arr = (key: SortKey) =>
+    sortKey === key ? (
+      <span style={{ color: "var(--acc-warn)", fontSize: 8, marginLeft: 4 }}>
+        {sortAsc ? "▲" : "▼"}
+      </span>
+    ) : null;
 
   if (isLoading) {
     return (
       <div className="flex-1 flex items-center justify-center py-20">
         <div className="flex flex-col items-center gap-3">
-          <div className="w-8 h-8 border-2 border-white/20 border-t-white/60 rounded-full animate-spin" />
-          <span className="text-sm text-gray-500">Loading markets...</span>
+          <div className="w-8 h-8 border-2 border-white/20 border-t-acc-warn rounded-full animate-spin" />
+          <span style={{ fontSize: 11, color: "var(--text-mute)", letterSpacing: ".12em", textTransform: "uppercase" }}>
+            Loading markets…
+          </span>
         </div>
       </div>
     );
@@ -197,72 +199,95 @@ export default function ScreenerTable({
     return (
       <div className="flex-1 flex items-center justify-center py-20">
         <div className="text-center">
-          <span className="text-2xl block mb-2">☆</span>
-          <span className="text-sm text-gray-500">No assets in your watchlist yet.</span>
+          <span style={{ fontSize: 24, display: "block", marginBottom: 8, color: "var(--text-mute)" }}>☆</span>
+          <span style={{ fontSize: 12, color: "var(--text-mute)" }}>No assets in your watchlist yet.</span>
         </div>
       </div>
     );
   }
 
+  const thStyle: React.CSSProperties = {
+    padding: "8px 10px",
+    fontSize: 10, fontWeight: 500,
+    letterSpacing: ".1em", textTransform: "uppercase",
+    color: "var(--text-mute)",
+    whiteSpace: "nowrap",
+    userSelect: "none",
+    cursor: "pointer",
+    borderBottom: ".5px solid var(--border)",
+    background: "var(--bg-card)",
+    textAlign: "left",
+    position: "sticky", top: 0,
+  };
+  const thRight: React.CSSProperties = { ...thStyle, textAlign: "right" };
+
   return (
-    <div className="px-4 pb-6">
-      <div className="bg-surface/50 rounded-xl border border-white/5 overflow-hidden">
-        <div className="flex items-center justify-between px-4 py-2.5 border-b border-white/5">
-          <div className="flex items-center gap-2">
-            <div className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse" />
-            <span className="text-xs font-semibold uppercase tracking-wider text-gray-300">
+    <div style={{ padding: "0 24px 24px" }}>
+      <div
+        className="density-comfy"
+        style={{
+          background: "var(--bg-card)",
+          border: ".5px solid var(--border)",
+          borderRadius: "var(--radius)",
+          overflow: "hidden",
+        }}
+      >
+        {/* Header band */}
+        <div style={{
+          display: "flex",
+          justifyContent: "space-between",
+          alignItems: "center",
+          padding: "10px 14px",
+          borderBottom: ".5px solid var(--border)",
+        }}>
+          <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+            <span className="pulse" />
+            <span style={{
+              fontSize: 11, fontWeight: 600,
+              letterSpacing: ".16em", textTransform: "uppercase",
+              color: "var(--text)",
+            }}>
               Screener
             </span>
-            <span className="text-[10px] font-mono text-gray-600 bg-gray-800/50 px-1.5 py-0.5 rounded">
+            <span style={{
+              fontSize: 10, color: "var(--text-mute)",
+              padding: "2px 6px", borderRadius: 3,
+              background: "var(--bg-chip)",
+              fontFamily: "var(--font-geist-mono), ui-monospace, monospace",
+            }}>
               {sorted.length} / {assets.length}
             </span>
-            <span className="text-[10px] font-mono text-gray-600 ml-2">
+            <span style={{
+              fontSize: 10, color: "var(--text-mute)",
+              fontFamily: "var(--font-geist-mono), ui-monospace, monospace",
+            }}>
               MAs: {candleTf}
             </span>
           </div>
           {screenerLoading && (
-            <span className="text-[10px] text-gray-600">computing indicators…</span>
+            <span style={{ fontSize: 10, color: "var(--text-mute)" }}>computing indicators…</span>
           )}
         </div>
-        <div className="overflow-x-auto">
-          <table className="w-full text-sm border-collapse">
+
+        <div style={{ overflowX: "auto" }}>
+          <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 12 }}>
             <thead>
-              <tr className="text-left text-[10px] text-gray-500 uppercase tracking-wider border-b border-white/5">
-                <th className="py-2 px-2 w-8 text-right">#</th>
-                <th className="py-2 px-2 cursor-pointer hover:text-gray-300" onClick={() => handleSort("name")}>
-                  Name{sortArrow("name")}
-                </th>
-                <th className="py-2 px-2">Sym</th>
-                <th className="py-2 px-2 text-right cursor-pointer hover:text-gray-300" onClick={() => handleSort("price")}>
-                  Price{sortArrow("price")}
-                </th>
-                <th className="py-2 px-2 text-right cursor-pointer hover:text-gray-300" onClick={() => handleSort("change1h")}>
-                  1h%{sortArrow("change1h")}
-                </th>
-                <th className="py-2 px-2 text-right cursor-pointer hover:text-gray-300" onClick={() => handleSort("change4h")}>
-                  4h%{sortArrow("change4h")}
-                </th>
-                <th className="py-2 px-2 text-right cursor-pointer hover:text-gray-300" onClick={() => handleSort("change24h")}>
-                  24h%{sortArrow("change24h")}
-                </th>
-                <th className="py-2 px-2 text-right cursor-pointer hover:text-gray-300" onClick={() => handleSort("change7d")}>
-                  7d%{sortArrow("change7d")}
-                </th>
-                <th className="py-2 px-2 text-right cursor-pointer hover:text-gray-300" onClick={() => handleSort("volume24h")}>
-                  Vol 24h{sortArrow("volume24h")}
-                </th>
-                <th className="py-2 px-2 text-right cursor-pointer hover:text-gray-300" onClick={() => handleSort("vol_ratio")}>
-                  Vol Ratio{sortArrow("vol_ratio")}
-                </th>
-                <th className="py-2 px-2 text-right cursor-pointer hover:text-gray-300" onClick={() => handleSort("ath_pct")}>
-                  ATH%{sortArrow("ath_pct")}
-                </th>
-                <th className="py-2 px-2 text-center">Spark</th>
-                <th className="py-2 px-2 cursor-pointer hover:text-gray-300" onClick={() => handleSort("rsi")}>
-                  RSI{sortArrow("rsi")}
-                </th>
-                <th className="py-2 px-2">MAs ({candleTf})</th>
-                <th className="py-2 px-2 w-6" />
+              <tr>
+                <th style={{ ...thRight, width: 32 }}>#</th>
+                <th style={thStyle} onClick={() => handleSort("name")}>Name{arr("name")}</th>
+                <th style={thStyle}>Sym</th>
+                <th style={thRight} onClick={() => handleSort("price")}>Price{arr("price")}</th>
+                <th style={thRight} onClick={() => handleSort("change1h")}>1H%{arr("change1h")}</th>
+                <th style={thRight} onClick={() => handleSort("change4h")}>4H%{arr("change4h")}</th>
+                <th style={thRight} onClick={() => handleSort("change24h")}>24H%{arr("change24h")}</th>
+                <th style={thRight} onClick={() => handleSort("change7d")}>7D%{arr("change7d")}</th>
+                <th style={thRight} onClick={() => handleSort("volume24h")}>Vol 24H{arr("volume24h")}</th>
+                <th style={thRight} onClick={() => handleSort("vol_ratio")}>Vol Ratio{arr("vol_ratio")}</th>
+                <th style={thRight} onClick={() => handleSort("ath_pct")}>ATH%{arr("ath_pct")}</th>
+                <th style={{ ...thStyle, width: 100, textAlign: "center" }}>Spark</th>
+                <th style={thStyle} onClick={() => handleSort("rsi")}>RSI{arr("rsi")}</th>
+                <th style={thStyle}>MAs ({candleTf})</th>
+                <th style={{ ...thStyle, width: 28 }} />
               </tr>
             </thead>
             <tbody>
@@ -270,64 +295,57 @@ export default function ScreenerTable({
                 const sr = screenerBySymbol.get(a.symbol) ?? null;
                 const sectorColor = SECTORS[a.sector]?.color ?? "#64748B";
                 const isWatched = watchlist.has(a.symbol);
+                const sparkTone = sr && sr.sparkline.length > 1
+                  ? (sr.sparkline[sr.sparkline.length - 1] >= sr.sparkline[0] ? "tone-up" : "tone-down")
+                  : "tone-mute";
                 return (
                   <tr
                     key={a.symbol}
-                    className="border-b border-white/3 hover:bg-white/3 cursor-pointer transition-colors group"
+                    className="screener-row"
                     onClick={() => onSelectAsset(a.symbol)}
                   >
-                    <td className="py-1.5 px-2 text-right text-[10px] text-gray-600 font-mono">{i + 1}</td>
-                    <td className="py-1.5 px-2">
-                      <div className="flex items-center gap-2">
-                        <div className="w-1.5 h-1.5 rounded-full shrink-0" style={{ backgroundColor: sectorColor }} />
-                        <span className="text-xs text-gray-200 truncate max-w-[140px]">{a.name}</span>
-                      </div>
+                    <td className="cell-rank">{String(i + 1).padStart(2, "0")}</td>
+                    <td className="cell-name">
+                      <span className="sec-dot" style={{ background: sectorColor, marginRight: 8 }} />
+                      <span className="name-txt">{a.name}</span>
                     </td>
-                    <td className="py-1.5 px-2 text-xs font-semibold text-white font-mono">{a.symbol}</td>
-                    <td className="py-1.5 px-2 text-right text-xs font-mono text-white">${fmtPrice(a.price)}</td>
-                    <td className={`py-1.5 px-2 text-right text-xs font-mono ${pctColor(a.change1h)}`}>{fmtPct(a.change1h)}</td>
-                    <td className={`py-1.5 px-2 text-right text-xs font-mono ${pctColor(a.change4h)}`}>{fmtPct(a.change4h)}</td>
-                    <td className={`py-1.5 px-2 text-right text-xs font-mono ${pctColor(a.change24h)}`}>{fmtPct(a.change24h)}</td>
-                    <td className={`py-1.5 px-2 text-right text-xs font-mono ${pctColor(a.change7d)}`}>{fmtPct(a.change7d)}</td>
-                    <td className="py-1.5 px-2 text-right text-[10px] font-mono text-gray-400">{fmtVol(a.volume24h)}</td>
-                    <td className="py-1.5 px-2 text-right text-[10px] font-mono">
+                    <td className="cell-sym"><span className="sym">{a.symbol}</span></td>
+                    <td className="cell-num cell-price">${fmtPrice(a.price)}</td>
+                    <td className={`cell-num pct-tri ${toneClass(a.change1h)}`}>{fmtPct(a.change1h, true)}</td>
+                    <td className={`cell-num pct-tri ${toneClass(a.change4h)}`}>{fmtPct(a.change4h, true)}</td>
+                    <td className={`cell-num pct-tri ${toneClass(a.change24h)}`}>{fmtPct(a.change24h)}</td>
+                    <td className={`cell-num pct-tri ${toneClass(a.change7d)}`}>{fmtPct(a.change7d)}</td>
+                    <td className="cell-num cell-vol">{fmtVol(a.volume24h)}</td>
+                    <td className="cell-num">
                       {sr?.vol_ratio != null ? (
-                        <span className={sr.vol_ratio >= 2 ? "text-amber-400" : "text-gray-500"}>
-                          {sr.vol_ratio.toFixed(2)}x
+                        <span className={sr.vol_ratio >= 2 ? "vol-ratio-hot" : "vol-ratio"}>
+                          {sr.vol_ratio.toFixed(2)}×
                         </span>
                       ) : (
-                        <span className="text-gray-700">—</span>
+                        <span style={{ color: "var(--text-mute)" }}>—</span>
                       )}
                     </td>
-                    <td className="py-1.5 px-2 text-right text-[10px] font-mono">
-                      {sr?.ath_pct != null ? (
-                        <span className={sr.ath_pct < -50 ? "text-red-400" : sr.ath_pct < -20 ? "text-amber-400" : "text-gray-400"}>
-                          {sr.ath_pct.toFixed(1)}%
-                        </span>
-                      ) : (
-                        <span className="text-gray-700">—</span>
-                      )}
+                    <td className={`cell-num ${
+                      sr?.ath_pct == null ? "tone-mute" :
+                      sr.ath_pct <= -50 ? "tone-down" :
+                      sr.ath_pct <= -20 ? "tone-warn" :
+                      "tone-mute"
+                    }`}>
+                      {sr?.ath_pct == null ? "—" : `${sr.ath_pct.toFixed(1)}%`}
                     </td>
-                    <td className="py-1.5 px-2 text-center">
-                      <Sparkline data={sr?.sparkline ?? []} />
+                    <td className={`cell-spark ${sparkTone}`}>
+                      <Sparkline data={sr?.sparkline ?? []} width={80} height={24} />
                     </td>
-                    <td className="py-1.5 px-2">
+                    <td className="cell-rsi">
                       <RSIGauge value={sr?.rsi ?? null} />
                     </td>
-                    <td className="py-1.5 px-2">
+                    <td className="cell-mas">
                       <MAGrid row={sr} />
                     </td>
-                    <td className="py-1.5 px-2 text-right">
+                    <td className="cell-watch">
                       <button
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          onToggleWatch(a.symbol);
-                        }}
-                        className={`text-sm leading-none transition-all ${
-                          isWatched
-                            ? "text-yellow-400 opacity-100"
-                            : "text-gray-700 opacity-0 group-hover:opacity-100"
-                        }`}
+                        onClick={(e) => { e.stopPropagation(); onToggleWatch(a.symbol); }}
+                        className={isWatched ? "star star-on" : "star"}
                         title={isWatched ? "Remove from watchlist" : "Add to watchlist"}
                       >
                         {isWatched ? "★" : "☆"}
@@ -340,6 +358,104 @@ export default function ScreenerTable({
           </table>
         </div>
       </div>
+
+      {/* Row-level styling is in this scoped style block so the mustard
+          hover ring + sym/name color shift land precisely. Doing it via
+          inline style would lose the :hover-on-tr targeting; doing it in
+          globals.css would scatter the table-only rules across the file. */}
+      <style jsx>{`
+        :global(.screener-row) {
+          cursor: pointer;
+          transition: background .12s, box-shadow .12s;
+        }
+        :global(.screener-row:hover) {
+          background: var(--bg-row-h);
+          box-shadow: inset 0 0 0 .5px color-mix(in oklab, var(--acc-warn) 55%, transparent);
+        }
+        :global(.screener-row:hover .sym),
+        :global(.screener-row:hover .name-txt) {
+          color: var(--acc-warn);
+        }
+        :global(.screener-row:hover .sym::before),
+        :global(.screener-row:hover .sym::after) {
+          color: var(--acc-warn);
+        }
+        :global(.screener-row + .screener-row td) {
+          border-top: .5px solid var(--border-soft);
+        }
+        :global(.screener-row td) {
+          padding: var(--row-pad, 7px) 10px;
+          white-space: nowrap;
+          vertical-align: middle;
+        }
+        :global(.cell-rank) {
+          text-align: right;
+          color: var(--text-mute);
+          font-size: 10px;
+          width: 32px;
+          font-family: var(--font-geist-mono), ui-monospace, monospace;
+        }
+        :global(.cell-name) {
+          padding-left: 14px !important;
+          color: var(--text);
+        }
+        :global(.cell-name .name-txt) {
+          font-size: 12px;
+          max-width: 180px;
+          overflow: hidden;
+          text-overflow: ellipsis;
+          display: inline-block;
+          vertical-align: middle;
+          transition: color .12s;
+        }
+        :global(.cell-sym) {
+          font-family: var(--font-geist-mono), ui-monospace, monospace;
+        }
+        :global(.cell-num) {
+          text-align: right;
+          font-family: var(--font-geist-mono), ui-monospace, monospace;
+          font-size: 12px;
+        }
+        :global(.cell-price) {
+          color: var(--text-strong);
+        }
+        :global(.cell-vol) {
+          color: var(--text-mute);
+        }
+        :global(.cell-spark) {
+          width: 100px;
+          text-align: center;
+        }
+        :global(.vol-ratio) {
+          color: var(--text-mute);
+          font-family: var(--font-geist-mono), ui-monospace, monospace;
+        }
+        :global(.vol-ratio-hot) {
+          color: var(--acc-warn);
+          background: color-mix(in oklab, var(--acc-warn) 14%, transparent);
+          padding: 1px 4px;
+          border-radius: 3px;
+          font-family: var(--font-geist-mono), ui-monospace, monospace;
+        }
+        :global(.cell-watch) {
+          text-align: right;
+          padding-right: 14px !important;
+          width: 28px;
+        }
+        :global(.cell-watch .star) {
+          background: transparent; border: 0; cursor: pointer;
+          font-size: 14px;
+          color: var(--text-mute);
+          opacity: 0;
+          transition: opacity .15s, color .15s;
+          padding: 0;
+        }
+        :global(.screener-row:hover .star) { opacity: 1; }
+        :global(.cell-watch .star.star-on) {
+          color: var(--acc-star);
+          opacity: 1;
+        }
+      `}</style>
     </div>
   );
 }
