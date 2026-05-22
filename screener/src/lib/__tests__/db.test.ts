@@ -27,6 +27,10 @@ import {
   insertSocialSnapshots,
   latestSocialSnapshots,
   pruneSocialSnapshots,
+  insertTrade,
+  closeTrade,
+  listTrades,
+  getTrade,
 } from "../db";
 
 test("price_snapshots round-trip + latestSnapshots returns newest per symbol", () => {
@@ -274,4 +278,169 @@ test("eventHistory: breakout_up does not refire across a simulated restart", asy
   const second = detectSignals("RESTARTSYM", closes, volumes, highs, lows);
   const refired = second.find((s) => s.type === "breakout_up");
   assert.equal(refired, undefined, "breakout_up should not refire after restart");
+});
+
+// ── trades journal ──────────────────────────────────────────────────────
+
+test("insertTrade + getTrade round-trip preserves all snapshot fields", () => {
+  const id = insertTrade({
+    ts_opened: 1700000000000,
+    symbol: "BTC",
+    sector: "majors",
+    direction: "long",
+    mode: "paper",
+    entry_price: 50000,
+    stop_price: 49000,
+    target_price: 53000,
+    size: 0.04,
+    risk_usd: 40,
+    conviction_score: 4.2,
+    conviction_label: "Strong Buy",
+    vol_regime: "normal",
+    atr_pct: 1.33,
+    funding_hourly: 0.0001,
+    signals_json: JSON.stringify([{ type: "breakout_up", tf: "4h" }]),
+    families_json: JSON.stringify(["trend", "volume"]),
+    notes: null,
+  });
+  assert.ok(id > 0);
+
+  const row = getTrade(id);
+  assert.ok(row);
+  assert.equal(row.symbol, "BTC");
+  assert.equal(row.direction, "long");
+  assert.equal(row.entry_price, 50000);
+  assert.equal(row.conviction_score, 4.2);
+  assert.equal(row.ts_closed, null);
+  assert.equal(row.pnl_usd, null);
+});
+
+test("closeTrade @ target: pnl_r is +3R (matches RR_RATIO)", () => {
+  const id = insertTrade({
+    ts_opened: Date.now(),
+    symbol: "ETH",
+    sector: "majors",
+    direction: "long",
+    mode: "paper",
+    entry_price: 3000,
+    stop_price: 2940,     // stop_dist = 60
+    target_price: 3180,   // 3R = 180
+    size: 0.667,           // ~$40 risk / $60 stop_dist = 0.667
+    risk_usd: 40,
+    conviction_score: null,
+    conviction_label: null,
+    vol_regime: null,
+    atr_pct: null,
+    funding_hourly: null,
+    signals_json: null,
+    families_json: null,
+    notes: null,
+  });
+  const closed = closeTrade(id, 3180, "target");
+  assert.ok(closed);
+  assert.ok(closed.pnl_usd! > 0);
+  assert.ok(Math.abs(closed.pnl_r! - 3) < 1e-6, `expected pnl_r ~3, got ${closed.pnl_r}`);
+});
+
+test("closeTrade @ stop: short pnl_r is -1R", () => {
+  const id = insertTrade({
+    ts_opened: Date.now(),
+    symbol: "SOL",
+    sector: "majors",
+    direction: "short",
+    mode: "paper",
+    entry_price: 200,
+    stop_price: 210,    // short stop ABOVE entry, dist = 10
+    target_price: 170,  // 3R below = 170
+    size: 4,             // $40 / $10 = 4
+    risk_usd: 40,
+    conviction_score: null,
+    conviction_label: null,
+    vol_regime: null,
+    atr_pct: null,
+    funding_hourly: null,
+    signals_json: null,
+    families_json: null,
+    notes: null,
+  });
+  // Stopped out: exit at 210
+  const closed = closeTrade(id, 210, "stop");
+  assert.ok(closed);
+  assert.ok(closed.pnl_usd! < 0);
+  assert.ok(Math.abs(closed.pnl_r! - -1) < 1e-6, `expected pnl_r ~-1, got ${closed.pnl_r}`);
+});
+
+test("closeTrade is idempotent — closing twice returns the original close", () => {
+  const id = insertTrade({
+    ts_opened: Date.now(),
+    symbol: "DOGE",
+    sector: "majors",
+    direction: "long",
+    mode: "paper",
+    entry_price: 0.1,
+    stop_price: 0.09,
+    target_price: 0.13,
+    size: 400,
+    risk_usd: 40,
+    conviction_score: null,
+    conviction_label: null,
+    vol_regime: null,
+    atr_pct: null,
+    funding_hourly: null,
+    signals_json: null,
+    families_json: null,
+    notes: null,
+  });
+  const first = closeTrade(id, 0.13, "target");
+  const second = closeTrade(id, 0.05, "stop");
+  // The second close MUST NOT overwrite the first — that would corrupt
+  // the journal. The function returns the existing row unchanged.
+  assert.equal(second?.exit_price, first?.exit_price);
+  assert.equal(second?.exit_reason, "target");
+});
+
+test("listTrades filters by symbol + status", () => {
+  // Insert a couple of trades on a unique symbol so this test is
+  // isolated from neighbours sharing the DB.
+  const sym = "FILTERSYM";
+  const open = insertTrade({
+    ts_opened: Date.now(),
+    symbol: sym,
+    sector: "majors",
+    direction: "long",
+    mode: "paper",
+    entry_price: 100,
+    stop_price: 95,
+    target_price: 115,
+    size: 8,
+    risk_usd: 40,
+    conviction_score: null, conviction_label: null,
+    vol_regime: null, atr_pct: null, funding_hourly: null,
+    signals_json: null, families_json: null, notes: null,
+  });
+  const closed = insertTrade({
+    ts_opened: Date.now() - 1000,
+    symbol: sym,
+    sector: "majors",
+    direction: "long",
+    mode: "paper",
+    entry_price: 100,
+    stop_price: 95,
+    target_price: 115,
+    size: 8,
+    risk_usd: 40,
+    conviction_score: null, conviction_label: null,
+    vol_regime: null, atr_pct: null, funding_hourly: null,
+    signals_json: null, families_json: null, notes: null,
+  });
+  closeTrade(closed, 115, "target");
+
+  const all = listTrades({ symbol: sym, status: "all" });
+  assert.equal(all.length, 2);
+  const onlyOpen = listTrades({ symbol: sym, status: "open" });
+  assert.equal(onlyOpen.length, 1);
+  assert.equal(onlyOpen[0].id, open);
+  const onlyClosed = listTrades({ symbol: sym, status: "closed" });
+  assert.equal(onlyClosed.length, 1);
+  assert.equal(onlyClosed[0].id, closed);
 });

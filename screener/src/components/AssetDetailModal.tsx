@@ -461,6 +461,51 @@ export default function AssetDetailModal({ symbol, onClose }: Props) {
   const [topMentions, setTopMentions] = useState<TopMentionsRouteResponse | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
+  // Journal logging state — minimal: pending while the POST is in flight,
+  // ok|err after. We don't keep a queue; if the user clicks twice fast
+  // they'll see the second result. Trade rows themselves are the source
+  // of truth — this state just drives the inline UI feedback.
+  const [logState, setLogState] = useState<{
+    status: "idle" | "pending" | "ok" | "err";
+    msg?: string;
+    tradeId?: number;
+  }>({ status: "idle" });
+
+  const logTrade = useCallback(
+    (direction: "long" | "short", mode: "paper" | "live" = "paper") => {
+      if (!data?.stats) return;
+      setLogState({ status: "pending" });
+      // Minimum-payload approach: send the current snapshot, let the
+      // server compute stop/target/size from cached 4h candles. Keeps
+      // the modal dumb and ensures math matches the alerter exactly.
+      fetch("/api/trades", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          symbol,
+          direction,
+          mode,
+          entry_price: data.stats.price,
+          funding_hourly: data.stats.fundingRate,
+          signals: data.signals,
+        }),
+      })
+        .then((r) => r.json().then((j) => ({ ok: r.ok, j })))
+        .then(({ ok, j }) => {
+          if (ok) {
+            setLogState({
+              status: "ok",
+              msg: `logged #${j.id} · ${direction.toUpperCase()} @ $${Number(j.entry_price).toLocaleString()}`,
+              tradeId: j.id,
+            });
+          } else {
+            setLogState({ status: "err", msg: j.error ?? "log failed" });
+          }
+        })
+        .catch((e) => setLogState({ status: "err", msg: String(e) }));
+    },
+    [data, symbol]
+  );
 
   const fetchData = useCallback(() => {
     setLoading(true);
@@ -751,6 +796,68 @@ export default function AssetDetailModal({ symbol, onClose }: Props) {
                   }}>
                     {description}
                   </p>
+                )}
+              </section>
+
+              {/* Journal log — one-click trade-card capture.
+                  Server computes stop/target/size from cached 4h ATR so
+                  the numbers match the Telegram alert exactly. Default
+                  mode is PAPER; "live" mode is intentionally a separate
+                  click so it can't be hit by accident. */}
+              <section style={{ marginBottom: 24 }}>
+                <div className="br-label" style={{ marginBottom: 10, paddingBottom: 6, borderBottom: ".5px solid var(--border-soft)" }}>
+                  Log Trade · Paper
+                </div>
+                <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
+                  <button
+                    onClick={() => logTrade("long", "paper")}
+                    disabled={logState.status === "pending" || !data?.stats}
+                    className="btn-ghost"
+                    style={{
+                      flex: 1, minWidth: 100,
+                      padding: "10px 14px",
+                      fontSize: 11, letterSpacing: ".18em", fontWeight: 600,
+                      border: ".5px solid var(--acc-up)",
+                      color: "var(--acc-up)",
+                      background: "transparent",
+                      cursor: logState.status === "pending" ? "wait" : "pointer",
+                      opacity: logState.status === "pending" ? 0.6 : 1,
+                    }}
+                  >
+                    ▲ LOG LONG
+                  </button>
+                  <button
+                    onClick={() => logTrade("short", "paper")}
+                    disabled={logState.status === "pending" || !data?.stats}
+                    className="btn-ghost"
+                    style={{
+                      flex: 1, minWidth: 100,
+                      padding: "10px 14px",
+                      fontSize: 11, letterSpacing: ".18em", fontWeight: 600,
+                      border: ".5px solid var(--acc-down)",
+                      color: "var(--acc-down)",
+                      background: "transparent",
+                      cursor: logState.status === "pending" ? "wait" : "pointer",
+                      opacity: logState.status === "pending" ? 0.6 : 1,
+                    }}
+                  >
+                    ▼ LOG SHORT
+                  </button>
+                </div>
+                {logState.status !== "idle" && (
+                  <div style={{
+                    marginTop: 10,
+                    fontSize: 11, letterSpacing: ".06em",
+                    color: logState.status === "ok"
+                      ? "var(--acc-up)"
+                      : logState.status === "err"
+                      ? "var(--acc-down)"
+                      : "var(--text-mute)",
+                  }}>
+                    {logState.status === "pending" && "logging…"}
+                    {logState.status === "ok" && `✓ ${logState.msg}`}
+                    {logState.status === "err" && `✗ ${logState.msg}`}
+                  </div>
                 )}
               </section>
 

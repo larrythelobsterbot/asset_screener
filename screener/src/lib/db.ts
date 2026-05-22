@@ -34,7 +34,7 @@ export function getDb(): Database.Database {
 // Versioned via PRAGMA user_version so we can add schema changes without
 // blowing away the local file. Bump VERSION and add a step.
 
-const VERSION = 6;
+const VERSION = 7;
 
 function migrate(db: Database.Database): void {
   const current = db.pragma("user_version", { simple: true }) as number;
@@ -46,6 +46,7 @@ function migrate(db: Database.Database): void {
   if (current < 4) db.exec(MIGRATION_V4);
   if (current < 5) db.exec(MIGRATION_V5);
   if (current < 6) db.exec(MIGRATION_V6);
+  if (current < 7) db.exec(MIGRATION_V7);
   db.pragma(`user_version = ${VERSION}`);
 }
 
@@ -199,6 +200,52 @@ const MIGRATION_V5 = `
     );
     create index if not exists idx_social_sym_tw_ts on social_snapshots(symbol, time_window, ts desc);
     create index if not exists idx_social_ts on social_snapshots(ts);
+  `;
+
+// V7 — Trade journal. Captures the full snapshot of a trade decision
+// (signals fired, conviction, ATR, funding) at the moment the user
+// commits to it, so later retros can answer "which family combinations
+// edge?" without having to reconstruct old market state.
+//
+// Lifecycle: opened (entry / stop / target / size set) → closed (exit
+// price + reason set → pnl_usd, pnl_r computed in the API layer). Mode
+// "paper" by default; "live" only set explicitly so we don't accidentally
+// treat backtests as real trades during retros.
+//
+// Snapshot fields are stored as JSON strings to keep the schema flat —
+// signals_json is the array of { type, family, timeframe, strength }
+// tuples, families_json the deduped family list. We don't need to query
+// inside them, only filter the parent row, so JSON is fine.
+const MIGRATION_V7 = `
+    create table if not exists trades (
+      id                integer primary key autoincrement,
+      ts_opened         integer not null,
+      ts_closed         integer,
+      symbol            text    not null,
+      sector            text,
+      direction         text    not null,           -- 'long' | 'short'
+      mode              text    not null default 'paper',  -- 'paper' | 'live'
+      entry_price       real    not null,
+      stop_price        real    not null,
+      target_price      real    not null,
+      size              real    not null,
+      risk_usd          real    not null,
+      conviction_score  real,
+      conviction_label  text,
+      vol_regime        text,
+      atr_pct           real,
+      funding_hourly    real,
+      signals_json      text,                       -- JSON: signal snapshots
+      families_json     text,                       -- JSON: contributing families
+      exit_price        real,
+      exit_reason       text,                       -- 'stop' | 'target' | 'manual' | 'expired'
+      pnl_usd           real,
+      pnl_r             real,                       -- exit pnl in units of stop_distance
+      notes             text
+    );
+    create index if not exists idx_trades_opened on trades(ts_opened desc);
+    create index if not exists idx_trades_symbol on trades(symbol, ts_opened desc);
+    create index if not exists idx_trades_open on trades(ts_closed) where ts_closed is null;
   `;
 
 // ── price_snapshots ─────────────────────────────────────────────────────
@@ -671,6 +718,127 @@ export function kvAtomicIncrement(key: string, delta: number = 1): number {
     return row ? parseInt(row.value, 10) : delta;
   });
   return txn() as number;
+}
+
+// ── trades (journal) ────────────────────────────────────────────────────
+// Wide row, sparse on close-time fields until a trade is closed. We DON'T
+// prune trades — the journal is the long-term retro substrate and a few
+// hundred rows/year is nothing.
+
+export interface TradeRow {
+  id: number;
+  ts_opened: number;
+  ts_closed: number | null;
+  symbol: string;
+  sector: string | null;
+  direction: "long" | "short";
+  mode: "paper" | "live";
+  entry_price: number;
+  stop_price: number;
+  target_price: number;
+  size: number;
+  risk_usd: number;
+  conviction_score: number | null;
+  conviction_label: string | null;
+  vol_regime: string | null;
+  atr_pct: number | null;
+  funding_hourly: number | null;
+  signals_json: string | null;
+  families_json: string | null;
+  exit_price: number | null;
+  exit_reason: "stop" | "target" | "manual" | "expired" | null;
+  pnl_usd: number | null;
+  pnl_r: number | null;
+  notes: string | null;
+}
+
+// Insert a new trade. Caller pre-computes the entry/stop/target/size — we
+// don't re-compute on this side to keep the DAL dumb. Returns the new id.
+export function insertTrade(
+  row: Omit<TradeRow, "id" | "ts_closed" | "exit_price" | "exit_reason" | "pnl_usd" | "pnl_r">
+): number {
+  const db = getDb();
+  const stmt = db.prepare(
+    `insert into trades (
+       ts_opened, symbol, sector, direction, mode,
+       entry_price, stop_price, target_price, size, risk_usd,
+       conviction_score, conviction_label, vol_regime, atr_pct, funding_hourly,
+       signals_json, families_json, notes
+     ) values (
+       @ts_opened, @symbol, @sector, @direction, @mode,
+       @entry_price, @stop_price, @target_price, @size, @risk_usd,
+       @conviction_score, @conviction_label, @vol_regime, @atr_pct, @funding_hourly,
+       @signals_json, @families_json, @notes
+     )`
+  );
+  const result = stmt.run(row);
+  return result.lastInsertRowid as number;
+}
+
+// Close a trade. Computes pnl_usd and pnl_r server-side from the stored
+// entry/stop/size — caller only supplies exit_price + reason + optional
+// note. Returns the updated row, or null if the trade is already closed
+// or doesn't exist.
+export function closeTrade(
+  id: number,
+  exit_price: number,
+  exit_reason: "stop" | "target" | "manual" | "expired",
+  appendNote?: string
+): TradeRow | null {
+  const db = getDb();
+  const existing = db.prepare(`select * from trades where id = ?`).get(id) as TradeRow | undefined;
+  if (!existing) return null;
+  if (existing.ts_closed != null) return existing; // idempotent: already closed
+
+  const dirSign = existing.direction === "long" ? 1 : -1;
+  const stopDistance = Math.abs(existing.entry_price - existing.stop_price);
+  // P&L in USD: (exit - entry) × size × dirSign for long, inverted for short
+  const pnl_usd = (exit_price - existing.entry_price) * existing.size * dirSign;
+  // R-multiple: how many stop-distances of profit/loss this trade earned.
+  // Positive = won (in favor); negative = lost (stopped out or worse).
+  // A clean 3R win means we hit our target; -1R means we hit our stop exactly.
+  const pnl_r = stopDistance > 0 ? (pnl_usd / (stopDistance * existing.size)) : 0;
+
+  const notesValue = appendNote && existing.notes
+    ? `${existing.notes}\n— ${appendNote}`
+    : (appendNote ?? existing.notes);
+
+  db.prepare(
+    `update trades
+     set ts_closed = ?, exit_price = ?, exit_reason = ?,
+         pnl_usd = ?, pnl_r = ?, notes = coalesce(?, notes)
+     where id = ?`
+  ).run(Date.now(), exit_price, exit_reason, pnl_usd, pnl_r, notesValue, id);
+
+  return db.prepare(`select * from trades where id = ?`).get(id) as TradeRow;
+}
+
+// List trades, newest-first. Optional filters keep the journal page
+// responsive once the table grows past a few hundred rows.
+export function listTrades(opts: {
+  symbol?: string;
+  mode?: "paper" | "live";
+  status?: "open" | "closed" | "all";
+  limit?: number;
+} = {}): TradeRow[] {
+  const db = getDb();
+  const where: string[] = [];
+  const params: Record<string, unknown> = {};
+  if (opts.symbol) { where.push("symbol = @symbol"); params.symbol = opts.symbol.toUpperCase(); }
+  if (opts.mode)   { where.push("mode = @mode"); params.mode = opts.mode; }
+  if (opts.status === "open")   where.push("ts_closed is null");
+  if (opts.status === "closed") where.push("ts_closed is not null");
+  const sql =
+    `select * from trades
+     ${where.length ? "where " + where.join(" and ") : ""}
+     order by ts_opened desc
+     limit ${Math.min(1000, Math.max(1, opts.limit ?? 200))}`;
+  return db.prepare(sql).all(params) as TradeRow[];
+}
+
+export function getTrade(id: number): TradeRow | null {
+  const db = getDb();
+  return (db.prepare(`select * from trades where id = ?`).get(id) as TradeRow | undefined) ?? null;
 }
 
 // ── Periodic prune scheduler ────────────────────────────────────────────
