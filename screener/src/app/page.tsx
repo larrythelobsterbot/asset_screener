@@ -44,14 +44,32 @@ export default function Home() {
 
   const [allAssets, setAllAssets] = useState<AssetData[]>([]);
   const [isLoading, setIsLoading] = useState(true);
+  // Track the most recent fetch outcome so the UI can distinguish
+  // "no data" (initial load) from "backend down" (existing data is
+  // stale because /api/markets failed). For a financial dashboard
+  // this difference matters — silently showing 30s-old data without
+  // signaling the upstream is unreachable is worse than telling the
+  // user something is wrong.
+  const [marketsError, setMarketsError] = useState<string | null>(null);
+  const [lastFetchAt, setLastFetchAt] = useState<number | null>(null);
 
   useEffect(() => {
     async function load() {
       try {
         const res = await fetch("/api/markets");
-        if (res.ok) setAllAssets(await res.json());
-      } catch { /* keep existing state */ }
-      finally { setIsLoading(false); }
+        if (!res.ok) {
+          setMarketsError(`HTTP ${res.status}`);
+          return;
+        }
+        const data = await res.json();
+        setAllAssets(data);
+        setMarketsError(null);
+        setLastFetchAt(Date.now());
+      } catch (err) {
+        setMarketsError(err instanceof Error ? err.message : String(err));
+      } finally {
+        setIsLoading(false);
+      }
     }
     load();
     const id = setInterval(load, 30_000);
@@ -92,6 +110,37 @@ export default function Home() {
       )}
 
       <MacroBar />
+
+      {/* Backend health banner — only renders when /api/markets has
+          failed at least once since the last successful fetch. The
+          existing display continues to show the LAST GOOD data so
+          users can still see prices, but the banner makes clear the
+          numbers may be stale. Mustard-bordered to be visible
+          without competing with the trade-action colors (green/red). */}
+      {marketsError && (
+        <div
+          role="alert"
+          style={{
+            padding: "8px 24px",
+            background: "color-mix(in oklab, var(--acc-warn) 6%, var(--bg))",
+            borderBottom: ".5px solid color-mix(in oklab, var(--acc-warn) 35%, transparent)",
+            color: "var(--acc-warn)",
+            fontSize: 11,
+            fontFamily: "var(--font-geist-mono), ui-monospace, monospace",
+            letterSpacing: ".06em",
+            textTransform: "uppercase",
+            display: "flex",
+            alignItems: "center",
+            gap: 12,
+          }}
+        >
+          <span>⚠</span>
+          <span>Backend unreachable — showing last known data{lastFetchAt ? ` (${Math.round((Date.now() - lastFetchAt) / 1000)}s ago)` : ""}</span>
+          <span style={{ marginLeft: "auto", color: "var(--text-mute)" }}>
+            {marketsError}
+          </span>
+        </div>
+      )}
 
       {/* HYPE TWAP buy-pressure card. Always visible — small enough to
           sit between macro + top bar without crowding either. */}

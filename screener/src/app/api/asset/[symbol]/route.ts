@@ -2,7 +2,7 @@ import { NextResponse } from "next/server";
 import { getCandles, getFundingHistory, getMetaAndCtxs, getAllMids } from "@/lib/hyperliquid";
 import { computeAllIndicators } from "@/lib/indicators";
 import { detectSignals } from "@/lib/signals";
-import { HL_SPOT_STOCKS } from "@/config/sectors";
+import { HL_SPOT_STOCKS, HL_PERP_SECTOR_MAP, HL_BUILDER_PERP_MAP } from "@/config/sectors";
 import { getMid } from "@/lib/hyperliquidWs";
 
 // Reverse lookup: ticker → @name for spot stocks
@@ -11,11 +11,45 @@ for (const [spotName, info] of Object.entries(HL_SPOT_STOCKS)) {
   TICKER_TO_SPOT[info.ticker] = spotName;
 }
 
+// Builder-dex perps store their ticker as the part after the ":" prefix.
+// Collect bare tickers so the validation accepts e.g. "TSLA" even if the
+// dex prefix is in HL_BUILDER_PERP_MAP under "xyz:TSLA".
+const BUILDER_TICKERS = new Set<string>();
+for (const key of Object.keys(HL_BUILDER_PERP_MAP)) {
+  const t = key.includes(":") ? key.split(":")[1] : key;
+  if (t) BUILDER_TICKERS.add(t);
+}
+
+// Symbol validation: only allow symbols we actually track (native HL
+// perp, builder-dex perp, or HIP-3 spot stock). Rejecting unknown
+// symbols here prevents a caller from fanning out to Hyperliquid for
+// each unique garbage value — that would silently burn rate-limit
+// budget for every request.
+function isValidSymbol(s: string): boolean {
+  if (!s) return false;
+  // Loose shape check: 1–24 chars, alphanumeric + a few separators.
+  // Anything outside this range is definitely not an HL symbol.
+  if (!/^[A-Za-z0-9._-]{1,24}$/.test(s)) return false;
+  return (
+    s in HL_PERP_SECTOR_MAP ||
+    s in TICKER_TO_SPOT ||
+    BUILDER_TICKERS.has(s)
+  );
+}
+
 export async function GET(
   _req: Request,
   { params }: { params: { symbol: string } }
 ) {
   const { symbol } = params;
+
+  // Reject unknown symbols up-front (400) instead of fanning out to HL.
+  if (!isValidSymbol(symbol)) {
+    return NextResponse.json(
+      { error: `unknown symbol "${symbol}" — not in HL perp/spot/builder universe` },
+      { status: 400 }
+    );
+  }
 
   try {
     const spotName = TICKER_TO_SPOT[symbol]; // e.g. "@287" for META

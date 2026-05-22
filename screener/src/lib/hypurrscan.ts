@@ -163,8 +163,18 @@ export function computePressureFromTwaps(
 
     const startMs = t.time;
     const durationMs = t.action.twap.m * 60 * 1000;
+    // Reject malformed durations (zero or negative) before dividing.
+    // Hypurrscan should never emit these, but defensive math here
+    // prevents NaN/Infinity propagating into the pressure total if
+    // they ever do (and silences a div-by-zero edge case).
+    if (!Number.isFinite(durationMs) || durationMs <= 0) continue;
     const endMs = startMs + durationMs;
     if (endMs <= nowMs) continue;
+    // Reject TWAPs scheduled for the future. The comment on
+    // PressureResult.active_twap_count says "started + not ended", and
+    // a future-start TWAP that's pre-broadcast shouldn't contribute to
+    // the [now, now+lookahead] pro-rata calculation.
+    if (startMs > nowMs) continue;
 
     const sizeBase = parseFloat(t.action.twap.s);
     if (!Number.isFinite(sizeBase) || sizeBase <= 0) continue;

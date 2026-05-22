@@ -54,8 +54,15 @@ export default function MacroBar({ variant: variantProp }: Props) {
   }, [variantProp]);
 
   useEffect(() => {
+    // Bail on non-OK responses rather than .json()-ing the error body
+    // (which would clobber the last-known macros with garbage). On
+    // failure we keep the previous macros visible; the page-level
+    // banner already tells the user the backend is down.
     const fetch_ = () =>
-      fetch("/api/macro").then((r) => r.json()).then(setMacros).catch(() => {});
+      fetch("/api/macro")
+        .then((r) => (r.ok ? r.json() : Promise.reject(new Error(`HTTP ${r.status}`))))
+        .then(setMacros)
+        .catch(() => { /* keep last good macros */ });
     fetch_();
     const interval = setInterval(fetch_, 60_000);
     return () => clearInterval(interval);

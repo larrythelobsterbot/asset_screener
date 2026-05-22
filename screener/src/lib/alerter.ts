@@ -154,10 +154,11 @@ export async function maybeDispatchAlerts(
     }
 
     // Stamp cooldown BEFORE sending so concurrent route calls don't
-    // double-fire. If the send fails we eat the cooldown — the failure
-    // is logged and the next scan can retry once the cooldown expires.
-    // This is the right trade-off vs the "no-cooldown-then-double-alert"
-    // failure mode that's much more annoying for the user.
+    // double-fire. If the send fails we REWIND the cooldown to a near-
+    // expiry value so the next scan in ~5 min gets a retry attempt
+    // (instead of losing the alert for the full 4h window — which was
+    // the previous behavior and silently turned every transient
+    // Telegram outage into a missed alert).
     markCooldown(symbol, direction, now);
 
     const price = priceBySymbol?.get(symbol) ?? null;
@@ -168,12 +169,15 @@ export async function maybeDispatchAlerts(
         .then((r) => {
           if (!r.ok) {
             console.warn(`[alerter] send failed for ${symbol}:`, r.error);
+            // Rewind cooldown so the next scan retries in ~5 min.
+            markCooldown(symbol, direction, now - COOLDOWN_MS + 5 * 60_000);
             return "failed" as const;
           }
           return "fired" as const;
         })
         .catch((err) => {
           console.warn(`[alerter] send threw for ${symbol}:`, err);
+          markCooldown(symbol, direction, now - COOLDOWN_MS + 5 * 60_000);
           return "failed" as const;
         })
     );

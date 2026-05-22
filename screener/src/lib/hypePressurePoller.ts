@@ -62,7 +62,10 @@ async function maybeAlertOnThreshold(
   if (isOnAlertCooldown(now)) return;
 
   // Stamp cooldown BEFORE sending so concurrent polls (shouldn't happen
-  // with our setInterval but defensive) can't double-fire.
+  // with our setInterval but defensive) can't double-fire. On send
+  // failure we rewind to "5 min from now" so the next poller tick gets
+  // a retry attempt — without this, a transient Telegram outage would
+  // silently lose the alert for the full 1h cooldown window.
   kvSet(COOLDOWN_KV_KEY, String(now));
 
   const text = [
@@ -79,6 +82,10 @@ async function maybeAlertOnThreshold(
   const r = await sendTelegramMessage(text);
   if (!r.ok) {
     console.warn(`[hype-pressure] alert send failed:`, r.error);
+    // Rewind cooldown: a value that expires in ~5 min so the next tick
+    // (90s cadence) gets up to 3 retry attempts before the threshold
+    // moves out of play.
+    kvSet(COOLDOWN_KV_KEY, String(now - ALERT_COOLDOWN_MS + 5 * 60_000));
   } else {
     console.info(
       `[hype-pressure] ALERT fired: 1h=$${pressure1h.toLocaleString()} ` +

@@ -125,27 +125,40 @@ test("event_history persists fire timestamps and survives reload", () => {
   assert.equal(h.get(eventHistoryKey("EVTSYM", "rsi_overbought", "1d")), 1_234_000_000, "1d row separate from 4h");
 });
 
-test("social_snapshots round-trip + latestSocialSnapshots returns newest per symbol", () => {
+test("social_snapshots round-trip + latestSocialSnapshots returns newest per (symbol, tf)", () => {
   const now = Date.now();
   insertSocialSnapshots([
-    { symbol: "BTC", ts: now - 3_600_000, mention_count: 1200, prev_count: 1100, change_pct: 9.09 },
-    { symbol: "BTC", ts: now,             mention_count: 1300, prev_count: 1200, change_pct: 8.33 },
-    { symbol: "HYPE", ts: now,            mention_count: 800,  prev_count: 600,  change_pct: 33.3 },
+    { symbol: "BTC", time_window: "24h", ts: now - 3_600_000, mention_count: 1200, prev_count: 1100, change_pct: 9.09 },
+    { symbol: "BTC", time_window: "24h", ts: now,             mention_count: 1300, prev_count: 1200, change_pct: 8.33 },
+    { symbol: "HYPE", time_window: "24h", ts: now,            mention_count: 800,  prev_count: 600,  change_pct: 33.3 },
   ]);
-  const latest = latestSocialSnapshots(["BTC", "HYPE"]);
+  const latest = latestSocialSnapshots("24h", ["BTC", "HYPE"]);
   assert.equal(latest.get("BTC")?.mention_count, 1300, "BTC newest should win");
   assert.equal(latest.get("HYPE")?.change_pct, 33.3);
+});
+
+test("latestSocialSnapshots: different time windows are scoped separately", () => {
+  // Regression test for the audit finding: a 24h snapshot must NOT be
+  // returned as a 1h snapshot. Each tf is its own bucket.
+  const now = Date.now();
+  insertSocialSnapshots([
+    { symbol: "TFTEST", time_window: "24h", ts: now, mention_count: 999, prev_count: null, change_pct: null },
+    { symbol: "TFTEST", time_window: "1h",  ts: now, mention_count: 42,  prev_count: null, change_pct: null },
+  ]);
+  assert.equal(latestSocialSnapshots("24h", ["TFTEST"]).get("TFTEST")?.mention_count, 999);
+  assert.equal(latestSocialSnapshots("1h",  ["TFTEST"]).get("TFTEST")?.mention_count, 42);
+  assert.equal(latestSocialSnapshots("4h",  ["TFTEST"]).get("TFTEST"), undefined, "no row for unrequested tf");
 });
 
 test("pruneSocialSnapshots removes only rows older than the cutoff", () => {
   const now = Date.now();
   insertSocialSnapshots([
-    { symbol: "PRUNESOCIAL", ts: now - 1000 * 86_400_000, mention_count: 1, prev_count: null, change_pct: null },
-    { symbol: "PRUNESOCIAL", ts: now,                     mention_count: 2, prev_count: null, change_pct: null },
+    { symbol: "PRUNESOCIAL", time_window: "24h", ts: now - 1000 * 86_400_000, mention_count: 1, prev_count: null, change_pct: null },
+    { symbol: "PRUNESOCIAL", time_window: "24h", ts: now,                     mention_count: 2, prev_count: null, change_pct: null },
   ]);
   const removed = pruneSocialSnapshots(30 * 86_400_000);
   assert.ok(removed >= 1);
-  assert.equal(latestSocialSnapshots(["PRUNESOCIAL"]).get("PRUNESOCIAL")?.mention_count, 2);
+  assert.equal(latestSocialSnapshots("24h", ["PRUNESOCIAL"]).get("PRUNESOCIAL")?.mention_count, 2);
 });
 
 test("kv get/set round-trip", () => {

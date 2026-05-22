@@ -21,9 +21,18 @@ export default function SignalScanner({ onSelectAsset, allowedSymbols }: Props) 
       : signals.filter((s) => allowedSymbols.has(s.symbol));
 
   useEffect(() => {
+    // Check r.ok before parsing — previously a 5xx response would
+    // .then() into the error payload (a {error: ...} object) and the
+    // Array.isArray guard would just leave the UI empty, indistinguish-
+    // able from "no signals fired". Now a non-OK leaves the last good
+    // signals visible and the page-level banner already signals the
+    // backend issue to the user.
     const fetchSignals = () =>
       fetch("/api/signals")
-        .then((r) => r.json())
+        .then((r) => {
+          if (!r.ok) throw new Error(`HTTP ${r.status}`);
+          return r.json();
+        })
         .then((data: Signal[]) => {
           if (Array.isArray(data)) setSignals(data);
           setLoading(false);

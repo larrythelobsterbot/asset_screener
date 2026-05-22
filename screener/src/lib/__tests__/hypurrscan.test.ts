@@ -167,6 +167,36 @@ test("computePressureFromTwaps: custom marketIds override works", () => {
   assert.equal(r.active_twap_count, 1);
 });
 
+test("computePressureFromTwaps: future-starting TWAPs are skipped", () => {
+  // A TWAP scheduled to start 1h in the future shouldn't contribute to
+  // the [now, now+lookahead] pro-rata calculation — even if its end is
+  // well within the window.
+  const r = computePressureFromTwaps(
+    [twap({ startMs: NOW + 3_600_000, durationMin: 60, sizeHype: 1000, buy: true })],
+    HYPE_PRICE,
+    NOW,
+  );
+  assert.equal(r.active_twap_count, 0, "future-start TWAP not counted as active");
+  assert.equal(r.pressure_1h_usd, 0);
+});
+
+test("computePressureFromTwaps: zero/negative duration is rejected", () => {
+  // Malformed durations should not propagate NaN/Infinity into the
+  // total via division.
+  const r = computePressureFromTwaps(
+    [
+      { ...twap({ startMs: NOW, durationMin: 60, sizeHype: 1000, buy: true }),
+        action: { type: "twapOrder", twap: { a: 10107, b: true, s: "1000", r: false, m: 0, t: false } } },
+      { ...twap({ startMs: NOW, durationMin: 60, sizeHype: 1000, buy: true }),
+        action: { type: "twapOrder", twap: { a: 10107, b: true, s: "1000", r: false, m: -10, t: false } } },
+    ],
+    HYPE_PRICE,
+    NOW,
+  );
+  assert.equal(r.active_twap_count, 0);
+  assert.ok(Number.isFinite(r.pressure_1h_usd), "result must be finite even with bad input");
+});
+
 test("computePressureFromTwaps: zero/negative size is filtered", () => {
   const r = computePressureFromTwaps(
     [

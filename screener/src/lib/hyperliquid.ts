@@ -1,5 +1,6 @@
 import { cache } from "./cache";
 import { upsertCandles, getCandlesFromCache, type CandleRow } from "./db";
+import { fetchWithTimeout } from "./fetchWithTimeout";
 
 const HL_API = "https://api.hyperliquid.xyz/info";
 
@@ -85,12 +86,15 @@ async function hlPost<T>(body: Record<string, unknown>): Promise<T> {
     // unless we opt out explicitly. Without `cache: "no-store"` the same
     // metaAndCtxs response gets served to us forever from Next's fetch
     // cache, which is exactly the bug that made markets prices freeze.
-    const res = await fetch(HL_API, {
+    // 10s timeout — HL is fast (typically < 200ms) so anything over
+    // 10s is almost certainly an outage; we'd rather fail fast and let
+    // the cache fall back to stale data than pin a request handler.
+    const res = await fetchWithTimeout(HL_API, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
       cache: "no-store",
-    });
+    }, 10_000);
     if (!res.ok) {
       // Back off hard on 429 — return the tokens so downstream callers don't
       // stampede, and surface a typed error.
@@ -256,12 +260,19 @@ export async function getCandles(
   });
 
   cache.set(cacheKey, data, HL_CANDLE_TTL_MS);
-  // Fire-and-forget persistence — the response doesn't wait on disk.
-  try {
-    upsertCandles(hlToCandleRows(coin, interval, data));
-  } catch (err) {
-    console.warn(`[hl.getCandles] sqlite write failed for ${coin}:${interval}:`, err);
-  }
+  // Fire-and-forget persistence — TRULY off the hot path. We use
+  // setImmediate so the synchronous SQLite transaction (200–350 rows
+  // per call, ~5–15ms in WAL mode) lands on the next event-loop tick
+  // instead of blocking this route's response. The previous "fire-
+  // and-forget" comment was misleading: the call was synchronous in
+  // the request path.
+  setImmediate(() => {
+    try {
+      upsertCandles(hlToCandleRows(coin, interval, data));
+    } catch (err) {
+      console.warn(`[hl.getCandles] sqlite write failed for ${coin}:${interval}:`, err);
+    }
+  });
   return data;
 }
 

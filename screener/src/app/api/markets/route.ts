@@ -8,7 +8,7 @@ import {
   insertPriceSnapshots,
   startPruneJob,
   snapshotAtBounded,
-  getCandlesFromCache,
+  getCandlesBulkFromCache,
   type PriceSnapshotRow,
 } from "@/lib/db";
 import { startHlWs, getMid } from "@/lib/hyperliquidWs";
@@ -260,6 +260,19 @@ export async function GET() {
     // garbage % change to the UI.
     const snap1h = snapshotAtBounded(snapshotTs - 3_600_000, 30 * 60_000, hlSymbolsForBackfill);
     const snap4h = snapshotAtBounded(snapshotTs - 4 * 3_600_000, 60 * 60_000, hlSymbolsForBackfill);
+    // Bulk-read 1d candles for ALL HL symbols in one SQLite query.
+    // Previously this was 230+ synchronous queries inside the asset
+    // loop — measurably blocking the event loop on each markets scan.
+    let dailiesBySymbol = new Map<string, Array<{ c: number }>>();
+    try {
+      const bulk = getCandlesBulkFromCache(hlSymbolsForBackfill, "1d", 10);
+      // We only need the close field downstream; preserve the shape.
+      dailiesBySymbol = new Map(
+        [...bulk.entries()].map(([s, rows]) => [s, rows.map((r) => ({ c: r.c }))])
+      );
+    } catch (err) {
+      console.warn(`[markets] bulk 1d candle read failed:`, err);
+    }
     for (const a of assets) {
       if (a.source !== "hyperliquid") continue;
       const p1 = snap1h.get(a.symbol);
@@ -268,14 +281,10 @@ export async function GET() {
       if (p4 && p4 > 0) a.change4h = ((a.price - p4) / p4) * 100;
       // 7d: 1d candles oldest-first. The last bar is "today (in progress)"
       // so the close 7 bars ago is candles[length - 8]. Need at least 8.
-      try {
-        const dailies = getCandlesFromCache(a.symbol, "1d", 10);
-        if (dailies.length >= 8) {
-          const sevenAgo = dailies[dailies.length - 8].c;
-          if (sevenAgo > 0) a.change7d = ((a.price - sevenAgo) / sevenAgo) * 100;
-        }
-      } catch {
-        // ignore — leave as null
+      const dailies = dailiesBySymbol.get(a.symbol) ?? [];
+      if (dailies.length >= 8) {
+        const sevenAgo = dailies[dailies.length - 8].c;
+        if (sevenAgo > 0) a.change7d = ((a.price - sevenAgo) / sevenAgo) * 100;
       }
     }
 

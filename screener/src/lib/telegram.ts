@@ -13,6 +13,8 @@
 // body is enough, avoids a dep that would also need careful escaping of
 // the chat id and token at install time.
 
+import { fetchWithTimeout } from "./fetchWithTimeout";
+
 const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const CHAT_ID = process.env.TELEGRAM_CHAT_ID;
 
@@ -98,11 +100,15 @@ export async function sendTelegramMessage(
   };
 
   try {
-    const res = await fetch(url, {
+    const res = await fetchWithTimeout(url, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
-    });
+      // Opt out of Next.js fetch caching — same policy as every other
+      // outbound integration in this codebase. Telegram responses are
+      // one-shot ACKs we never want a cached version of.
+      cache: "no-store",
+    }, 10_000); // 10s — alerts are time-sensitive; better to fail fast than hang
     const json = (await res.json()) as
       | { ok: true; result: { message_id: number } }
       | { ok: false; description: string };

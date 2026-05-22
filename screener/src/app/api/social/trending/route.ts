@@ -73,10 +73,12 @@ export async function GET(req: NextRequest) {
 
   const now = Date.now();
 
-  // L2: SQLite. If the most recent snapshot is < 1h old, return it
-  // without burning a credit. This is the path that runs after a PM2
-  // reload — we'd otherwise lose the in-memory cache and re-hit Elfa.
-  const recent = latestSocialSnapshots();
+  // L2: SQLite. If the most recent snapshot for THIS time_window is
+  // < 1h old, return it without burning a credit. The time_window
+  // scoping (added in v5) means a 24h snapshot won't be served for a
+  // 1h request — earlier versions confused these and returned wrong
+  // data to the UI.
+  const recent = latestSocialSnapshots(tf);
   if (recent.size > 0) {
     let newestTs = 0;
     for (const r of recent.values()) if (r.ts > newestTs) newestTs = r.ts;
@@ -106,6 +108,7 @@ export async function GET(req: NextRequest) {
     const ts = Date.now();
     const rows = resp.data.map((t) => ({
       symbol: normalize(t.token),
+      time_window: tf,
       ts,
       mention_count: t.current_count,
       prev_count: t.previous_count ?? null,

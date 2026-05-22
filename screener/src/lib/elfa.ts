@@ -15,7 +15,8 @@
 // All other endpoints (data/keyword-mentions, data/top-mentions, etc.)
 // are available via the same client pattern — add them when needed.
 
-import { kvGet, kvSet } from "./db";
+import { kvGet, kvAtomicIncrement } from "./db";
+import { fetchWithTimeout } from "./fetchWithTimeout";
 
 const ELFA_API = "https://api.elfa.ai";
 const API_KEY = process.env.ELFA_API_KEY;
@@ -85,9 +86,26 @@ function getDailyCount(): number {
   return Number.isFinite(n) ? n : 0;
 }
 
-function incDailyCount(): void {
-  const next = getDailyCount() + 1;
-  kvSet(todayKey(), String(next));
+// Reserve-then-dispatch: atomically increment FIRST, check the soft cap
+// AFTER. If we exceed the cap, decrement to release the reservation.
+// This closes the read/check/write race that let N concurrent callers
+// all pass the precheck at value = cap-1 and overshoot to cap+N-1.
+// Returns the new count if the reservation succeeded, null if the
+// budget is exhausted and the reservation was rolled back.
+function reserveCredit(): number | null {
+  const after = kvAtomicIncrement(todayKey(), 1);
+  if (after > DAILY_SOFT_CAP) {
+    // Roll back — release the credit we just reserved.
+    kvAtomicIncrement(todayKey(), -1);
+    return null;
+  }
+  return after;
+}
+
+// Release a previously-reserved credit. Used when Elfa returns 401/403
+// (the request never reached the metered tier).
+function releaseCredit(): void {
+  kvAtomicIncrement(todayKey(), -1);
 }
 
 let totalRequests = 0;
@@ -139,12 +157,21 @@ class ElfaNotConfiguredError extends Error {
 
 async function elfaGet<T>(path: string, costsCredit: boolean = true): Promise<T> {
   if (!API_KEY) throw new ElfaNotConfiguredError();
+  // Reserve a credit FIRST (atomic SQLite UPDATE), check soft cap
+  // AFTER. If we exceed the cap, release the reservation. This closes
+  // the read/check/write race that previously let N concurrent callers
+  // all pass the precheck at value = cap-1 and overshoot to cap+N-1.
+  // Auth-rejected and (rarely) genuine network failures release the
+  // reservation; HTTP-level errors (4xx/5xx including 429) keep it
+  // because Elfa charges for those.
+  let reserved = false;
   if (costsCredit) {
-    const used = getDailyCount();
-    if (used >= DAILY_SOFT_CAP) {
+    const after = reserveCredit();
+    if (after === null) {
       totalRefused += 1;
-      throw new ElfaBudgetError(used, DAILY_SOFT_CAP);
+      throw new ElfaBudgetError(getDailyCount(), DAILY_SOFT_CAP);
     }
+    reserved = true;
   }
 
   await acquireToken();
@@ -152,7 +179,10 @@ async function elfaGet<T>(path: string, costsCredit: boolean = true): Promise<T>
 
   const url = `${ELFA_API}${path}`;
   try {
-    const res = await fetch(url, {
+    // 15s timeout. Elfa is occasionally slow under load; we don't want
+    // a hang to pin our route. On timeout the cache will keep serving
+    // stale data for up to 1 hour before the next attempt.
+    const res = await fetchWithTimeout(url, {
       headers: {
         "x-elfa-api-key": API_KEY,
         Accept: "application/json",
@@ -160,28 +190,22 @@ async function elfaGet<T>(path: string, costsCredit: boolean = true): Promise<T>
       // Always bypass Next.js fetch cache — we own caching at the route
       // layer (SQLite + in-memory TTLCache).
       cache: "no-store",
-    });
-    // Elfa counts 4xx (e.g. invalid params) against the daily quota too,
-    // so we increment the counter on any HTTP response that isn't an
-    // auth rejection or transport failure. 401/403 imply the request
-    // never reached the metered tier — leave them uncounted.
+    }, 15_000);
     if (res.status === 401 || res.status === 403) {
       totalErrors += 1;
+      // Auth never reached the metered tier — release the reservation.
+      if (reserved) { releaseCredit(); reserved = false; }
       throw new Error(`Elfa auth failed (${res.status}). Check ELFA_API_KEY.`);
     }
     if (res.status === 429) {
       totalErrors += 1;
       tokens = 0;
       lastRefill = Date.now();
-      // 429 does count (request was processed up to the rate-limit gate).
-      if (costsCredit) incDailyCount();
+      // 429 counts (request was processed to the rate-limit gate).
       throw new Error("Elfa rate limited (429)");
     }
     if (!res.ok) {
       totalErrors += 1;
-      // 4xx + 5xx — Elfa charges. Bump the counter before throwing so
-      // our soft-cap detection stays accurate.
-      if (costsCredit) incDailyCount();
       throw new Error(`Elfa API error: ${res.status}`);
     }
     const json = (await res.json()) as { success?: boolean; data?: T; error?: string };
@@ -189,17 +213,18 @@ async function elfaGet<T>(path: string, costsCredit: boolean = true): Promise<T>
       totalErrors += 1;
       throw new Error(`Elfa API error: ${json.error ?? "unknown"}`);
     }
-    // 2xx path — also increment if we didn't already on a 4xx branch.
-    if (costsCredit) incDailyCount();
     return (json.data ?? json) as T;
   } catch (err) {
     // Don't double-count budget errors as errors — they're a deliberate
     // refusal, not an upstream fault.
     if (!(err instanceof ElfaBudgetError) && !(err instanceof ElfaNotConfiguredError)) {
       // We already incremented totalErrors above on the known branches;
-      // network-layer failures land here and need counting too.
+      // network-layer failures land here and need counting too. They
+      // also release the reservation — a fetch timeout means Elfa
+      // didn't process the request, no charge.
       if (!(err instanceof Error) || !err.message.includes("Elfa")) {
         totalErrors += 1;
+        if (reserved) { releaseCredit(); reserved = false; }
       }
     }
     throw err;

@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { computeAllIndicators, rsi as computeRsi } from "@/lib/indicators";
-import { getCandlesFromCache, type CandleRow } from "@/lib/db";
+import { getCandlesBulkFromCache, type CandleRow } from "@/lib/db";
 import { HL_PERP_SECTOR_MAP } from "@/config/sectors";
 import { cache } from "@/lib/cache";
 
@@ -155,17 +155,27 @@ export async function GET(req: NextRequest) {
   // Iterate the sector map's symbols — those are the symbols we actually
   // track for signals/candle population. Symbols outside it (long-tail
   // perps) won't have cached candles regardless.
+  //
+  // Bulk-read all symbols' candles in ONE SQLite query. Previously this
+  // loop did 1 query per symbol (200+ synchronous reads); the bulk
+  // variant uses a window function + IN() so the entire scan completes
+  // in a single dispatched statement. Per-symbol error handling stays
+  // identical — buildRow() is pure and only throws if its math fails.
   const symbols = Object.keys(HL_PERP_SECTOR_MAP);
+  let candlesBySymbol: Map<string, CandleRow[]>;
+  try {
+    candlesBySymbol = getCandlesBulkFromCache(symbols, tf, 350);
+  } catch (err) {
+    console.warn(`[screener] bulk candle read failed:`, err);
+    candlesBySymbol = new Map();
+  }
   const rows: ScreenerRow[] = [];
   for (const symbol of symbols) {
     try {
-      // We need at least 300 bars to compute MA300; ask for 350 to be safe.
-      const candles = getCandlesFromCache(symbol, tf, 350);
+      const candles = candlesBySymbol.get(symbol) ?? [];
       const row = buildRow(symbol, tf, candles);
       if (row) rows.push(row);
     } catch (err) {
-      // Per-symbol error is non-fatal — log and continue. We'd rather
-      // serve 35 symbols than 0.
       console.warn(`[screener] buildRow failed for ${symbol}:`, err);
     }
   }

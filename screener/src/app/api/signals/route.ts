@@ -101,7 +101,9 @@ export async function GET() {
     // pure local read. Filter results to the top-40 symbols so we don't
     // alert on long-tail tickers that aren't tradable on HL anyway.
     try {
-      const socialMap = latestSocialSnapshots(allMappedSymbols);
+      // social_spike fires on 24h mention growth — match the time
+      // window the poller is writing to (default tf=24h on /api/social/trending).
+      const socialMap = latestSocialSnapshots("24h", allMappedSymbols);
       const socialSnapshot: SocialSnapshot[] = [];
       for (const sym of allMappedSymbols) {
         const row = socialMap.get(sym);
