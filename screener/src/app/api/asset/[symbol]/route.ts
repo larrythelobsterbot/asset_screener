@@ -3,6 +3,7 @@ import { getCandles, getFundingHistory, getMetaAndCtxs, getAllMids } from "@/lib
 import { computeAllIndicators } from "@/lib/indicators";
 import { detectSignals } from "@/lib/signals";
 import { HL_SPOT_STOCKS } from "@/config/sectors";
+import { getMid } from "@/lib/hyperliquidWs";
 
 // Reverse lookup: ticker → @name for spot stocks
 const TICKER_TO_SPOT: Record<string, string> = {};
@@ -97,14 +98,25 @@ export async function GET(
         rate: parseFloat(f.fundingRate),
       })),
       signals,
+      // For perps, prefer the WS mid if we have a fresh one — this is
+      // the price an LTF user actually transacts at. Falls back to REST
+      // markPx when the WS isn't connected. We don't overlay on spot
+      // stocks because the `allMids` channel doesn't reliably cover the
+      // @N spot identifiers.
       stats: ctx
-        ? {
-            price: parseFloat(ctx.markPx),
-            oraclePrice: parseFloat(ctx.oraclePx),
-            fundingRate: parseFloat(ctx.funding),
-            openInterest: parseFloat(ctx.openInterest),
-            volume24h: parseFloat(ctx.dayNtlVlm),
-          }
+        ? (() => {
+            const liveMid = getMid(symbol);
+            const price = liveMid != null && liveMid > 0
+              ? liveMid
+              : parseFloat(ctx.markPx);
+            return {
+              price,
+              oraclePrice: parseFloat(ctx.oraclePx),
+              fundingRate: parseFloat(ctx.funding),
+              openInterest: parseFloat(ctx.openInterest),
+              volume24h: parseFloat(ctx.dayNtlVlm),
+            };
+          })()
         : spotPrice > 0
         ? {
             price: spotPrice,

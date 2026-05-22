@@ -11,12 +11,20 @@ import {
   getCandlesFromCache,
   type PriceSnapshotRow,
 } from "@/lib/db";
+import { startHlWs, getMid } from "@/lib/hyperliquidWs";
 
 // Kick the periodic prune job once per process. Idempotent — repeated
 // calls are no-ops. This is the natural place to hook startup because
 // /api/markets is the most-hit route, so the prune timer is alive
 // shortly after process boot.
 startPruneJob();
+
+// Same idempotent-init pattern for the WS mid stream. The connection
+// stays alive for the process lifetime; reconnects on its own. Started
+// here (rather than at module top-level somewhere generic) because this
+// route is hit early enough that the connection is established before
+// the first request needs it.
+startHlWs();
 
 // Without this, Next.js 14 App Router prerenders this route at BUILD TIME
 // and the built-in response gets served forever — meaning every price in
@@ -52,12 +60,21 @@ export async function GET() {
 
       let price = parseFloat(ctx.markPx || "0");
       let prevDayPx = parseFloat(ctx.prevDayPx || "0");
+      // Overlay the live WS mid when we have one. WS mids tick in real
+      // time; the REST markPx is up to 30s stale by the time we read it.
+      // For an LTF user clicking a tile, this difference is the gap
+      // between "real entry price" and "phantom price they can't actually
+      // hit." getMid returns null when the WS is connecting/disconnected
+      // or the value is too stale, in which case we keep the REST mark.
+      const liveMid = getMid(name);
+      if (liveMid != null && liveMid > 0) price = liveMid;
       // HL's SPX perp is quoted as (index / 20000) — i.e. 1 unit = 1/20000th
       // of the S&P 500 index level — so we scale back up here to display a
       // number that matches the familiar SPX value (e.g. 5200, not 0.26).
       // This multiplier is specific to HL's SPX contract; if they ever list
       // an un-scaled SPX market (or rename this one) this branch becomes
-      // wrong and should be revisited.
+      // wrong and should be revisited. Applies to both REST and WS sources
+      // since allMids returns the same un-scaled value.
       if (name === "SPX") { price *= 20000; prevDayPx *= 20000; }
       const change24h = prevDayPx > 0 ? ((price - prevDayPx) / prevDayPx) * 100 : null;
       const volume = parseFloat(ctx.dayNtlVlm || "0");
