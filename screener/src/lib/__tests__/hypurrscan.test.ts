@@ -6,13 +6,16 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { computePressureFromTwaps } from "../hypurrscan";
 
-// Helper: build a synthetic TWAP with sane defaults.
+// Helper: build a synthetic TWAP with sane defaults. assetId defaults to
+// 10107 (HYPE spot) — pass `assetId: 159` for perp HYPE or any other id
+// to test the market-filter behaviour.
 function twap(opts: {
   startMs: number;
   durationMin: number;
   sizeHype: number;
   buy: boolean;
   ended?: string;
+  assetId?: number;
 }): Parameters<typeof computePressureFromTwaps>[0][number] {
   return {
     time: opts.startMs,
@@ -20,7 +23,7 @@ function twap(opts: {
     action: {
       type: "twapOrder",
       twap: {
-        a: 10107,                          // HYPE spot
+        a: opts.assetId ?? 10107,           // default HYPE spot; tests can override
         b: opts.buy,
         s: opts.sizeHype.toString(),
         r: false,
@@ -116,6 +119,52 @@ test("computePressureFromTwaps: TWAP started 30min ago with 60min duration", () 
   );
   // Half remaining × $50k full value = $25k contribution.
   assert.ok(Math.abs(r.pressure_1h_usd - 25_000) < 1, `got ${r.pressure_1h_usd}`);
+});
+
+test("computePressureFromTwaps: includes both HYPE perp (159) and HYPE spot (10107)", () => {
+  // Two identical buy TWAPs differing only by asset id. With default
+  // hypeMarketIds [159, 10107] both should contribute.
+  const r = computePressureFromTwaps(
+    [
+      twap({ startMs: NOW, durationMin: 60, sizeHype: 1000, buy: true, assetId: 159   }),
+      twap({ startMs: NOW, durationMin: 60, sizeHype: 1000, buy: true, assetId: 10107 }),
+    ],
+    HYPE_PRICE,
+    NOW,
+  );
+  assert.equal(r.active_twap_count, 2);
+  // Each contributes $50,000 → total $100,000 over 1h.
+  assert.ok(Math.abs(r.pressure_1h_usd - 100_000) < 1);
+});
+
+test("computePressureFromTwaps: ignores TWAPs on unrelated markets (e.g. asset 0 = BTC)", () => {
+  // BTC perp (a=0) should NOT contribute to HYPE pressure even with
+  // huge size, because the market filter excludes it.
+  const r = computePressureFromTwaps(
+    [
+      twap({ startMs: NOW, durationMin: 60, sizeHype: 1000, buy: true, assetId: 159 }),
+      twap({ startMs: NOW, durationMin: 60, sizeHype: 1_000_000, buy: true, assetId: 0 }),
+    ],
+    HYPE_PRICE,
+    NOW,
+  );
+  assert.equal(r.active_twap_count, 1, "only the HYPE-asset-id TWAP contributes");
+  assert.ok(Math.abs(r.pressure_1h_usd - 50_000) < 1);
+});
+
+test("computePressureFromTwaps: custom marketIds override works", () => {
+  // Caller supplies a non-default market id; HYPE asset ids should NOT
+  // contribute when not in the list.
+  const r = computePressureFromTwaps(
+    [
+      twap({ startMs: NOW, durationMin: 60, sizeHype: 1000, buy: true, assetId: 159 }),
+      twap({ startMs: NOW, durationMin: 60, sizeHype: 1000, buy: true, assetId: 42  }),
+    ],
+    HYPE_PRICE,
+    NOW,
+    [42],  // override: only count asset_id 42
+  );
+  assert.equal(r.active_twap_count, 1);
 });
 
 test("computePressureFromTwaps: zero/negative size is filtered", () => {
