@@ -2,6 +2,7 @@
 
 import { useState, useEffect, useMemo } from "react";
 import MacroBar from "@/components/MacroBar";
+import HypePressureCard from "@/components/HypePressureCard";
 import TimeframeToggle, { Timeframe } from "@/components/TimeframeToggle";
 import Heatmap from "@/components/Heatmap";
 import ScreenerTable from "@/components/ScreenerTable";
@@ -82,6 +83,12 @@ export default function Home() {
       )}
 
       <MacroBar />
+
+      {/* HYPE TWAP buy-pressure card. Always visible — small enough to
+          sit between macro + top bar without crowding either. */}
+      <div style={{ padding: "12px 24px 0", display: "flex", justifyContent: "flex-end" }}>
+        <HypePressureCard />
+      </div>
 
       {/* ── Top bar ─────────────────────────────────────────── */}
       <div className="topbar">

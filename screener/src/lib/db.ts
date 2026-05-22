@@ -34,18 +34,15 @@ export function getDb(): Database.Database {
 // Versioned via PRAGMA user_version so we can add schema changes without
 // blowing away the local file. Bump VERSION and add a step.
 
-const VERSION = 2;
+const VERSION = 3;
 
 function migrate(db: Database.Database): void {
   const current = db.pragma("user_version", { simple: true }) as number;
   if (current >= VERSION) return;
 
-  if (current < 1) {
-    db.exec(MIGRATION_V1);
-  }
-  if (current < 2) {
-    db.exec(MIGRATION_V2);
-  }
+  if (current < 1) db.exec(MIGRATION_V1);
+  if (current < 2) db.exec(MIGRATION_V2);
+  if (current < 3) db.exec(MIGRATION_V3);
   db.pragma(`user_version = ${VERSION}`);
 }
 
@@ -116,6 +113,21 @@ const MIGRATION_V2 = `
     );
     create index if not exists idx_social_sym_ts on social_snapshots(symbol, ts desc);
     create index if not exists idx_social_ts on social_snapshots(ts);
+  `;
+
+// V3 — HYPE TWAP pressure time series. Pressure values are signed USD
+// (positive = net buy pressure, negative = net sell pressure). hype_price
+// snapshot stored alongside so historical reads don't need to look up
+// the contemporaneous price separately.
+const MIGRATION_V3 = `
+    create table if not exists hype_pressure_snapshots (
+      ts                 integer primary key,
+      pressure_1h_usd    real    not null,
+      pressure_24h_usd   real    not null,
+      hype_price         real    not null,
+      active_twap_count  integer not null
+    );
+    create index if not exists idx_hype_pressure_ts on hype_pressure_snapshots(ts desc);
   `;
 
 // ── price_snapshots ─────────────────────────────────────────────────────
@@ -352,6 +364,45 @@ export function pruneSocialSnapshots(maxAgeMs: number = 30 * 86_400_000): number
   return db.prepare(`delete from social_snapshots where ts < ?`).run(cutoff).changes;
 }
 
+// ── hype_pressure_snapshots ─────────────────────────────────────────────
+
+export interface HypePressureRow {
+  ts: number;
+  pressure_1h_usd: number;
+  pressure_24h_usd: number;
+  hype_price: number;
+  active_twap_count: number;
+}
+
+export function insertHypePressureSnapshot(row: HypePressureRow): void {
+  const db = getDb();
+  db.prepare(
+    `insert into hype_pressure_snapshots
+       (ts, pressure_1h_usd, pressure_24h_usd, hype_price, active_twap_count)
+     values (@ts, @pressure_1h_usd, @pressure_24h_usd, @hype_price, @active_twap_count)
+     on conflict(ts) do update set
+       pressure_1h_usd = excluded.pressure_1h_usd,
+       pressure_24h_usd = excluded.pressure_24h_usd,
+       hype_price = excluded.hype_price,
+       active_twap_count = excluded.active_twap_count`
+  ).run(row);
+}
+
+export function latestHypePressureSnapshot(): HypePressureRow | null {
+  const db = getDb();
+  const row = db.prepare(
+    `select ts, pressure_1h_usd, pressure_24h_usd, hype_price, active_twap_count
+     from hype_pressure_snapshots order by ts desc limit 1`
+  ).get() as HypePressureRow | undefined;
+  return row ?? null;
+}
+
+export function pruneHypePressureSnapshots(maxAgeMs: number = 30 * 86_400_000): number {
+  const db = getDb();
+  return db.prepare(`delete from hype_pressure_snapshots where ts < ?`)
+    .run(Date.now() - maxAgeMs).changes;
+}
+
 // ── runtime_kv ──────────────────────────────────────────────────────────
 
 export function kvGet(key: string): string | null {
@@ -385,8 +436,11 @@ export function startPruneJob(): void {
       const sp = prunePriceSnapshots();
       const cp = pruneCandles();
       const ss = pruneSocialSnapshots();
-      if (sp > 0 || cp > 0 || ss > 0) {
-        console.info(`[db] pruned ${sp} price, ${cp} candle, ${ss} social snapshots`);
+      const hp = pruneHypePressureSnapshots();
+      if (sp > 0 || cp > 0 || ss > 0 || hp > 0) {
+        console.info(
+          `[db] pruned ${sp} price, ${cp} candle, ${ss} social, ${hp} hype-pressure snapshots`
+        );
       }
     } catch (err) {
       console.warn(`[db] prune failed:`, err);
