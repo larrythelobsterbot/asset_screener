@@ -12,7 +12,8 @@ import {
 import { cache } from "@/lib/cache";
 import { logSignalFires } from "@/lib/signalPersistence";
 import { snapshotAtBounded, latestSocialSnapshots } from "@/lib/db";
-import { maybeDispatchAlerts } from "@/lib/alerter";
+import { maybeDispatchAlerts, type TradeContext } from "@/lib/alerter";
+import { atrPercent } from "@/lib/indicators";
 
 // Without this, Next.js 14 prerenders this route statically at build time
 // and serves a frozen snapshot forever. See markets/route.ts for the same
@@ -145,6 +146,13 @@ export async function GET() {
       { tf: "1d", interval: "1d", bars: 300 },
     ];
 
+    // Trade context per symbol — populated from the 4h pass (the primary
+    // timeframe the LTF playbook trades). ATR% drives the stop distance
+    // in the Telegram trade card; fundingHourly tags the alert with
+    // long/short alignment. Built here so the alerter doesn't have to
+    // recompute anything from raw candles.
+    const tradeCtxBySymbol = new Map<string, TradeContext>();
+
     for (let i = 0; i < mapped.length; i += 5) {
       const batch = mapped.slice(i, i + 5);
 
@@ -202,6 +210,21 @@ export async function GET() {
             TIMEFRAMES[t].tf
           );
           allSignals.push(...signals);
+
+          // Stamp 4h ATR% + funding into the trade-context map for the
+          // alerter. We only fill from the 4h pass — that's the timeframe
+          // the trade card sizes against. Skip if ATR is null (insufficient
+          // history): the alerter will just omit the trade card.
+          if (isPrimary) {
+            const atrSeries = atrPercent(highs, lows, closes, 14);
+            const atrLast = atrSeries[atrSeries.length - 1];
+            if (atrLast != null && Number.isFinite(atrLast) && atrLast > 0) {
+              tradeCtxBySymbol.set(batch[j].name, {
+                atrPct: atrLast,
+                fundingHourly: Number.isFinite(funding) ? funding : undefined,
+              });
+            }
+          }
         }
       }
     }
@@ -238,7 +261,7 @@ export async function GET() {
     // Telegram alerting — fire-and-forget. Scores conviction per symbol
     // and dispatches Strong Buy/Sell alerts that pass the cooldown +
     // vol-regime gate. No-ops if env isn't configured.
-    maybeDispatchAlerts(allSignals, priceBySymbol)
+    maybeDispatchAlerts(allSignals, priceBySymbol, tradeCtxBySymbol)
       .then((r) => {
         if (r.considered > 0) {
           console.info(

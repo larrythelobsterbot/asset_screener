@@ -19,6 +19,21 @@ import { sendTelegramMessage, escapeHtml, isTelegramConfigured } from "./telegra
 import { kvGet, kvSet } from "./db";
 import { priorityOf, sectorOf } from "@/config/sectors";
 
+// Trade-card sizing knobs — overridable via env so we can tune live without
+// a rebuild. Defaults match the $2k / 2% / 1.5×ATR / 3R LTF playbook.
+const ACCOUNT_USD = parseFloat(process.env.ALERT_ACCOUNT_USD || "2000");
+const RISK_PCT = parseFloat(process.env.ALERT_RISK_PCT || "2");      // 2% of equity per trade
+const STOP_ATR_MULT = parseFloat(process.env.ALERT_STOP_ATR_MULT || "1.5");
+const RR_RATIO = parseFloat(process.env.ALERT_RR_RATIO || "3");      // target = entry +/- RR × stop_dist
+
+// Context the alerter needs PER SYMBOL to compute the trade card. Caller
+// stamps these from the same scan that produced the signals — so the
+// numbers are consistent with the bars that fired the alert.
+export interface TradeContext {
+  atrPct: number;             // 4h ATR as % of price (Wilder-smoothed, 14-period)
+  fundingHourly?: number;     // hourly funding rate (sign-bearing), for APR context
+}
+
 // 4-hour cooldown per (symbol, direction). Matches the 4h primary timeframe —
 // if the setup is still valid 4h later it's worth re-alerting; sooner than
 // that and we're spamming on cache-driven re-emissions of the same fire.
@@ -52,6 +67,52 @@ function markCooldown(symbol: string, direction: "bullish" | "bearish", now: num
   kvSet(cooldownKey(symbol, direction), String(now));
 }
 
+// Format a price with a sensible number of decimals for the ticker's
+// scale — BTC at $76,778 should show "$76,778" but PEPE at $0.0000091
+// shouldn't round to "$0.00". We pick decimals from the magnitude.
+function fmtPrice(p: number): string {
+  const abs = Math.abs(p);
+  let decimals: number;
+  if (abs >= 1000) decimals = 0;
+  else if (abs >= 100) decimals = 2;
+  else if (abs >= 1) decimals = 3;
+  else if (abs >= 0.01) decimals = 5;
+  else decimals = 8;
+  return p.toLocaleString(undefined, { minimumFractionDigits: decimals, maximumFractionDigits: decimals });
+}
+
+// Compute a sized trade plan from the entry price + ATR + direction:
+//   stop  = entry ∓ STOP_ATR_MULT × ATR
+//   target = entry ± RR_RATIO × stop_distance
+//   size = (ACCOUNT_USD × RISK_PCT/100) / stop_distance  →  units of base asset
+// Returns null when we don't have enough info to size the trade (ATR
+// missing, ATR=0 — which would zero-divide — or price unknown).
+export function computeTradeCard(
+  entry: number,
+  atrPct: number,
+  direction: "bullish" | "bearish"
+): { stop: number; target: number; stopDistance: number; size: number; riskUsd: number } | null {
+  if (!Number.isFinite(entry) || entry <= 0) return null;
+  if (!Number.isFinite(atrPct) || atrPct <= 0) return null;
+  const atrAbs = entry * (atrPct / 100);
+  const stopDistance = STOP_ATR_MULT * atrAbs;
+  if (stopDistance <= 0) return null;
+  const stop = direction === "bullish" ? entry - stopDistance : entry + stopDistance;
+  const target = direction === "bullish"
+    ? entry + RR_RATIO * stopDistance
+    : entry - RR_RATIO * stopDistance;
+  const riskUsd = ACCOUNT_USD * (RISK_PCT / 100);
+  const size = riskUsd / stopDistance;
+  return { stop, target, stopDistance, size, riskUsd };
+}
+
+// Annualized funding from hourly rate. Same math as the table column —
+// keeping it inline so the alert and the UI agree on the number a user
+// sees when they cross-check.
+function fundingApr(hourly: number): number {
+  return hourly * 8760 * 100;
+}
+
 // Build the alert body. HTML mode so `<code>` / `<b>` render cleanly on
 // both mobile and desktop clients. Caller-supplied values are escaped;
 // the tags themselves are intentional and must stay raw.
@@ -59,7 +120,8 @@ function formatAlert(
   symbol: string,
   conviction: ConvictionResult,
   signals: Signal[],
-  currentPrice: number | null
+  currentPrice: number | null,
+  tradeCtx?: TradeContext
 ): string {
   const dot = directionDot(conviction.score >= 0 ? "bullish" : "bearish");
   const direction = conviction.score >= 0 ? "LONG" : "SHORT";
@@ -95,8 +157,40 @@ function formatAlert(
   const sector = sectorOf(symbol);
   const sectorTag = `<i>${escapeHtml(sector)}</i>`;
   const priceLine = currentPrice != null
-    ? `<b>${escapeHtml(symbol)}</b> · ${sectorTag} · @ <code>$${currentPrice.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</code>`
+    ? `<b>${escapeHtml(symbol)}</b> · ${sectorTag} · @ <code>$${fmtPrice(currentPrice)}</code>`
     : `<b>${escapeHtml(symbol)}</b> · ${sectorTag}`;
+
+  // ── Trade card ───────────────────────────────────────────────────────
+  // Built only when we have BOTH price and ATR%. Direction is taken from
+  // the conviction score sign — same source the dot/LONG-SHORT label
+  // uses, so card direction always agrees with the headline.
+  const tradeDir: "bullish" | "bearish" = conviction.score >= 0 ? "bullish" : "bearish";
+  const card = currentPrice != null && tradeCtx?.atrPct
+    ? computeTradeCard(currentPrice, tradeCtx.atrPct, tradeDir)
+    : null;
+  let cardBlock = "";
+  if (card) {
+    const stopPct = (card.stopDistance / currentPrice!) * 100;
+    const apr = tradeCtx?.fundingHourly != null ? fundingApr(tradeCtx.fundingHourly) : null;
+    // Funding context: positive APR = longs paying shorts (supportive of
+    // shorts / headwind for longs), negative = opposite. We tag the
+    // alignment vs the trade direction so the user doesn't have to think.
+    let fundingLine = "";
+    if (apr != null) {
+      const aligned = (tradeDir === "bullish" && apr <= 0) || (tradeDir === "bearish" && apr >= 0);
+      const tag = aligned ? "✓ aligned" : "✗ headwind";
+      fundingLine = `funding: <code>${apr >= 0 ? "+" : ""}${apr.toFixed(1)}% APR</code> · ${tag}`;
+    }
+    cardBlock = [
+      "",
+      `<b>[ TRADE CARD ]</b>`,
+      `entry: <code>$${fmtPrice(currentPrice!)}</code>  ·  ATR(14·4h): ${tradeCtx!.atrPct.toFixed(2)}%`,
+      `stop:  <code>$${fmtPrice(card.stop)}</code>  (${stopPct.toFixed(2)}% · ${STOP_ATR_MULT}× ATR)`,
+      `target: <code>$${fmtPrice(card.target)}</code>  (${RR_RATIO}R)`,
+      `size: <code>${card.size.toFixed(card.size >= 1 ? 2 : 4)} ${escapeHtml(symbol)}</code>  ·  risk <code>$${card.riskUsd.toFixed(2)}</code> (${RISK_PCT}% of $${ACCOUNT_USD})`,
+      fundingLine,
+    ].filter(Boolean).join("\n");
+  }
 
   return [
     `${dot} <b>${escapeHtml(label)}</b> · ${escapeHtml(direction)} · score <code>${score}</code>`,
@@ -105,9 +199,10 @@ function formatAlert(
     `bull/bear: ${conviction.bullishCount}/${conviction.bearishCount} · families: ${conviction.contributingFamilies.length}`,
     "",
     signalLines || "<i>(no enriched signals)</i>",
+    cardBlock,
     "",
     `<a href="https://assets.lekker.design">open screener</a>`,
-  ].join("\n");
+  ].join("\n").replace(/\n{3,}/g, "\n\n");
 }
 
 export interface AlertDispatchResult {
@@ -126,7 +221,8 @@ export interface AlertDispatchResult {
 // "(price unknown)".
 export async function maybeDispatchAlerts(
   allSignals: Signal[],
-  priceBySymbol?: Map<string, number>
+  priceBySymbol?: Map<string, number>,
+  tradeCtxBySymbol?: Map<string, TradeContext>
 ): Promise<AlertDispatchResult> {
   if (!isTelegramConfigured()) {
     return { considered: 0, fired: 0, cooledDown: 0, failed: 0 };
@@ -172,7 +268,8 @@ export async function maybeDispatchAlerts(
     markCooldown(symbol, direction, now);
 
     const price = priceBySymbol?.get(symbol) ?? null;
-    const body = formatAlert(symbol, conviction, signals, price);
+    const tradeCtx = tradeCtxBySymbol?.get(symbol);
+    const body = formatAlert(symbol, conviction, signals, price, tradeCtx);
 
     tasks.push(
       sendTelegramMessage(body)
