@@ -34,7 +34,7 @@ export function getDb(): Database.Database {
 // Versioned via PRAGMA user_version so we can add schema changes without
 // blowing away the local file. Bump VERSION and add a step.
 
-const VERSION = 7;
+const VERSION = 8;
 
 function migrate(db: Database.Database): void {
   const current = db.pragma("user_version", { simple: true }) as number;
@@ -47,6 +47,7 @@ function migrate(db: Database.Database): void {
   if (current < 5) db.exec(MIGRATION_V5);
   if (current < 6) db.exec(MIGRATION_V6);
   if (current < 7) db.exec(MIGRATION_V7);
+  if (current < 8) db.exec(MIGRATION_V8);
   db.pragma(`user_version = ${VERSION}`);
 }
 
@@ -246,6 +247,32 @@ const MIGRATION_V7 = `
     create index if not exists idx_trades_opened on trades(ts_opened desc);
     create index if not exists idx_trades_symbol on trades(symbol, ts_opened desc);
     create index if not exists idx_trades_open on trades(ts_closed) where ts_closed is null;
+  `;
+
+// V8 — unified catalyst feed. One row per inbound item from any source
+// (Tree News now; Telegram / Twitter later). dedup_key is the source's
+// native id (e.g. Tree's `_id`) with a unique index so re-polling the
+// same window never double-inserts. symbols_json holds the matched
+// tickers (uppercase, intersected with our perp universe) so the UI can
+// filter the stream by symbol. importance: 0 normal, 1 notable (mentions
+// a tracked symbol), 2 market-moving (listing / hack / ETF / macro).
+const MIGRATION_V8 = `
+    create table if not exists feed_events (
+      id           integer primary key autoincrement,
+      ts           integer not null,
+      source       text    not null,          -- 'tree' | 'telegram' | 'twitter'
+      author       text,                       -- sourceName / channel / handle
+      title        text    not null,
+      body         text,
+      url          text,
+      symbols_json text,                        -- JSON: ["BTC","HYPE"]
+      importance   integer not null default 0,
+      dedup_key    text    not null unique,
+      raw_json     text
+    );
+    create index if not exists idx_feed_ts on feed_events(ts desc);
+    create index if not exists idx_feed_source_ts on feed_events(source, ts desc);
+    create index if not exists idx_feed_importance_ts on feed_events(importance, ts desc);
   `;
 
 // ── price_snapshots ─────────────────────────────────────────────────────
@@ -859,9 +886,10 @@ export function startPruneJob(): void {
       const ss = pruneSocialSnapshots();
       const hp = pruneHypePressureSnapshots();
       const bb = pruneBtcBinarySnapshots();
-      if (sp > 0 || cp > 0 || ss > 0 || hp > 0 || bb > 0) {
+      const fe = pruneFeedEvents();
+      if (sp > 0 || cp > 0 || ss > 0 || hp > 0 || bb > 0 || fe > 0) {
         console.info(
-          `[db] pruned ${sp} price, ${cp} candle, ${ss} social, ${hp} hype-pressure, ${bb} btc-binary snapshots`
+          `[db] pruned ${sp} price, ${cp} candle, ${ss} social, ${hp} hype-pressure, ${bb} btc-binary, ${fe} feed snapshots`
         );
       }
     } catch (err) {
@@ -872,4 +900,80 @@ export function startPruneJob(): void {
   pruneTimer = setInterval(runOnce, 24 * 3600 * 1000);
   // Don't keep the event loop alive just for this timer.
   if (typeof pruneTimer.unref === "function") pruneTimer.unref();
+}
+
+// ── feed_events ─────────────────────────────────────────────────────────
+
+export interface FeedEventRow {
+  id: number;
+  ts: number;
+  source: string;
+  author: string | null;
+  title: string;
+  body: string | null;
+  url: string | null;
+  symbols_json: string | null;
+  importance: number;
+  dedup_key: string;
+  raw_json: string | null;
+}
+
+export type FeedEventInput = Omit<FeedEventRow, "id">;
+
+// Insert feed items, ignoring any whose dedup_key already exists. Returns
+// the count actually inserted — lets the poller log "5 new" without a
+// separate read. Wrapped in a transaction so a batch poll is one fsync.
+export function insertFeedEvents(rows: FeedEventInput[]): number {
+  if (rows.length === 0) return 0;
+  const db = getDb();
+  const stmt = db.prepare(
+    `insert or ignore into feed_events
+       (ts, source, author, title, body, url, symbols_json, importance, dedup_key, raw_json)
+     values (@ts, @source, @author, @title, @body, @url, @symbols_json, @importance, @dedup_key, @raw_json)`
+  );
+  const tx = db.transaction((batch: FeedEventInput[]) => {
+    let inserted = 0;
+    for (const r of batch) {
+      const info = stmt.run(r);
+      inserted += info.changes;
+    }
+    return inserted;
+  });
+  return tx(rows);
+}
+
+// Read the feed newest-first with optional filters. `symbol` matches rows
+// whose symbols_json array contains it (uppercase). `since` is a ts lower
+// bound (exclusive) for incremental polling from the client.
+export function listFeedEvents(opts: {
+  source?: string;
+  symbol?: string;
+  minImportance?: number;
+  since?: number;
+  limit?: number;
+} = {}): FeedEventRow[] {
+  const db = getDb();
+  const where: string[] = [];
+  const params: Record<string, unknown> = {};
+  if (opts.source) { where.push("source = @source"); params.source = opts.source; }
+  if (opts.minImportance != null) { where.push("importance >= @minImportance"); params.minImportance = opts.minImportance; }
+  if (opts.since != null) { where.push("ts > @since"); params.since = opts.since; }
+  if (opts.symbol) {
+    // symbols_json is a JSON array of bare uppercase tickers. Match the
+    // quoted token so "BTC" doesn't substring-hit "WBTC". Cheap LIKE is
+    // fine at this table's size; a json_each index isn't worth it yet.
+    where.push(`symbols_json like @symLike`);
+    params.symLike = `%"${opts.symbol.toUpperCase()}"%`;
+  }
+  const clause = where.length ? `where ${where.join(" and ")}` : "";
+  const limit = Math.min(opts.limit ?? 100, 500);
+  return db
+    .prepare(`select * from feed_events ${clause} order by ts desc limit ${limit}`)
+    .all(params) as FeedEventRow[];
+}
+
+export function pruneFeedEvents(maxAgeMs: number = 14 * 86_400_000): number {
+  const db = getDb();
+  const cutoff = Date.now() - maxAgeMs;
+  return db.prepare(`delete from feed_events where ts < ?`).run(cutoff).changes;
 }
