@@ -42,6 +42,7 @@ export function classifyRegime(oiDeltaPct: number | null, priceDeltaPct: number 
 }
 
 let started = false;
+let running = false; // re-entrancy guard — see runOnce
 let timer: ReturnType<typeof setInterval> | null = null;
 let lastError: string | null = null;
 let consecutiveErrors = 0;
@@ -65,6 +66,13 @@ function topCoinsByVolume(
 
 async function runOnce(): Promise<void> {
   if (!isCoinalyzeConfigured()) return;
+  // A single cycle issues ~12 requests and, under 429 backoff, can run
+  // longer than POLL_INTERVAL_MS. Without this guard the next interval
+  // tick would start a second concurrent cycle, doubling request pressure
+  // and permanently saturating the 40/min limit — the poller could never
+  // recover. Skip ticks while a cycle is still in flight.
+  if (running) return;
+  running = true;
   try {
     const { meta, assetCtxs } = await getMetaAndCtxs();
     const top = topCoinsByVolume(meta, assetCtxs);
@@ -114,6 +122,8 @@ async function runOnce(): Promise<void> {
     if (consecutiveErrors === 1 || consecutiveErrors % 10 === 0) {
       console.warn(`[coinalyze] poll #${consecutiveErrors} failed:`, lastError);
     }
+  } finally {
+    running = false;
   }
 }
 
