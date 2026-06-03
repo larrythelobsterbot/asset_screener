@@ -38,34 +38,36 @@ function chunk<T>(arr: T[], n: number): T[][] {
   return out;
 }
 
-const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+// Thrown on HTTP 429 so the poller can recognise rate-limiting and enter a
+// cooldown rather than immediately re-poking the key.
+export class RateLimitError extends Error {
+  retryAfterMs: number;
+  constructor(retryAfterMs: number) {
+    super("coinalyze 429 rate-limited");
+    this.name = "RateLimitError";
+    this.retryAfterMs = retryAfterMs;
+  }
+}
 
-// 40 req/min is strict and the limiter renews its penalty on every request
-// made while throttled, so we honour Retry-After and back off rather than
-// hammer. Capped wait + bounded retries so a sustained outage still fails
-// loudly instead of hanging the poller forever.
+// IMPORTANT: do NOT retry in-call. Coinalyze renews its throttle penalty on
+// every request made while limited, so an in-call retry loop keeps the key
+// permanently throttled (observed in prod). We fail fast on 429 and let the
+// POLLER back off as a whole — that's the only way the window actually cools.
 async function czGet<T>(path: string, params: Record<string, string>): Promise<T> {
   const k = key();
   if (!k) throw new Error("COINALYZE_API_KEY not set");
   const qs = new URLSearchParams(params).toString();
-  const url = `${BASE}${path}?${qs}`;
-  const MAX_RETRIES = 3;
-  for (let attempt = 0; ; attempt++) {
-    const res = await fetchWithTimeout(
-      url,
-      { headers: { api_key: k, accept: "application/json" } },
-      15_000
-    );
-    if (res.status === 429) {
-      if (attempt >= MAX_RETRIES) throw new Error("coinalyze 429 rate-limited (gave up)");
-      const ra = parseFloat(res.headers.get("retry-after") || "");
-      const waitMs = Math.min(50_000, (Number.isFinite(ra) ? ra : 5) * 1000 + 500);
-      await sleep(waitMs);
-      continue;
-    }
-    if (!res.ok) throw new Error(`coinalyze ${path} ${res.status}`);
-    return (await res.json()) as T;
+  const res = await fetchWithTimeout(
+    `${BASE}${path}?${qs}`,
+    { headers: { api_key: k, accept: "application/json" } },
+    15_000
+  );
+  if (res.status === 429) {
+    const ra = parseFloat(res.headers.get("retry-after") || "");
+    throw new RateLimitError((Number.isFinite(ra) ? ra : 60) * 1000);
   }
+  if (!res.ok) throw new Error(`coinalyze ${path} ${res.status}`);
+  return (await res.json()) as T;
 }
 
 // ── Markets index ───────────────────────────────────────────────────────

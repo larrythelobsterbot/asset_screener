@@ -14,7 +14,7 @@
 // under budget at the 90s cadence. The /future-markets index is cached 6h.
 
 import { getMetaAndCtxs } from "./hyperliquid";
-import { getDerivsForCoins, isCoinalyzeConfigured } from "./coinalyze";
+import { getDerivsForCoins, isCoinalyzeConfigured, RateLimitError } from "./coinalyze";
 import { insertDerivsSnapshots, derivsSnapshotAt, type DerivsRow } from "./db";
 
 const POLL_INTERVAL_MS = 90_000;
@@ -42,10 +42,12 @@ export function classifyRegime(oiDeltaPct: number | null, priceDeltaPct: number 
 }
 
 let started = false;
-let running = false; // re-entrancy guard — see runOnce
+let running = false;      // re-entrancy guard — see runOnce
+let cooldownUntil = 0;    // skip cycles until this ts (set on rate-limit)
 let timer: ReturnType<typeof setInterval> | null = null;
 let lastError: string | null = null;
 let consecutiveErrors = 0;
+let rateLimitStreak = 0;  // drives the cooldown backoff
 let lastRunTs = 0;
 
 // name (HL universe) → base asset. HL names are already the base for most
@@ -72,6 +74,9 @@ async function runOnce(): Promise<void> {
   // and permanently saturating the 40/min limit — the poller could never
   // recover. Skip ticks while a cycle is still in flight.
   if (running) return;
+  // Cooling down after a rate-limit — stay completely quiet so the key's
+  // throttle window can actually clear (it renews on every request).
+  if (Date.now() < cooldownUntil) return;
   running = true;
   try {
     const { meta, assetCtxs } = await getMetaAndCtxs();
@@ -114,12 +119,21 @@ async function runOnce(): Promise<void> {
     insertDerivsSnapshots(rows);
     lastRunTs = now;
     consecutiveErrors = 0;
+    rateLimitStreak = 0;
     lastError = null;
     console.info(`[coinalyze] wrote ${rows.length} derivs snapshots (top ${TOP_N})`);
   } catch (err) {
     consecutiveErrors += 1;
     lastError = String(err);
-    if (consecutiveErrors === 1 || consecutiveErrors % 10 === 0) {
+    if (err instanceof RateLimitError) {
+      // Escalating cooldown: 2,4,8…min capped at 15. Far longer than the
+      // server's Retry-After on purpose — the key only cools if we stop
+      // touching it entirely for a sustained stretch.
+      rateLimitStreak += 1;
+      const backoffMs = Math.min(15 * 60_000, 60_000 * 2 ** rateLimitStreak);
+      cooldownUntil = Date.now() + backoffMs;
+      console.warn(`[coinalyze] rate-limited — cooling down ${Math.round(backoffMs / 60_000)}min`);
+    } else if (consecutiveErrors === 1 || consecutiveErrors % 10 === 0) {
       console.warn(`[coinalyze] poll #${consecutiveErrors} failed:`, lastError);
     }
   } finally {
