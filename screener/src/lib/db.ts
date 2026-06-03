@@ -34,7 +34,7 @@ export function getDb(): Database.Database {
 // Versioned via PRAGMA user_version so we can add schema changes without
 // blowing away the local file. Bump VERSION and add a step.
 
-const VERSION = 8;
+const VERSION = 9;
 
 function migrate(db: Database.Database): void {
   const current = db.pragma("user_version", { simple: true }) as number;
@@ -48,6 +48,7 @@ function migrate(db: Database.Database): void {
   if (current < 6) db.exec(MIGRATION_V6);
   if (current < 7) db.exec(MIGRATION_V7);
   if (current < 8) db.exec(MIGRATION_V8);
+  if (current < 9) db.exec(MIGRATION_V9);
   db.pragma(`user_version = ${VERSION}`);
 }
 
@@ -273,6 +274,31 @@ const MIGRATION_V8 = `
     create index if not exists idx_feed_ts on feed_events(ts desc);
     create index if not exists idx_feed_source_ts on feed_events(source, ts desc);
     create index if not exists idx_feed_importance_ts on feed_events(importance, ts desc);
+  `;
+
+// V9 — cross-exchange derivatives snapshots (Coinalyze). One row per
+// (base_asset, ts). The poller writes the aggregate OI, HL-specific OI +
+// funding, windowed liquidations, and the DERIVED regime fields (OI delta
+// vs price delta → the OI×Price 2×2) so the read route/UI stay dumb.
+// regime ∈ new_longs | short_squeeze | new_shorts | long_flush | flat.
+const MIGRATION_V9 = `
+    create table if not exists derivs_snapshots (
+      base             text    not null,
+      ts               integer not null,
+      oi_usd           real    not null,   -- aggregate OI across venues (USD)
+      oi_hl_usd        real,                -- Hyperliquid-only OI (USD)
+      funding_hl       real,                -- HL current funding rate
+      liq_long_usd     real,                -- long liquidations over window
+      liq_short_usd    real,                -- short liquidations over window
+      oi_delta_pct     real,                -- vs lookback snapshot
+      price            real,                -- HL mark at snapshot
+      price_delta_pct  real,                -- vs same lookback
+      regime           text,
+      venues           integer,
+      primary key (base, ts)
+    );
+    create index if not exists idx_derivs_base_ts on derivs_snapshots(base, ts desc);
+    create index if not exists idx_derivs_ts on derivs_snapshots(ts desc);
   `;
 
 // ── price_snapshots ─────────────────────────────────────────────────────
@@ -887,9 +913,10 @@ export function startPruneJob(): void {
       const hp = pruneHypePressureSnapshots();
       const bb = pruneBtcBinarySnapshots();
       const fe = pruneFeedEvents();
-      if (sp > 0 || cp > 0 || ss > 0 || hp > 0 || bb > 0 || fe > 0) {
+      const dv = pruneDerivsSnapshots();
+      if (sp > 0 || cp > 0 || ss > 0 || hp > 0 || bb > 0 || fe > 0 || dv > 0) {
         console.info(
-          `[db] pruned ${sp} price, ${cp} candle, ${ss} social, ${hp} hype-pressure, ${bb} btc-binary, ${fe} feed snapshots`
+          `[db] pruned ${sp} price, ${cp} candle, ${ss} social, ${hp} hype-pressure, ${bb} btc-binary, ${fe} feed, ${dv} derivs snapshots`
         );
       }
     } catch (err) {
@@ -986,4 +1013,72 @@ export function pruneFeedEvents(maxAgeMs: number = 14 * 86_400_000): number {
   const db = getDb();
   const cutoff = Date.now() - maxAgeMs;
   return db.prepare(`delete from feed_events where ts < ?`).run(cutoff).changes;
+}
+
+// ── derivs_snapshots ────────────────────────────────────────────────────
+
+export interface DerivsRow {
+  base: string;
+  ts: number;
+  oi_usd: number;
+  oi_hl_usd: number | null;
+  funding_hl: number | null;
+  liq_long_usd: number | null;
+  liq_short_usd: number | null;
+  oi_delta_pct: number | null;
+  price: number | null;
+  price_delta_pct: number | null;
+  regime: string | null;
+  venues: number | null;
+}
+
+export function insertDerivsSnapshots(rows: DerivsRow[]): void {
+  if (rows.length === 0) return;
+  const db = getDb();
+  const stmt = db.prepare(
+    `insert or replace into derivs_snapshots
+       (base, ts, oi_usd, oi_hl_usd, funding_hl, liq_long_usd, liq_short_usd,
+        oi_delta_pct, price, price_delta_pct, regime, venues)
+     values (@base, @ts, @oi_usd, @oi_hl_usd, @funding_hl, @liq_long_usd, @liq_short_usd,
+        @oi_delta_pct, @price, @price_delta_pct, @regime, @venues)`
+  );
+  const tx = db.transaction((batch: DerivsRow[]) => {
+    for (const r of batch) stmt.run(r);
+  });
+  tx(rows);
+}
+
+// Latest snapshot per base, newest-first by ts. `maxAgeMs` drops bases that
+// haven't updated recently (stale poller / dropped coverage).
+export function latestDerivsSnapshots(maxAgeMs = 10 * 60_000): DerivsRow[] {
+  const db = getDb();
+  const cutoff = Date.now() - maxAgeMs;
+  return db
+    .prepare(
+      `select d.* from derivs_snapshots d
+         join (select base, max(ts) ts from derivs_snapshots group by base) m
+           on d.base = m.base and d.ts = m.ts
+        where d.ts >= ?
+        order by d.oi_usd desc`
+    )
+    .all(cutoff) as DerivsRow[];
+}
+
+// Closest snapshot for one base at-or-before targetTs — used by the poller
+// to compute OI/price deltas over a fixed lookback window.
+export function derivsSnapshotAt(base: string, targetTs: number): DerivsRow | null {
+  const db = getDb();
+  return (
+    (db
+      .prepare(
+        `select * from derivs_snapshots where base = ? and ts <= ? order by ts desc limit 1`
+      )
+      .get(base, targetTs) as DerivsRow | undefined) ?? null
+  );
+}
+
+export function pruneDerivsSnapshots(maxAgeMs: number = 7 * 86_400_000): number {
+  const db = getDb();
+  const cutoff = Date.now() - maxAgeMs;
+  return db.prepare(`delete from derivs_snapshots where ts < ?`).run(cutoff).changes;
 }

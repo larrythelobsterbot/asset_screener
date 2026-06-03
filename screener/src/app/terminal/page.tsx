@@ -18,6 +18,7 @@ import MacroBar from "@/components/MacroBar";
 import HypePressureCard from "@/components/HypePressureCard";
 import FeedStream from "@/components/FeedStream";
 import MoversPanel from "@/components/MoversPanel";
+import DerivsRadar from "@/components/DerivsRadar";
 
 export default function Terminal() {
   const [symbol, setSymbol] = useState<string | null>(null);
@@ -35,7 +36,10 @@ export default function Terminal() {
 
       <section className="term-grid">
         <FeedStream symbol={symbol} onPickSymbol={setSymbol} />
-        <MoversPanel symbol={symbol} onPickSymbol={setSymbol} />
+        <div className="term-rail">
+          <DerivsRadar symbol={symbol} onPickSymbol={setSymbol} />
+          <MoversPanel symbol={symbol} onPickSymbol={setSymbol} />
+        </div>
       </section>
 
       <style jsx>{`
@@ -68,12 +72,19 @@ export default function Terminal() {
         .term-grid {
           flex: 1 1 auto;
           display: grid;
-          grid-template-columns: 1fr 320px;
+          grid-template-columns: 1fr 340px;
           gap: 12px;
           min-height: 0; /* let children scroll instead of growing the page */
         }
+        .term-rail {
+          display: grid;
+          grid-template-rows: 3fr 2fr; /* Derivs radar gets the larger share */
+          gap: 12px;
+          min-height: 0;
+        }
         @media (max-width: 820px) {
           .term-grid { grid-template-columns: 1fr; }
+          .term-rail { grid-template-rows: 360px 280px; }
         }
       `}</style>
     </main>
