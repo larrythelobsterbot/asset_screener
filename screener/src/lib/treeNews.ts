@@ -34,11 +34,45 @@ const TRACKED: Set<string> = new Set([
   ...Object.keys(HL_BUILDER_PERP_MAP),
 ].map((s) => s.toUpperCase()));
 
-// Market-moving keyword → importance 2. Kept tight on purpose: these are
-// the headlines that reprice an asset within minutes. Broader "notable"
-// (importance 1) is inferred from a tracked-symbol match instead.
-const MOVING_RE =
-  /\b(listing|will list|to list|lists|delist|hack|hacked|exploit|drained|breach|halt(?:ed|s)?|etf|sec\b|lawsuit|fomc|cpi|rate (?:cut|hike|decision)|approv\w*|unlock)\b/i;
+// Market-moving keyword → importance 2. These are the headlines that
+// reprice an asset within minutes. Broader "notable" (importance 1) is
+// inferred from a tracked-symbol match instead. For a headline trader,
+// missing a listing is worse than over-tagging, so the listing vocabulary
+// is deliberately generous (audit finding M6).
+const MOVING_RE = new RegExp(
+  "\\b(" + [
+    // listings / delistings / new contracts
+    "listing", "will list", "to list", "lists", "listed on",
+    "delist\\w*", "launchpool", "launchpad",
+    "perpetual (?:contract|futures)", "perp(?:etual)? listing",
+    "futures? (?:listing|contract)", "spot (?:listing|trading pair)",
+    "adds? (?:spot|perpetual|futures|support for)", "support for",
+    "trading (?:will )?(?:open|go(?:es)? live|begins)", "now (?:listed|trading|available)",
+    "pre-?market",
+    // exploits / security
+    "hack(?:ed|s)?", "exploit\\w*", "drained?", "breach", "rug",
+    // halts / regulatory / macro
+    "halt(?:ed|s|ing)?", "etf", "\\bsec\\b", "lawsuit", "indict\\w*",
+    "fomc", "\\bcpi\\b", "rate (?:cut|hike|decision)", "approv\\w*",
+    // supply events
+    "token unlock", "unlock", "airdrop", "snapshot",
+  ].join("|") + ")\\b",
+  "i"
+);
+
+// Only http(s) URLs are safe to render as a link target. A compromised or
+// future source (Telegram/Twitter) could emit `javascript:`/`data:` etc.;
+// we drop anything that isn't http/https at ingest so the UI never renders
+// an unsafe href (audit finding H1).
+function sanitizeUrl(raw: string | undefined): string | null {
+  if (!raw) return null;
+  try {
+    const u = new URL(raw);
+    return u.protocol === "https:" || u.protocol === "http:" ? raw : null;
+  } catch {
+    return null;
+  }
+}
 
 // ── Tree shape (verified against /api/news; the WS pushes the same
 // objects, plus a `{user}` login-ack which the WS client filters out) ───
@@ -94,7 +128,7 @@ export function normalizeTreeItem(item: TreeNewsItem): FeedEventInput | null {
     author: item.sourceName || item.source || null,
     title,
     body: item.body?.trim() || null,
-    url: item.url || item.link || null,
+    url: sanitizeUrl(item.url || item.link),
     symbols_json: symbols.length ? JSON.stringify(symbols) : null,
     importance: classifyImportance(title, symbols),
     dedup_key: `${SOURCE}:${id}`,

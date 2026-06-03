@@ -60,12 +60,19 @@ export async function GET(req: Request) {
   const minImportance = minImpRaw != null && Number.isFinite(+minImpRaw) ? +minImpRaw : undefined;
   const limit = limitRaw != null && Number.isFinite(+limitRaw) ? +limitRaw : undefined;
 
+  // Match the no-store posture of /api/markets — this is a live feed and
+  // must never be cached by Next's data cache or any CDN (audit M7).
+  const NO_STORE = {
+    "Cache-Control": "no-store, no-cache, must-revalidate",
+    "CDN-Cache-Control": "no-store",
+  };
+
   const cacheKey = `api:feed:${url.search}`;
   const cached = cache.get<FeedItem[]>(cacheKey);
-  if (cached) return NextResponse.json({ items: cached });
+  if (cached) return NextResponse.json({ items: cached }, { headers: NO_STORE });
 
   const rows = listFeedEvents({ source, symbol, minImportance, since, limit });
   const items = rows.map(toItem);
   cache.set(cacheKey, items, ROUTE_CACHE_TTL_MS);
-  return NextResponse.json({ items });
+  return NextResponse.json({ items }, { headers: NO_STORE });
 }

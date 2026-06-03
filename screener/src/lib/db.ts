@@ -962,11 +962,21 @@ export function listFeedEvents(opts: {
     // symbols_json is a JSON array of bare uppercase tickers. Match the
     // quoted token so "BTC" doesn't substring-hit "WBTC". Cheap LIKE is
     // fine at this table's size; a json_each index isn't worth it yet.
-    where.push(`symbols_json like @symLike`);
-    params.symLike = `%"${opts.symbol.toUpperCase()}"%`;
+    // Validate the ticker shape first — `%`/`_` are LIKE wildcards, so an
+    // unvalidated symbol could broaden the match to everything; a bad
+    // shape simply drops the filter (audit finding M3).
+    const sym = opts.symbol.toUpperCase();
+    if (/^[A-Z0-9]{1,20}$/.test(sym)) {
+      where.push(`symbols_json like @symLike`);
+      params.symLike = `%"${sym}"%`;
+    }
   }
   const clause = where.length ? `where ${where.join(" and ")}` : "";
-  const limit = Math.min(opts.limit ?? 100, 500);
+  // Clamp to [1,500]. Without the lower bound, limit=-1 (which passes
+  // Number.isFinite upstream) becomes SQLite `LIMIT -1` = unbounded scan
+  // on a public endpoint (audit finding H2).
+  const reqLimit = Math.floor(opts.limit ?? 100);
+  const limit = Number.isFinite(reqLimit) ? Math.max(1, Math.min(500, reqLimit)) : 100;
   return db
     .prepare(`select * from feed_events ${clause} order by ts desc limit ${limit}`)
     .all(params) as FeedEventRow[];
