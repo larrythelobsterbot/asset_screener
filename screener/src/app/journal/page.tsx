@@ -227,10 +227,18 @@ export default function JournalPage() {
             Trade Journal
           </div>
         </div>
-        <a href="/" style={{
-          fontSize: 11, color: "var(--text-mute)", textDecoration: "none",
-          padding: "6px 10px", border: ".5px solid var(--border)", borderRadius: "var(--radius)",
-        }}>← screener</a>
+        <div style={{ display: "flex", gap: 8 }}>
+          <a href="/terminal" style={{
+            fontSize: 11, color: "var(--acc-warn)", textDecoration: "none",
+            padding: "6px 10px", borderRadius: "var(--radius)",
+            border: ".5px solid color-mix(in oklab, var(--acc-warn) 45%, transparent)",
+            background: "color-mix(in oklab, var(--acc-warn) 9%, transparent)",
+          }}>⌗ terminal</a>
+          <a href="/" style={{
+            fontSize: 11, color: "var(--text-mute)", textDecoration: "none",
+            padding: "6px 10px", border: ".5px solid var(--border)", borderRadius: "var(--radius)",
+          }}>← screener</a>
+        </div>
       </header>
 
       {/* Summary tiles */}

@@ -28,6 +28,7 @@ export default function Terminal() {
       <header className="term-head">
         <div className="term-brand">
           <Link href="/" className="back">[ ← SCREENER ]</Link>
+          <Link href="/journal" className="back">[ JOURNAL ]</Link>
           <span className="term-name">TERMINAL</span>
         </div>
         <div className="term-macro"><MacroBar /></div>

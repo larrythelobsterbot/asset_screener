@@ -240,6 +240,24 @@ export default function Home() {
             </button>
           )}
 
+          {/* Terminal — prominent (accented) link to the read-only info
+              terminal: catalyst news feed, live prices, derivs radar.
+              Mustard-highlighted so it stands out from the ghost buttons. */}
+          <a
+            href="/terminal"
+            className="btn-ghost"
+            title="Open the live terminal — news feed, prices, derivs radar"
+            style={{
+              textDecoration: "none",
+              color: "var(--acc-warn)",
+              borderColor: "color-mix(in oklab, var(--acc-warn) 45%, transparent)",
+              background: "color-mix(in oklab, var(--acc-warn) 9%, transparent)",
+            }}
+          >
+            <span>⌗</span>
+            Terminal
+          </a>
+
           {/* Journal — link out to the trades table view. Same chrome as
               the watchlist button, no count badge (open count would
               add a fetch on every page load just for the badge). */}
