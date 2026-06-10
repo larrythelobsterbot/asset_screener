@@ -1015,6 +1015,49 @@ export function pruneFeedEvents(maxAgeMs: number = 14 * 86_400_000): number {
   return db.prepare(`delete from feed_events where ts < ?`).run(cutoff).changes;
 }
 
+// Recent snapshot series for a set of symbols, oldest-first. Powers the
+// HL-native derivs radar: OI/price deltas + sparklines come straight from
+// this table (written ~60s by the /api/markets pipeline + keepalive).
+// The since-bound keeps the result naturally windowed — a multi-day gap in
+// snapshots (sleeping poller) can't leak ancient rows into delta math.
+export function snapshotSeriesBulk(
+  symbols: string[],
+  sinceTs: number
+): Map<string, { ts: number; mark: number; oi: number | null; funding: number | null }[]> {
+  const out = new Map<string, { ts: number; mark: number; oi: number | null; funding: number | null }[]>();
+  if (symbols.length === 0) return out;
+  const db = getDb();
+  const placeholders = symbols.map(() => "?").join(",");
+  const rows = db
+    .prepare(
+      `select symbol, ts, mark, oi, funding from price_snapshots
+        where ts >= ? and symbol in (${placeholders})
+        order by ts asc`
+    )
+    .all(sinceTs, ...symbols) as {
+      symbol: string; ts: number; mark: number; oi: number | null; funding: number | null;
+    }[];
+  for (const r of rows) {
+    const list = out.get(r.symbol) ?? [];
+    list.push({ ts: r.ts, mark: r.mark, oi: r.oi, funding: r.funding });
+    out.set(r.symbol, list);
+  }
+  return out;
+}
+
+// Freshness probes for the status bar — newest row timestamps.
+export function latestSnapshotTs(): number | null {
+  const db = getDb();
+  const r = db.prepare(`select max(ts) ts from price_snapshots`).get() as { ts: number | null };
+  return r?.ts ?? null;
+}
+
+export function latestFeedTs(): number | null {
+  const db = getDb();
+  const r = db.prepare(`select max(ts) ts from feed_events`).get() as { ts: number | null };
+  return r?.ts ?? null;
+}
+
 // ── derivs_snapshots ────────────────────────────────────────────────────
 
 export interface DerivsRow {

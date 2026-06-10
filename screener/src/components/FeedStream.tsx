@@ -7,10 +7,11 @@
 // in a fast-scrolling feed. Source + "movers only" + symbol filters narrow
 // the stream client-side via the same query the API already supports.
 
-import { useEffect, useState, useCallback } from "react";
+import { useEffect, useState, useCallback, useRef } from "react";
 import type { FeedItem } from "@/app/api/feed/route";
 
 const POLL_MS = 8_000;
+const FRESH_PULSE_MS = 1800;
 
 function relTime(ts: number, now: number): string {
   const s = Math.max(0, Math.round((now - ts) / 1000));
@@ -39,6 +40,9 @@ export default function FeedStream({
   const [source, setSource] = useState<string>("all");
   const [moversOnly, setMoversOnly] = useState(false);
   const [now, setNow] = useState(() => 0);
+  // Rows that arrived since the previous poll get a one-shot mustard pulse.
+  const [freshIds, setFreshIds] = useState<Set<number>>(new Set());
+  const maxSeenIdRef = useRef<number>(0);
 
   const load = useCallback(() => {
     const params = new URLSearchParams();
@@ -49,7 +53,18 @@ export default function FeedStream({
     return fetch(`/api/feed?${params.toString()}`)
       .then((r) => (r.ok ? r.json() : null))
       .then((d: { items: FeedItem[] } | null) => {
-        if (d?.items) setItems(d.items);
+        if (d?.items) {
+          const prevMax = maxSeenIdRef.current;
+          const incoming = new Set(
+            d.items.filter((it) => prevMax > 0 && it.id > prevMax).map((it) => it.id)
+          );
+          maxSeenIdRef.current = Math.max(prevMax, ...d.items.map((it) => it.id), 0);
+          setItems(d.items);
+          if (incoming.size > 0) {
+            setFreshIds(incoming);
+            setTimeout(() => setFreshIds(new Set()), FRESH_PULSE_MS);
+          }
+        }
         setNow(Date.now());
       })
       .catch(() => { /* keep last known */ });
@@ -92,7 +107,7 @@ export default function FeedStream({
           <div className="feed-empty">no items yet — waiting on the wire…</div>
         )}
         {items.map((it) => (
-          <article key={it.id} className={`row imp-${it.importance}`}>
+          <article key={it.id} className={`row imp-${it.importance} ${freshIds.has(it.id) ? "fresh" : ""}`}>
             <div className="row-meta">
               <span className="age">{relTime(it.ts, now || it.ts)}</span>
               <span className={`src src-${it.source}`}>{SOURCE_LABELS[it.source] ?? it.source}</span>
@@ -128,8 +143,6 @@ export default function FeedStream({
         .feed {
           display: flex; flex-direction: column;
           height: 100%;
-          border: .5px solid var(--border);
-          border-radius: var(--radius);
           background: var(--bg-card);
           overflow: hidden;
         }
@@ -186,6 +199,11 @@ export default function FeedStream({
         .row.imp-2 {
           border-left: 2px solid var(--acc-warn);
           background: color-mix(in oklab, var(--acc-warn) 5%, transparent);
+        }
+        .row.fresh { animation: feed-flash ${FRESH_PULSE_MS}ms ease-out; }
+        @keyframes feed-flash {
+          0%   { background: color-mix(in oklab, var(--acc-warn) 22%, transparent); }
+          100% { background: transparent; }
         }
         .row-meta {
           display: flex; align-items: center; gap: 8px;

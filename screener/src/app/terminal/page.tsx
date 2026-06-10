@@ -1,16 +1,22 @@
 "use client";
 
-// /terminal — read-only information terminal.
+// /terminal — read-only information terminal, v2 (full-bleed).
 //
-//   ┌─ header: back link · MacroBar (BTC/ETH/SPX) · HYPE pressure ──────┐
-//   ├───────────────────────────────┬───────────────────────────────────┤
-//   │  FeedStream (Tree News +       │  MoversPanel (top movers, 1h/4h/   │
-//   │  later TG/Twitter), catalysts  │  24h) — the "Radar"                │
-//   └───────────────────────────────┴───────────────────────────────────┘
+//   ┌─ [←] [JOURNAL]  TERMINAL · macro · clock+funding · HYPE pressure ──┐
+//   ├──────────────────────────────────┬──────────────────────────────────┤
+//   │ FEED (Tree News, flash-in)        │ RADAR (OI×price, sparklines,     │
+//   │                                   │   live SSE prices)               │
+//   │                                   ├──────────────────────────────────┤
+//   │                                   │ VARIATIONAL (funding arb)        │
+//   │                                   ├──────────────────────────────────┤
+//   │                                   │ MOVERS (1h/4h/24h)               │
+//   ├──────────────────────────────────┴──────────────────────────────────┤
+//   │ STATUS — prices·snapshots·feed·tree dots, data ages                  │
+//   └──────────────────────────────────────────────────────────────────────┘
 //
-// Symbol selection is shared: click a ticker chip in the feed or a row in
-// the movers rail and both panels focus that symbol. Phase 2 adds OI /
-// funding / liquidation cards to the Radar from /api/derivs.
+// Layout uses the 1px-gap trick: the grid's background is the hairline
+// color and panels are opaque, so dividers render without per-panel
+// borders. Symbol selection cross-filters feed ↔ radar ↔ movers.
 
 import { useState } from "react";
 import Link from "next/link";
@@ -19,6 +25,9 @@ import HypePressureCard from "@/components/HypePressureCard";
 import FeedStream from "@/components/FeedStream";
 import MoversPanel from "@/components/MoversPanel";
 import DerivsRadar from "@/components/DerivsRadar";
+import VariationalPanel from "@/components/VariationalPanel";
+import TermClock from "@/components/TermClock";
+import StatusBar from "@/components/StatusBar";
 
 export default function Terminal() {
   const [symbol, setSymbol] = useState<string | null>(null);
@@ -32,29 +41,33 @@ export default function Terminal() {
           <span className="term-name">TERMINAL</span>
         </div>
         <div className="term-macro"><MacroBar /></div>
-        <HypePressureCard />
+        <TermClock />
+        <div className="term-hype"><HypePressureCard /></div>
       </header>
 
-      <section className="term-grid">
-        <FeedStream symbol={symbol} onPickSymbol={setSymbol} />
-        <div className="term-rail">
-          <DerivsRadar symbol={symbol} onPickSymbol={setSymbol} />
-          <MoversPanel symbol={symbol} onPickSymbol={setSymbol} />
+      <section className="term-frame">
+        <div className="term-grid">
+          <div className="cell feed-cell"><FeedStream symbol={symbol} onPickSymbol={setSymbol} /></div>
+          <div className="term-rail">
+            <div className="cell rail-radar"><DerivsRadar symbol={symbol} onPickSymbol={setSymbol} /></div>
+            <div className="cell rail-var"><VariationalPanel /></div>
+            <div className="cell rail-movers"><MoversPanel symbol={symbol} onPickSymbol={setSymbol} /></div>
+          </div>
         </div>
+        <StatusBar />
       </section>
 
       <style jsx>{`
         .term {
           height: 100vh;
           display: flex; flex-direction: column;
-          padding: 12px;
-          gap: 12px;
+          padding: 10px 12px 12px;
+          gap: 10px;
           background: var(--bg);
         }
         .term-head {
-          display: flex; align-items: center; gap: 16px;
-          flex: 0 0 auto;
-          flex-wrap: wrap;
+          display: flex; align-items: center; gap: 18px;
+          flex: 0 0 auto; flex-wrap: wrap;
         }
         .term-brand {
           display: flex; align-items: baseline; gap: 12px;
@@ -70,22 +83,37 @@ export default function Terminal() {
           color: var(--text-strong);
         }
         .term-macro { flex: 1 1 auto; min-width: 0; overflow: hidden; }
+        .term-hype { flex: 0 0 auto; }
+
+        /* Full-bleed frame: one outer border, hairline internal dividers
+           via gap+background. Panels must keep opaque backgrounds. */
+        .term-frame {
+          flex: 1 1 auto; min-height: 0;
+          display: flex; flex-direction: column;
+          border: .5px solid var(--border);
+          border-radius: var(--radius);
+          overflow: hidden;
+          background: var(--border-soft);
+        }
         .term-grid {
-          flex: 1 1 auto;
+          flex: 1 1 auto; min-height: 0;
           display: grid;
-          grid-template-columns: 1fr 340px;
-          gap: 12px;
-          min-height: 0; /* let children scroll instead of growing the page */
+          grid-template-columns: minmax(0, 1fr) 400px;
+          gap: 1px;
         }
         .term-rail {
           display: grid;
-          grid-template-rows: 3fr 2fr; /* Derivs radar gets the larger share */
-          gap: 12px;
+          grid-template-rows: minmax(0, 7fr) minmax(0, 3fr) minmax(0, 4fr);
+          gap: 1px;
           min-height: 0;
         }
-        @media (max-width: 820px) {
+        .cell { min-height: 0; min-width: 0; background: var(--bg-card); }
+
+        @media (max-width: 900px) {
+          .term { height: auto; }
           .term-grid { grid-template-columns: 1fr; }
-          .term-rail { grid-template-rows: 360px 280px; }
+          .feed-cell { height: 60vh; }
+          .term-rail { grid-template-rows: 420px 180px 260px; }
         }
       `}</style>
     </main>

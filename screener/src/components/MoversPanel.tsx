@@ -98,8 +98,6 @@ export default function MoversPanel({
         .radar {
           display: flex; flex-direction: column;
           height: 100%;
-          border: .5px solid var(--border);
-          border-radius: var(--radius);
           background: var(--bg-card);
           overflow: hidden;
           font-family: var(--font-geist-mono), monospace;
