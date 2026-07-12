@@ -8,6 +8,7 @@ import type { ScreenerRow } from "@/app/api/screener/route";
 import Sparkline from "./Sparkline";
 import RSIGauge from "./RSIGauge";
 import MAGrid from "./MAGrid";
+import { useAttention, attentionTone } from "@/lib/useAttention";
 
 // Dense Bracket-style table view.
 //
@@ -128,6 +129,9 @@ export default function ScreenerTable({
   searchQuery,
 }: Props) {
   const candleTf = mapToCandleTF(timeframe);
+  // Attention radar lookup — drives the small accel chip next to the
+  // symbol so social context is visible while scanning TA columns.
+  const { bySymbol: attention } = useAttention();
   const [screenerRows, setScreenerRows] = useState<ScreenerRow[]>([]);
   const [screenerLoading, setScreenerLoading] = useState(true);
   const [sortKey, setSortKey] = useState<SortKey>("volume24h");
@@ -356,7 +360,24 @@ export default function ScreenerTable({
                       <span className="sec-dot" style={{ background: sectorColor, marginRight: 8 }} />
                       <span className="name-txt">{a.name}</span>
                     </td>
-                    <td className="cell-sym"><span className="sym">{a.symbol}</span></td>
+                    <td className="cell-sym">
+                      <span className="sym">{a.symbol}</span>
+                      {(() => {
+                        const at = attention.get(a.symbol);
+                        // Chip only when the radar classified the symbol —
+                        // an unclassified 1.3× on every row would be noise.
+                        if (!at?.klass) return null;
+                        const tone = attentionTone(at.klass);
+                        return (
+                          <span
+                            className={`attn-chip attn-${tone}`}
+                            title={`Attention: ${at.mentions} mentions, ${at.accel.toFixed(1)}× baseline (${at.klass.replace("_", " ")})`}
+                          >
+                            👁{at.accel.toFixed(1)}×
+                          </span>
+                        );
+                      })()}
+                    </td>
                     <td className="cell-num cell-price">${fmtPrice(a.price)}</td>
                     <td className={`cell-num pct-tri ${toneClass(a.change1h)}`}>{fmtPct(a.change1h, true)}</td>
                     <td className={`cell-num pct-tri ${toneClass(a.change4h)}`}>{fmtPct(a.change4h, true)}</td>
@@ -490,6 +511,26 @@ export default function ScreenerTable({
         :global(.vol-ratio) {
           color: var(--text-mute);
           font-family: var(--font-geist-mono), ui-monospace, monospace;
+        }
+        :global(.attn-chip) {
+          font-size: 9px;
+          padding: 1px 4px;
+          margin-left: 6px;
+          border-radius: 3px;
+          font-family: var(--font-geist-mono), ui-monospace, monospace;
+          vertical-align: middle;
+        }
+        :global(.attn-chip.attn-warn) {
+          color: var(--acc-warn);
+          background: color-mix(in oklab, var(--acc-warn) 14%, transparent);
+        }
+        :global(.attn-chip.attn-up) {
+          color: var(--acc-up);
+          background: color-mix(in oklab, var(--acc-up) 14%, transparent);
+        }
+        :global(.attn-chip.attn-down) {
+          color: var(--acc-down);
+          background: color-mix(in oklab, var(--acc-down) 14%, transparent);
         }
         :global(.vol-ratio-hot) {
           color: var(--acc-warn);

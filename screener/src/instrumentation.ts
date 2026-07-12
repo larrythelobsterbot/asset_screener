@@ -12,6 +12,14 @@
 //   /api/markets → HL WS + prune job + price_snapshots persistence
 //                  (the OI/funding time series the derivs radar reads)
 //   /api/feed    → Tree News websocket + REST backfill poller
+//   /api/social/trending → Elfa mindshare snapshot persistence. The
+//                  route's own 1h cache means 60s pings cost exactly
+//                  1 Elfa credit/hour (~24/day of the 950 soft cap) —
+//                  this is what builds the hourly history the attention
+//                  radar's acceleration baseline needs.
+//   /api/social/momentum → attention-radar recompute (SQLite-only, zero
+//                  credits) + its signal persistence and Telegram
+//                  alerts, so divergences fire with zero visitors.
 // The pings repeat every 60s, which doubles as the keepalive that keeps
 // snapshots flowing with zero visitors.
 
@@ -22,6 +30,8 @@ export async function register() {
   const ping = () => {
     fetch(`${origin}/api/markets`, { cache: "no-store" }).catch(() => {});
     fetch(`${origin}/api/feed?limit=1`, { cache: "no-store" }).catch(() => {});
+    fetch(`${origin}/api/social/trending?tf=24h`, { cache: "no-store" }).catch(() => {});
+    fetch(`${origin}/api/social/momentum`, { cache: "no-store" }).catch(() => {});
   };
 
   // Delay the first ping so `next start` has bound the port before we
@@ -30,6 +40,6 @@ export async function register() {
     ping();
     const t = setInterval(ping, 60_000);
     if (typeof t.unref === "function") t.unref();
-    console.info("[instrumentation] keepalive started (markets+feed @60s)");
+    console.info("[instrumentation] keepalive started (markets+feed+social @60s)");
   }, 10_000);
 }

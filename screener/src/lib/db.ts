@@ -629,6 +629,33 @@ export function latestSocialSnapshots(
   return out;
 }
 
+// Full snapshot series per symbol since `sinceTs`, oldest-first — the
+// substrate for mention-acceleration ranking. Scoped to one time_window
+// (same rule as latestSocialSnapshots: horizons are not interchangeable).
+// No symbol filter: the whole point is discovering tickers we don't
+// track yet, so callers get the full Elfa universe and intersect with
+// the HL universe themselves.
+export function socialSnapshotSeries(
+  timeWindow: string,
+  sinceTs: number,
+): Map<string, Array<{ ts: number; mentions: number }>> {
+  const db = getDb();
+  const rows = db
+    .prepare(
+      `select symbol, ts, mention_count from social_snapshots
+        where time_window = ? and ts >= ?
+        order by ts asc`
+    )
+    .all(timeWindow, sinceTs) as Array<{ symbol: string; ts: number; mention_count: number }>;
+  const out = new Map<string, Array<{ ts: number; mentions: number }>>();
+  for (const r of rows) {
+    const list = out.get(r.symbol) ?? [];
+    list.push({ ts: r.ts, mentions: r.mention_count });
+    out.set(r.symbol, list);
+  }
+  return out;
+}
+
 export function pruneSocialSnapshots(maxAgeMs: number = 30 * 86_400_000): number {
   const db = getDb();
   const cutoff = Date.now() - maxAgeMs;

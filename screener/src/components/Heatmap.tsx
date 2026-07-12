@@ -16,6 +16,7 @@ import { AssetData } from "@/lib/types";
 import { SECTORS, Sector } from "@/config/sectors";
 import { Timeframe } from "./TimeframeToggle";
 import HeatmapTile from "./HeatmapTile";
+import { useAttention, attentionTone } from "@/lib/useAttention";
 
 interface Props {
   assets: AssetData[];
@@ -144,6 +145,8 @@ export default function Heatmap({
 }: Props) {
   const wrapRef = useRef<HTMLDivElement | null>(null);
   const [dim, setDim] = useState({ w: 1200, h: 700 });
+  // Attention radar lookup for the per-tile accel badge.
+  const { bySymbol: attention } = useAttention();
 
   useEffect(() => {
     const upd = () => {
@@ -347,20 +350,28 @@ export default function Heatmap({
                 </span>
               </div>
 
-              {tiles.map((t) => (
-                <HeatmapTile
-                  key={t.asset.symbol}
-                  asset={t.asset}
-                  x={t.x}
-                  y={t.y}
-                  w={t.w}
-                  h={t.h}
-                  change={changeFor(t.asset, timeframe)}
-                  onClick={() => onSelectAsset(t.asset.symbol)}
-                  isHidden={hidden?.has(t.asset.symbol) ?? false}
-                  onToggleHide={onToggleHide}
-                />
-              ))}
+              {tiles.map((t) => {
+                const at = attention.get(t.asset.symbol);
+                return (
+                  <HeatmapTile
+                    key={t.asset.symbol}
+                    asset={t.asset}
+                    x={t.x}
+                    y={t.y}
+                    w={t.w}
+                    h={t.h}
+                    change={changeFor(t.asset, timeframe)}
+                    onClick={() => onSelectAsset(t.asset.symbol)}
+                    isHidden={hidden?.has(t.asset.symbol) ?? false}
+                    onToggleHide={onToggleHide}
+                    attention={
+                      at?.klass
+                        ? { accel: at.accel, tone: attentionTone(at.klass), klass: at.klass }
+                        : null
+                    }
+                  />
+                );
+              })}
             </div>
           ))}
         </div>

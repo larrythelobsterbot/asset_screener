@@ -19,6 +19,10 @@ const STORAGE_KEY = "asset-screener-macro-variant";
 
 interface Props {
   variant?: MacroVariant;
+  // Optional right-side slot rendered after the scrolling macro items —
+  // used by the main page to inline HYPE pressure + attention movers so
+  // the whole market context lives in one band.
+  children?: React.ReactNode;
 }
 
 function fmtPrice(n: number): string {
@@ -39,7 +43,7 @@ function toneClass(n: number | null): string {
   return "tone-flat";
 }
 
-export default function MacroBar({ variant: variantProp }: Props) {
+export default function MacroBar({ variant: variantProp, children }: Props) {
   const [macros, setMacros] = useState<MacroData[]>([]);
   const [variant, setVariant] = useState<MacroVariant>(variantProp ?? "compact");
 
@@ -111,6 +115,7 @@ export default function MacroBar({ variant: variantProp }: Props) {
           );
         })}
       </div>
+      {children}
 
       <style jsx>{`
         .macro-bar {

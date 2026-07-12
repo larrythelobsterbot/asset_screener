@@ -19,6 +19,9 @@ interface Props {
   // button appears in the top-right of the tile on hover.
   isHidden?: boolean;
   onToggleHide?: (symbol: string) => void;
+  // Attention-radar badge (mention accel). Only passed for classified
+  // symbols; suppressed on tiny tiles like the % label.
+  attention?: { accel: number; tone: "warn" | "up" | "down" | null; klass: string } | null;
 }
 
 // Six-step intensity scale matching the design handoff:
@@ -42,6 +45,7 @@ function fmtPct(n: number | null): string {
 export default function HeatmapTile({
   asset, x, y, w, h, change, onClick,
   isHidden = false, onToggleHide,
+  attention = null,
 }: Props) {
   const tiny = w < 50 || h < 36;
   // Suppress the hide button on tiny tiles — it would overlap the sym
@@ -98,6 +102,14 @@ export default function HeatmapTile({
             {fmtPct(change)}
           </span>
         )}
+        {!tiny && attention && (
+          <span
+            className={`tile-attn ${attention.tone ? `ta-${attention.tone}` : ""}`}
+            title={`Attention: ${attention.accel.toFixed(1)}× mention baseline (${attention.klass.replace("_", " ")})`}
+          >
+            👁{attention.accel.toFixed(1)}×
+          </span>
+        )}
       </button>
 
       {showHideBtn && (
@@ -124,6 +136,19 @@ export default function HeatmapTile({
         .heatmap-tile-wrap.tile-hidden:hover {
           opacity: 0.85;
         }
+        .tile-attn {
+          position: absolute;
+          bottom: 4px; right: 5px;
+          font-size: 8px;
+          padding: 0 3px;
+          border-radius: 2px;
+          background: rgba(0, 0, 0, 0.45);
+          font-family: var(--font-geist-mono), ui-monospace, monospace;
+          pointer-events: none;
+        }
+        .tile-attn.ta-warn { color: var(--acc-warn); }
+        .tile-attn.ta-up { color: var(--acc-up); }
+        .tile-attn.ta-down { color: var(--acc-down); }
         .heatmap-tile:hover {
           transform: scale(1.02);
           filter: brightness(1.2);

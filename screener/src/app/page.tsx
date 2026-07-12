@@ -2,11 +2,12 @@
 
 import { useState, useEffect, useMemo } from "react";
 import MacroBar from "@/components/MacroBar";
-import HypePressureCard from "@/components/HypePressureCard";
+import ContextChips from "@/components/ContextChips";
 import TimeframeToggle, { Timeframe } from "@/components/TimeframeToggle";
 import Heatmap from "@/components/Heatmap";
 import ScreenerTable from "@/components/ScreenerTable";
 import SignalScanner from "@/components/SignalScanner";
+import AttentionPanel from "@/components/AttentionPanel";
 import AssetDetailModal from "@/components/AssetDetailModal";
 import { FilterPanel } from "@/components/FilterPanel";
 import { useWatchlist } from "@/lib/useWatchlist";
@@ -109,7 +110,12 @@ export default function Home() {
         />
       )}
 
-      <MacroBar />
+      {/* One context band: macro tickers + HYPE TWAP pressure + top
+          attention movers. The full HypePressureCard lives on /terminal;
+          here it's compressed into an inline chip so nothing floats. */}
+      <MacroBar>
+        <ContextChips onSelectAsset={setSelectedAsset} />
+      </MacroBar>
 
       {/* Backend health banner — only renders when /api/markets has
           failed at least once since the last successful fetch. The
@@ -141,12 +147,6 @@ export default function Home() {
           </span>
         </div>
       )}
-
-      {/* HYPE TWAP buy-pressure card. Always visible — small enough to
-          sit between macro + top bar without crowding either. */}
-      <div style={{ padding: "12px 24px 0", display: "flex", justifyContent: "flex-end" }}>
-        <HypePressureCard />
-      </div>
 
       {/* ── Top bar ─────────────────────────────────────────── */}
       <div className="topbar">
@@ -304,11 +304,15 @@ export default function Home() {
         />
       )}
 
-      <div style={{ padding: "0 24px 24px" }}>
+      {/* Bottom row: confirmation (signals) beside discovery (attention).
+          Two-column on wide screens — the scanner needs the width for its
+          table view; the radar is a fixed-rhythm list. Stacks on narrow. */}
+      <div className="bottom-grid">
         <SignalScanner
           onSelectAsset={setSelectedAsset}
           allowedSymbols={passingSymbols}
         />
+        <AttentionPanel onSelectAsset={setSelectedAsset} />
       </div>
 
       {selectedAsset && (
@@ -319,6 +323,16 @@ export default function Home() {
       )}
 
       <style jsx>{`
+        .bottom-grid {
+          display: grid;
+          grid-template-columns: minmax(0, 2fr) minmax(320px, 1fr);
+          gap: 16px;
+          align-items: start;
+          padding: 0 24px 24px;
+        }
+        @media (max-width: 1100px) {
+          .bottom-grid { grid-template-columns: minmax(0, 1fr); }
+        }
         .topbar {
           display: flex; justify-content: space-between; align-items: center;
           padding: 18px 24px 14px;

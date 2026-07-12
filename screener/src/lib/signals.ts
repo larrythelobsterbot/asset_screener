@@ -41,7 +41,13 @@ export type SignalType =
   | "death_cross"
   | "sector_leader"
   | "sector_laggard"
-  | "social_spike";
+  | "social_spike"
+  // Attention-radar types (src/lib/socialMomentum.ts). Persisted to
+  // signal_events for outcome tracking but deliberately NOT emitted in
+  // the /api/signals stream — they must not perturb conviction scoring
+  // or the alerter until the track record says they earn a weight.
+  | "social_accel"
+  | "social_divergence";
 
 export type SignalDirection = "bullish" | "bearish";
 
@@ -84,6 +90,8 @@ export const SIGNAL_FAMILY: Record<SignalType, SignalFamily> = {
   sector_leader: "structure",
   sector_laggard: "structure",
   social_spike: "social",
+  social_accel: "social",
+  social_divergence: "social",
 };
 
 // In-memory de-bouncer map. Hydrated from SQLite on first use so a PM2

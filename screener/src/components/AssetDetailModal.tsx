@@ -15,6 +15,7 @@ import {
 import Sparkline from "./Sparkline";
 import RSIGauge from "./RSIGauge";
 import MomentumCell from "./MomentumCell";
+import { useAttention, attentionTone } from "@/lib/useAttention";
 import type { ScreenerRow } from "@/app/api/screener/route";
 import type { SocialResponse } from "@/app/api/social/trending/route";
 import type { BtcBinaryResponse } from "@/app/api/btc/binary/route";
@@ -446,6 +447,10 @@ function TopMentionsList({
 
 export default function AssetDetailModal({ symbol, onClose }: Props) {
   const [data, setData] = useState<AssetDetail | null>(null);
+  // Attention radar — mention-history sparkline + accel context for the
+  // Social section. Zero Elfa cost (SQLite-backed route, 5-min cache).
+  const { bySymbol: attentionMap } = useAttention();
+  const attention = attentionMap.get(symbol) ?? null;
   const [screenerRow, setScreenerRow] = useState<ScreenerRow | null>(null);
   const [social, setSocial] = useState<{
     row: { mention_count: number; prev_count: number | null; change_pct: number | null } | null;
@@ -999,12 +1004,64 @@ export default function AssetDetailModal({ symbol, onClose }: Props) {
                 </div>
               </section>
 
-              {/* Social — only render if we have data for this symbol */}
-              {social?.row && (
+              {/* Social — render when either the trending lookup or the
+                  attention radar has data for this symbol */}
+              {(social?.row || attention) && (
                 <section style={{ marginBottom: 24 }}>
-                  <div className="br-label" style={{ marginBottom: 10, paddingBottom: 6, borderBottom: ".5px solid var(--border-soft)" }}>
+                  <div className="br-label" style={{ display: "flex", alignItems: "baseline", gap: 8, marginBottom: 10, paddingBottom: 6, borderBottom: ".5px solid var(--border-soft)" }}>
                     Social · 24h
+                    {attention?.klass && (() => {
+                      const tone = attentionTone(attention.klass);
+                      const color =
+                        tone === "up" ? "var(--acc-up)" :
+                        tone === "down" ? "var(--acc-down)" :
+                        "var(--acc-warn)";
+                      return (
+                        <span style={{
+                          fontSize: 8, fontWeight: 700, letterSpacing: ".08em",
+                          padding: "1px 5px", borderRadius: 3,
+                          color,
+                          background: `color-mix(in oklab, ${color} 14%, transparent)`,
+                          textTransform: "uppercase",
+                        }}>
+                          {attention.klass.replace("_", " ")}
+                        </span>
+                      );
+                    })()}
                   </div>
+
+                  {/* Mention-history chart — hourly 24h-rolling counts
+                      from the attention radar (up to last 24 snapshots). */}
+                  {attention && attention.series.length > 1 && (
+                    <div style={{
+                      display: "flex", alignItems: "center", gap: 14,
+                      padding: "10px 12px", marginBottom: 8,
+                      background: "var(--bg-chip)",
+                      borderRadius: "var(--radius)",
+                      border: ".5px solid var(--border-soft)",
+                    }}>
+                      <span className={attention.accel >= 1 ? "tone-up" : "tone-down"} style={{ display: "flex" }}>
+                        <Sparkline data={attention.series} width={180} height={36} fill />
+                      </span>
+                      <div style={{
+                        display: "flex", flexDirection: "column", gap: 2,
+                        fontFamily: "var(--font-geist-mono), ui-monospace, monospace",
+                        marginLeft: "auto", textAlign: "right",
+                      }}>
+                        <span style={{
+                          fontSize: 16,
+                          color: attention.accel >= 2 ? "var(--acc-warn)" : attention.accel <= 0.7 ? "var(--acc-down)" : "var(--text-strong)",
+                        }}>
+                          {attention.accel.toFixed(1)}×
+                        </span>
+                        <span style={{ fontSize: 9, color: "var(--text-mute)", letterSpacing: ".1em", textTransform: "uppercase" }}>
+                          vs baseline
+                        </span>
+                      </div>
+                    </div>
+                  )}
+
+                  {social?.row && (
                   <div style={{
                     display: "grid",
                     gridTemplateColumns: "repeat(3, 1fr)",
@@ -1037,6 +1094,7 @@ export default function AssetDetailModal({ symbol, onClose }: Props) {
                       tone={social.rank != null && social.rank <= 10 ? "warn" : undefined}
                     />
                   </div>
+                  )}
                 </section>
               )}
 
@@ -1088,6 +1146,13 @@ export default function AssetDetailModal({ symbol, onClose }: Props) {
                       detail={social.row.change_pct != null
                         ? `${social.row.change_pct.toFixed(0)}% mention Δ`
                         : "—"}
+                    />
+                  )}
+                  {attention && (
+                    <ConfRow
+                      label="Attention Accel"
+                      hit={attention.accel >= 2}
+                      detail={`${attention.accel.toFixed(1)}× baseline`}
                     />
                   )}
                 </div>
