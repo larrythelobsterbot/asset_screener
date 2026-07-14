@@ -70,6 +70,24 @@ pm2 logs asset-screener --lines 10 --nostream    # no boot errors
 
 ## Gotchas
 
+- **OI is denominated in COINS, not USD.** USD OI = `openInterest × price`, and the
+  two factors must come from the same instant. Use `snapshotFullAtBounded` (not
+  `snapshotAtBounded` + a separate OI read) for historical OI.
+- **A few markets are quoted fractionally.** HL's SPX trades at index/20000. Prices
+  are scaled up for display, so any `coin_quantity × price` must divide the scale
+  back out via `rawPriceOf()` (`lib/hyperliquid.ts`), and a raw price must never be
+  compared against a stored one — `price_snapshots` holds the SCALED mark, while
+  `candles_cache` holds HL's RAW quote. Getting this wrong reported SPX at $54.2B
+  of OI (real: $2.71M) and would report a -99.99% price delta. `PRICE_DISPLAY_SCALE`
+  is the single source for this; don't reintroduce inline literals.
+- **HIP-3 candles need the dex-prefixed coin.** `candleSnapshot` returns `null` for
+  a bare `SKHX` *and* for the wrong dex (`km:SKHX`); only `xyz:SKHX` resolves. Fetch
+  under the prefixed coin, cache under the bare ticker (`getCandles`' `cacheSymbol`).
+- **Never write a per-row correlated subquery against `price_snapshots`** (13.7M rows
+  and growing). Bound the ts range so SQLite can seek `idx_snap_sym_ts` and loop
+  per-symbol instead — that's a ~1600x difference (7.3s → 4.5ms), and since
+  `better-sqlite3` is synchronous, a slow query blocks every in-flight request.
+  Measure new snapshot queries against the real DB before shipping.
 - `better-sqlite3` is a native module — if Node version changes, run `npm rebuild better-sqlite3`.
 - After any code change, the running PM2 process serves the OLD build until you `npm run build && pm2 restart asset-screener`.
 - Don't commit `data/*.sqlite` or `.env.local` (Supabase keys).

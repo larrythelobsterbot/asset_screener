@@ -1,5 +1,37 @@
 # Build Plan: Flow Metrics for the Asset Screener
 
+> **STATUS — Tasks 1–4 and 5A are BUILT, verified and deployed (2026-07-14).**
+> Only **Task 5B remains, and it is still gated on owner approval.** Keep the
+> rest of this document as the record of intent; the corrections below are what
+> the build actually found, and matter more than the plan where they disagree.
+>
+> Three of this plan's assumptions were wrong. If you are planning follow-on
+> work, start from these, not from the prose further down:
+>
+> 1. **"These queries are cheap" was wrong by ~1600x.** `snapshotAtBounded` ran a
+>    correlated subquery over 13.7M rows (~7.3s), 5x per scan cycle — `/api/markets`
+>    was taking **20–40s per cache miss in production** before this work, and adding
+>    the planned queries would have made it worse. Fixed by bounding the range so
+>    SQLite can seek the index (~4.5ms). Cache-miss is now ~0.6s. **Measure before
+>    assuming a snapshot query is cheap; `better-sqlite3` is synchronous, so a slow
+>    one blocks every request in flight.**
+> 2. **"No special handling needed for SPX" was wrong.** OI is coin-denominated, so
+>    `openInterest × displayPrice` inherited SPX's 20000x display scale and reported
+>    **$54.2B of OI against $2.3M of volume** (real: $2.71M). See `PRICE_DISPLAY_SCALE`
+>    in `lib/hyperliquid.ts` — it is now the single mechanism for that quirk, and
+>    every coin×price multiplication must go through `rawPriceOf()`.
+> 3. **"Equity/commodity candles have weekend gaps" was wrong.** HL's HIP-3 equity
+>    perps trade 24/7 with no gaps (verified), so 7 bars really is 7 calendar days
+>    and the 7D column means the same thing for every market. The plan's "acceptable
+>    drift" caveat was unnecessary — but the check was not.
+>
+> Known nuance, not a defect: the candle path measures 7d from the bar close
+> (23:59 UTC) while the snapshot fallback measures from the exact 7×24h mark.
+> They differ by up to ~4pp on a fast-moving market (oil), <1pp on a calm one.
+> Crypto has always used the candle path; HIP-3 now shares it. If you'd rather
+> 7D% meant a true rolling 7×24h everywhere, that's a deliberate change to
+> crypto's long-standing semantics and needs its own approval.
+
 **Goal:** turn the screener's existing *state* views (current OI, current funding) into *flow* views (OI change, time-averaged funding, turnover, positioning regimes for every market including HIP-3 builder perps). All raw data already exists in `data/screener.db` → `price_snapshots` (minute-cadence mark/OI/funding for all ~320 HL + builder-dex markets, 30-day retention). **No new external data collection is required for Tasks 1–4.** Task 5 adds HL candle fetches for HIP-3 symbols.
 
 Owner-approved on 2026-07-14. This document IS the approval for the `src/lib/` changes it specifies — but ONLY those. Do not change any other signal logic or thresholds (see AGENTS.md).
