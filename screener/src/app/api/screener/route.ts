@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { computeAllIndicators, rsi as computeRsi } from "@/lib/indicators";
 import { getCandlesBulkFromCache, type CandleRow } from "@/lib/db";
-import { HL_PERP_SECTOR_MAP } from "@/config/sectors";
+import { HL_PERP_SECTOR_MAP, builderOnlyTickers } from "@/config/sectors";
 import { cache } from "@/lib/cache";
 
 // Batch indicator endpoint for the screener table view. Returns one row
@@ -52,10 +52,13 @@ export interface ScreenerRow {
   // Same metric the volume_spike signal uses; surfacing as a column means
   // the user can see the ratio even when it's not yet >2× (signal threshold).
   vol_ratio: number | null;
-  // % off the all-time high observed within cached candles. Cached candles
-  // typically cover ~300 bars per interval (so ~300 days on 1d) — this is
-  // an "observed-history" ATH%, not a true ATH%. The UI should label it
-  // accordingly.
+  // % off the all-time high observed within cached candles — an
+  // "observed-history" ATH%, not a true ATH%. The UI should label it
+  // accordingly. We warm up to ~300 bars per interval for every symbol, but
+  // the window is bounded by the market's actual age: the HIP-3 listings are
+  // young (SKHX first traded 2026-02-19), so their ATH% looks back months
+  // where a crypto major's looks back a year. Compare across rows with that
+  // in mind.
   ath_pct: number | null;
   // Last SPARKLINE_BARS closes for a mini-chart. Just numbers, no timestamps
   // — the receiver can render an SVG polyline directly.
@@ -152,16 +155,26 @@ export async function GET(req: NextRequest) {
   const cached = cache.get<ScreenerRow[]>(cacheKey);
   if (cached) return NextResponse.json(cached);
 
-  // Iterate the sector map's symbols — those are the symbols we actually
-  // track for signals/candle population. Symbols outside it (long-tail
-  // perps) won't have cached candles regardless.
+  // Native perps + the HIP-3 board. Both are symbols we populate candles
+  // for (natives via /api/signals + /api/asset, HIP-3 via the 6h warmer in
+  // lib/hip3CandleWarmer). Anything without enough cached candles is
+  // dropped by the BARS_NEEDED gate in buildRow, so listing a symbol here
+  // costs one Map lookup and never fabricates a row.
+  //
+  // HIP-3 markets only have 1d candles warmed, so they appear at tf=1d and
+  // are absent at 1h/4h — which is exactly the documented contract above
+  // (the UI LEFT JOINs this and renders "—").
+  //
+  // This widens the INDICATOR surface only. /api/signals — the one path to
+  // the Telegram alerter — derives its universe from meta.universe (native
+  // perps), which these tickers are not in, so alerting is unaffected.
   //
   // Bulk-read all symbols' candles in ONE SQLite query. Previously this
   // loop did 1 query per symbol (200+ synchronous reads); the bulk
   // variant uses a window function + IN() so the entire scan completes
   // in a single dispatched statement. Per-symbol error handling stays
   // identical — buildRow() is pure and only throws if its math fails.
-  const symbols = Object.keys(HL_PERP_SECTOR_MAP);
+  const symbols = [...Object.keys(HL_PERP_SECTOR_MAP), ...builderOnlyTickers()];
   let candlesBySymbol: Map<string, CandleRow[]>;
   try {
     candlesBySymbol = getCandlesBulkFromCache(symbols, tf, 350);

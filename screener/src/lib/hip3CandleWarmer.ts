@@ -25,7 +25,14 @@ import { getBuilderUniverse, getCandles } from "./hyperliquid";
 const WARM_INTERVAL_MS = 6 * 3_600_000;
 const FIRST_RUN_DELAY_MS = 45_000; // let boot settle; HL WS + first scans first
 const TOP_N = 40;
-const BARS = 60; // >= the 8 the 7d lookback needs, with room for future MAs
+// Match the native crypto set's depth (/api/signals fetches 300 1d bars).
+// /api/screener's ath_pct is "% off the high observed in cached candles", so
+// a shallower window here would quietly make that column mean something
+// different for a HIP-3 row than for a crypto one. HL returns only what
+// exists — these are young listings (SKHX 146 bars, NVDA 245, XYZ100 275 as
+// of 2026-07-14), so none reach ma300 and the MA grid renders those null.
+// That's honest: the history genuinely isn't there yet.
+const BARS = 300;
 
 let started = false;
 let running = false; // re-entrancy guard: a slow cycle must not overlap the next

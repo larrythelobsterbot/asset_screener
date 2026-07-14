@@ -724,6 +724,28 @@ function buildBuilderTickerIndex(): Map<string, Sector> {
   return idx;
 }
 
+// Bare tickers listed ONLY on a builder dex — i.e. the HIP-3 board minus
+// anything a native HL perp already claims. Deduped, native-wins, which is
+// the same precedence /api/markets applies when it merges the universes.
+//
+// Scope note: this is the read-only indicator surface (/api/screener). It is
+// deliberately NOT wired into /api/signals, which builds its universe from
+// meta.universe (native perps only) — so these tickers cannot reach the
+// Telegram alerter. sectors.test.ts pins that separation.
+export function builderOnlyTickers(): string[] {
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const key of Object.keys(HL_BUILDER_PERP_MAP)) {
+    const ticker = key.includes(":") ? key.split(":")[1] : key;
+    if (!ticker) continue;
+    if (HL_PERP_SECTOR_MAP[ticker]) continue; // native wins outright
+    if (seen.has(ticker)) continue;           // first dex wins
+    seen.add(ticker);
+    out.push(ticker);
+  }
+  return out;
+}
+
 // Reverse map: bare ticker → spot stock sector. e.g. "TSLA" → "stocks".
 const _spotStockTickerToSector = new Map<string, Sector>();
 for (const info of Object.values(HL_SPOT_STOCKS)) {
