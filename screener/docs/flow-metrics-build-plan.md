@@ -1,11 +1,21 @@
 # Build Plan: Flow Metrics for the Asset Screener
 
-> **STATUS — Tasks 1–4 and 5A are BUILT, verified and deployed (2026-07-14).**
-> Only **Task 5B remains, and it is still gated on owner approval.** Keep the
-> rest of this document as the record of intent; the corrections below are what
-> the build actually found, and matter more than the plan where they disagree.
+> **STATUS — ALL tasks (1–4, 5A, 5B) are BUILT, verified and deployed (2026-07-14).**
+> 5B was approved by the owner and shipped. Keep the rest of this document as the
+> record of intent; the corrections below are what the build actually found, and
+> matter more than the plan where they disagree.
 >
-> Three of this plan's assumptions were wrong. If you are planning follow-on
+> **5B's "alerting stays OFF behind a flag" was satisfied without a flag.** Every
+> path to Telegram was traced first: `maybeDispatchAlerts` has exactly one caller
+> (`/api/signals`), whose universe is `meta.universe` (NATIVE perps) filtered
+> through `HL_PERP_SECTOR_MAP` — builder tickers are not in `meta.universe` at
+> all — and `/api/screener` is consumed only by client components. A flag would
+> have gated nothing. `sectors.test.ts` pins the real invariant instead: builder-
+> only tickers must stay disjoint from the native sector map, so mapping one
+> natively becomes a deliberate, test-breaking decision. **If you ever want HIP-3
+> alerting, that is a change to `/api/signals`, not a flag flip here.**
+>
+> Four of this plan's assumptions were wrong. If you are planning follow-on
 > work, start from these, not from the prose further down:
 >
 > 1. **"These queries are cheap" was wrong by ~1600x.** `snapshotAtBounded` ran a
@@ -24,6 +34,13 @@
 >    perps trade 24/7 with no gaps (verified), so 7 bars really is 7 calendar days
 >    and the 7D column means the same thing for every market. The plan's "acceptable
 >    drift" caveat was unnecessary — but the check was not.
+> 4. **"min bars ≥ 30 is the only gate that matters" understated it.** The HIP-3
+>    listings are young — SKHX first traded 2026-02-19 (146 bars), NVDA 245,
+>    XYZ100 275 — so `ma300` is null across the whole board and `ema200` resolves
+>    only where history reaches it. The warmer fetches 300 bars (not 60) so
+>    `ath_pct` isn't computed over a shallower window for HIP-3 than for crypto,
+>    which would have made one column mean two different things. **Any new
+>    indicator with a long lookback needs to expect nulls on HIP-3 for months.**
 >
 > Known nuance, not a defect: the candle path measures 7d from the bar close
 > (23:59 UTC) while the snapshot fallback measures from the exact 7×24h mark.
