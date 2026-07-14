@@ -4,6 +4,35 @@ import { fetchWithTimeout } from "./fetchWithTimeout";
 
 const HL_API = "https://api.hyperliquid.xyz/info";
 
+// ── Fractionally-quoted markets ──────────────────────────────────────────
+// HL quotes a few perps at a fixed fraction of the level a human expects:
+// its SPX contract trades at index/20000 (raw markPx ~0.37 for a ~7400
+// index). Anything user-facing scales that up; price_snapshots stores the
+// SCALED mark (verified continuous across the full 30d retention on
+// 2026-07-14), so historical reads are in display units too.
+//
+// The trap this exists to prevent: openInterest is denominated in COINS,
+// so `openInterest × displayPrice` silently inherits the scale factor.
+// That shipped SPX as $54.2B of OI against $2.3M of daily volume — the
+// largest market on the board, 20000x its real $2.7M. Any code pairing a
+// coin quantity with a price must use rawPriceOf().
+//
+// Equally: never mix a raw price with a scaled one. Comparing HL's live
+// markPx against a stored snapshot mark for SPX yields a ~-99.99% delta.
+//
+// Keyed by HL symbol; absent => scale 1 (the overwhelmingly common case).
+export const PRICE_DISPLAY_SCALE: Record<string, number> = { SPX: 20000 };
+
+export function displayScaleOf(symbol: string): number {
+  return PRICE_DISPLAY_SCALE[symbol] ?? 1;
+}
+
+// The price in HL's own quote units — what a coin-denominated size must be
+// multiplied by to get USD. Takes a DISPLAY price (live or historical).
+export function rawPriceOf(symbol: string, displayPrice: number): number {
+  return displayPrice / displayScaleOf(symbol);
+}
+
 // ── Token-bucket rate limiter ────────────────────────────────────────────
 // Hyperliquid's published limit is ~1200 req/min per IP on the /info endpoint.
 // We cap ourselves at 10 req/s sustained with a burst of 20, leaving headroom

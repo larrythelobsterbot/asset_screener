@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server";
-import { getMetaAndCtxs, getBuilderDexData } from "@/lib/hyperliquid";
+import { getMetaAndCtxs, getBuilderDexData, displayScaleOf, rawPriceOf } from "@/lib/hyperliquid";
 import { getMarkets } from "@/lib/coingecko";
 import { HL_PERP_SECTOR_MAP, HL_BUILDER_PERP_MAP, BUILDER_DEXES, SECTORS, Sector } from "@/config/sectors";
 import { AssetData } from "@/lib/types";
@@ -35,32 +35,6 @@ startHlWs();
 // so our in-memory TTL cache is what actually controls freshness.
 export const dynamic = "force-dynamic";
 
-// HL quotes a few markets at a fixed fraction of the level a human expects:
-// its SPX perp trades at index/20000 (raw markPx ~0.37 for a ~7400 index).
-// We scale the price up so the UI shows the familiar number.
-//
-// The catch, and the reason this is a named constant rather than an inline
-// literal: openInterest is denominated in COINS, so `openInterest × price`
-// silently inherits the scale factor. Before this was centralised, SPX
-// reported $54.2B of OI against $2.3M of daily volume — 20000x its real
-// $2.7M, and the largest "market" on the whole board. ANY code multiplying
-// a coin quantity by a display price must divide the scale back out; use
-// rawPriceOf() below.
-//
-// Keyed by HL symbol; absent => scale 1 (the overwhelmingly common case).
-const PRICE_DISPLAY_SCALE: Record<string, number> = { SPX: 20000 };
-
-function displayScaleOf(symbol: string): number {
-  return PRICE_DISPLAY_SCALE[symbol] ?? 1;
-}
-
-// The price in HL's own quote units — what a coin-denominated size must be
-// multiplied by to get USD. Accepts a display price (live or historical:
-// price_snapshots stores the scaled mark, verified continuous over the full
-// 30d retention on 2026-07-14).
-function rawPriceOf(symbol: string, displayPrice: number): number {
-  return displayPrice / displayScaleOf(symbol);
-}
 
 export async function GET() {
   try {
