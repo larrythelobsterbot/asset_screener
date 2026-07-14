@@ -14,6 +14,7 @@ import {
   type PriceSnapshotRow,
 } from "@/lib/db";
 import { startHlWs, getMid } from "@/lib/hyperliquidWs";
+import { startHip3CandleWarmer } from "@/lib/hip3CandleWarmer";
 
 // Kick the periodic prune job once per process. Idempotent — repeated
 // calls are no-ops. This is the natural place to hook startup because
@@ -27,6 +28,10 @@ startPruneJob();
 // route is hit early enough that the connection is established before
 // the first request needs it.
 startHlWs();
+
+// Same idempotent-init pattern: keeps candles_cache warm for the HIP-3
+// board, which no other job fetches candles for. Self-schedules every 6h.
+startHip3CandleWarmer();
 
 // Without this, Next.js 14 App Router prerenders this route at BUILD TIME
 // and the built-in response gets served forever — meaning every price in
@@ -325,12 +330,13 @@ export async function GET() {
       // 7d: 1d candles oldest-first. The last bar is "today (in progress)"
       // so the close 7 bars ago is candles[length - 8]. Need at least 8.
       const dailies = dailiesBySymbol.get(a.symbol) ?? [];
-      // SPX is excluded from the candle path: candles_cache stores HL's raw
-      // quote (index/20000) while a.price is scaled up for display, so the
-      // candle-based change7d comes out ~2,000,000%. The snapshot fallback
-      // below stores the scaled mark and computes it correctly.
-      if (a.symbol !== "SPX" && dailies.length >= 8) {
-        const sevenAgo = dailies[dailies.length - 8].c;
+      // candles_cache holds HL's RAW quote, so a fractionally-quoted market
+      // (SPX) must be scaled into display units before it can be compared
+      // against a.price — unscaled, its change7d reads ~2,000,000%. Scaling
+      // rather than skipping keeps every market on one code path.
+      const candleScale = displayScaleOf(a.symbol);
+      if (dailies.length >= 8) {
+        const sevenAgo = dailies[dailies.length - 8].c * candleScale;
         if (sevenAgo > 0) a.change7d = ((a.price - sevenAgo) / sevenAgo) * 100;
       }
       const prior7d = full7d.get(a.symbol);

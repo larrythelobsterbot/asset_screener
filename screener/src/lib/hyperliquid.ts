@@ -1,6 +1,7 @@
 import { cache } from "./cache";
 import { upsertCandles, getCandlesFromCache, type CandleRow } from "./db";
 import { fetchWithTimeout } from "./fetchWithTimeout";
+import { BUILDER_DEXES } from "@/config/sectors";
 
 const HL_API = "https://api.hyperliquid.xyz/info";
 
@@ -252,19 +253,28 @@ function hlToCandleRows(coin: string, interval: string, candles: HLCandle[]): Ca
   }));
 }
 
+// `cacheSymbol` splits the market's WIRE address from its identity in this
+// app. HIP-3 candles must be fetched under the dex-prefixed coin — HL
+// returns null for a bare "SKHX" and for "km:SKHX" (wrong dex); only
+// "xyz:SKHX" works — but everything downstream (price_snapshots,
+// getCandlesBulkFromCache, the UI) keys off the bare ticker. Passing
+// cacheSymbol="SKHX" with coin="xyz:SKHX" bridges the two, which is what
+// lets /api/markets pick HIP-3 candles up with no change at that call site.
+// Defaults to `coin`, so every existing caller is unaffected.
 export async function getCandles(
   coin: string,
   interval: string = "4h",
-  count: number = 350
+  count: number = 350,
+  cacheSymbol: string = coin,
 ): Promise<HLCandle[]> {
-  const cacheKey = `hl:candles:${coin}:${interval}`;
+  const cacheKey = `hl:candles:${cacheSymbol}:${interval}`;
   const cached = cache.get<HLCandle[]>(cacheKey);
   if (cached && cached.length >= count) return tailSlice(cached, count);
 
   // L2: SQLite. If we have enough rows AND the newest one is fresher than
   // the in-memory TTL, serve from disk + populate the memory cache.
   try {
-    const dbRows = getCandlesFromCache(coin, interval, count);
+    const dbRows = getCandlesFromCache(cacheSymbol, interval, count);
     if (dbRows.length >= count) {
       const newest = dbRows[dbRows.length - 1];
       const age = Date.now() - newest.t - intervalMs(interval);
@@ -275,7 +285,7 @@ export async function getCandles(
       }
     }
   } catch (err) {
-    console.warn(`[hl.getCandles] sqlite read failed for ${coin}:${interval}:`, err);
+    console.warn(`[hl.getCandles] sqlite read failed for ${cacheSymbol}:${interval}:`, err);
   }
 
   // L3: hit HL.
@@ -283,10 +293,13 @@ export async function getCandles(
   const endTime = Date.now();
   const startTime = endTime - count * ms;
 
-  const data = await hlPost<HLCandle[]>({
+  // HL returns null (not []) for an unknown coin — e.g. a HIP-3 ticker
+  // requested without its dex prefix. Normalise so callers and the cache
+  // never see null where an array is typed.
+  const data = (await hlPost<HLCandle[] | null>({
     type: "candleSnapshot",
     req: { coin, interval, startTime, endTime },
-  });
+  })) ?? [];
 
   cache.set(cacheKey, data, HL_CANDLE_TTL_MS);
   // Fire-and-forget persistence — TRULY off the hot path. We use
@@ -297,9 +310,9 @@ export async function getCandles(
   // the request path.
   setImmediate(() => {
     try {
-      upsertCandles(hlToCandleRows(coin, interval, data));
+      upsertCandles(hlToCandleRows(cacheSymbol, interval, data));
     } catch (err) {
-      console.warn(`[hl.getCandles] sqlite write failed for ${coin}:${interval}:`, err);
+      console.warn(`[hl.getCandles] sqlite write failed for ${cacheSymbol}:${interval}:`, err);
     }
   });
   return data;
@@ -406,6 +419,43 @@ export async function getBuilderDexData(dex: string): Promise<{ meta: HLMeta; as
   const result = { meta: data[0] as HLMeta, assetCtxs: data[1] as HLAssetCtx[] };
   cache.set(cacheKey, result, 30_000);
   return result;
+}
+
+// Deduped list of HIP-3 (builder-deployed) markets, ordered by 24h notional.
+//
+// `ticker` is the bare identity everything in this app keys on; `coin` is the
+// dex-prefixed address HL's API demands. Dedup precedence MUST stay in step
+// with /api/markets (native HL wins a ticker outright, then the earliest dex
+// in BUILDER_DEXES) — otherwise a warmed candle series could be filed under a
+// ticker that the markets route resolves to a different venue's contract.
+export async function getBuilderUniverse(): Promise<
+  Array<{ ticker: string; coin: string; dex: string; vol: number }>
+> {
+  const [native, ...results] = await Promise.all([
+    getMetaAndCtxs().catch(() => null),
+    ...BUILDER_DEXES.map((dex) => getBuilderDexData(dex).catch(() => null)),
+  ]);
+  const taken = new Set<string>(native?.meta.universe.map((u) => u.name) ?? []);
+  const out: Array<{ ticker: string; coin: string; dex: string; vol: number }> = [];
+  for (let d = 0; d < BUILDER_DEXES.length; d++) {
+    const dex = BUILDER_DEXES[d];
+    const data = results[d];
+    if (!data) continue;
+    for (let i = 0; i < data.meta.universe.length; i++) {
+      const raw = data.meta.universe[i].name;
+      const ticker = raw.includes(":") ? raw.split(":")[1] : raw;
+      if (taken.has(ticker)) continue;
+      const ctx = data.assetCtxs[i];
+      const vol = parseFloat(ctx?.dayNtlVlm || "0");
+      if (!ctx || !(vol > 0)) continue; // ghost listing
+      taken.add(ticker);
+      // Always address HL with the prefix, even when the universe entry
+      // came back bare — "SKHX" and "km:SKHX" both return null; only
+      // "xyz:SKHX" (its actual dex) resolves.
+      out.push({ ticker, coin: raw.includes(":") ? raw : `${dex}:${ticker}`, dex, vol });
+    }
+  }
+  return out.sort((a, b) => b.vol - a.vol);
 }
 
 export async function getFundingHistory(
