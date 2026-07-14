@@ -32,7 +32,12 @@ type SortKey =
   | "ath_pct"
   | "rsi"
   | "volume24h"
-  | "funding_apr";
+  | "funding_apr"
+  | "oi_usd"
+  | "oi_change_24h"
+  | "oi_change_7d"
+  | "funding_avg_apr"
+  | "vol_oi";
 
 function mapToCandleTF(tf: HeatmapTF): "1h" | "4h" | "1d" {
   if (tf === "1h") return "1h";
@@ -97,6 +102,41 @@ function fmtVol(n: number): string {
   if (n >= 1e6) return `$${(n / 1e6).toFixed(1)}M`;
   if (n >= 1e3) return `$${(n / 1e3).toFixed(0)}K`;
   return `$${n.toFixed(0)}`;
+}
+
+// Signed compact USD, for OI deltas: "+$41.2M" / "-$3.1M".
+// Sign carries the meaning here (money in vs money out), so it's always
+// explicit — unlike fmtVol, which only ever renders magnitudes.
+function fmtSignedVol(n: number | null): string {
+  if (n == null || !Number.isFinite(n)) return "—";
+  if (Math.abs(n) < 1) return "$0";
+  return `${n > 0 ? "+" : "−"}${fmtVol(Math.abs(n))}`;
+}
+
+// Tone for an OI delta. NOTE: this is deliberately NOT price semantics —
+// green means open interest grew (new money took positions), red means it
+// shrank (positions closed). A red-price/green-OI row is the informative
+// combination, not a contradiction: it's fresh shorts pressing a decline.
+// Sub-1% moves are noise on a 24h horizon, so they read flat.
+function oiToneClass(pct: number | null): string {
+  if (pct == null) return "tone-mute";
+  if (pct > 1) return "tone-up";
+  if (pct < -1) return "tone-down";
+  return "tone-flat";
+}
+
+// Turnover: 24h volume / open interest. Below ~0.5x the book is parked
+// (hedges, passive exposure); above ~2x it's being actively churned.
+function fmtVolOi(r: number | null): string {
+  if (r == null || !Number.isFinite(r)) return "—";
+  return `${r.toFixed(1)}×`;
+}
+
+function volOiClass(r: number | null): string {
+  if (r == null) return "tone-mute";
+  if (r >= 2) return "tone-warn";
+  if (r < 0.5) return "tone-mute";
+  return "";
 }
 
 interface Props {
@@ -175,37 +215,36 @@ export default function ScreenerTable({
     arr.sort((a, b) => {
       const sa = screenerBySymbol.get(a.symbol);
       const sb = screenerBySymbol.get(b.symbol);
-      const va = ((): number | string => {
+      // Existing columns keep their -Infinity sentinel (unchanged ordering).
+      // The flow columns return null instead, which sorts last in BOTH
+      // directions — "sort by biggest OI outflow" is a real read, and a
+      // wall of no-data rows at the top would bury it.
+      const pick = (x: AssetData, s: ScreenerRow | undefined): number | string | null => {
         switch (sortKey) {
-          case "name": return a.name;
-          case "price": return a.price;
-          case "change1h": return a.change1h ?? -Infinity;
-          case "change4h": return a.change4h ?? -Infinity;
-          case "change24h": return a.change24h ?? -Infinity;
-          case "change7d": return a.change7d ?? -Infinity;
-          case "vol_ratio": return sa?.vol_ratio ?? -Infinity;
-          case "ath_pct": return sa?.ath_pct ?? -Infinity;
-          case "rsi": return sa?.rsi ?? -Infinity;
-          case "volume24h": return a.volume24h;
-          case "funding_apr": return fundingApr(a.fundingRate) ?? -Infinity;
+          case "name": return x.name;
+          case "price": return x.price;
+          case "change1h": return x.change1h ?? -Infinity;
+          case "change4h": return x.change4h ?? -Infinity;
+          case "change24h": return x.change24h ?? -Infinity;
+          case "change7d": return x.change7d ?? -Infinity;
+          case "vol_ratio": return s?.vol_ratio ?? -Infinity;
+          case "ath_pct": return s?.ath_pct ?? -Infinity;
+          case "rsi": return s?.rsi ?? -Infinity;
+          case "volume24h": return x.volume24h;
+          case "funding_apr": return fundingApr(x.fundingRate) ?? -Infinity;
+          case "oi_usd": return x.oiUsd;
+          case "oi_change_24h": return x.oiChange24hUsd;
+          case "oi_change_7d": return x.oiChange7dUsd;
+          case "funding_avg_apr": return fundingApr(x.fundingAvg24h);
+          case "vol_oi": return x.volOiRatio;
         }
-      })();
-      const vb = ((): number | string => {
-        switch (sortKey) {
-          case "name": return b.name;
-          case "price": return b.price;
-          case "change1h": return b.change1h ?? -Infinity;
-          case "change4h": return b.change4h ?? -Infinity;
-          case "change24h": return b.change24h ?? -Infinity;
-          case "change7d": return b.change7d ?? -Infinity;
-          case "vol_ratio": return sb?.vol_ratio ?? -Infinity;
-          case "ath_pct": return sb?.ath_pct ?? -Infinity;
-          case "rsi": return sb?.rsi ?? -Infinity;
-          case "volume24h": return b.volume24h;
-          case "funding_apr": return fundingApr(b.fundingRate) ?? -Infinity;
-        }
-      })();
+      };
+      const va = pick(a, sa);
+      const vb = pick(b, sb);
       const dir = sortAsc ? 1 : -1;
+      if (va == null && vb == null) return 0;
+      if (va == null) return 1;
+      if (vb == null) return -1;
       if (typeof va === "string" && typeof vb === "string") {
         return va.localeCompare(vb) * dir;
       }
@@ -331,8 +370,13 @@ export default function ScreenerTable({
                 <th style={thRight} onClick={() => handleSort("change24h")}>24H%{arr("change24h")}</th>
                 <th style={thRight} onClick={() => handleSort("change7d")}>7D%{arr("change7d")}</th>
                 <th style={thRight} onClick={() => handleSort("volume24h")}>Vol 24H{arr("volume24h")}</th>
+                <th style={thRight} onClick={() => handleSort("oi_usd")} title="Open interest in USD (HL reports it in coins; this is coins × price).">OI{arr("oi_usd")}</th>
+                <th style={thRight} onClick={() => handleSort("oi_change_24h")} title="Change in USD open interest vs 24h ago. Green = OI grew (new money took positions), red = OI shrank (positions closed). This is money flow, not price direction.">ΔOI 24H{arr("oi_change_24h")}</th>
+                <th style={thRight} onClick={() => handleSort("oi_change_7d")} title="Change in USD open interest vs 7d ago.">ΔOI 7D{arr("oi_change_7d")}</th>
+                <th style={thRight} onClick={() => handleSort("vol_oi")} title="24h volume ÷ open interest. <0.5× = parked positions, >2× = actively churned.">Vol/OI{arr("vol_oi")}</th>
                 <th style={thRight} onClick={() => handleSort("vol_ratio")}>Vol Ratio{arr("vol_ratio")}</th>
-                <th style={thRight} onClick={() => handleSort("funding_apr")} title="Annualized funding APR. + = longs pay shorts.">Fund APR{arr("funding_apr")}</th>
+                <th style={thRight} onClick={() => handleSort("funding_apr")} title="Annualized funding APR, current print. + = longs pay shorts.">Fund APR{arr("funding_apr")}</th>
+                <th style={thRight} onClick={() => handleSort("funding_avg_apr")} title="Mean funding APR over the last 24h. The spot print whipsaws on thin markets; this is what separates structural crowding from noise.">F̄ 24H{arr("funding_avg_apr")}</th>
                 <th style={thRight} onClick={() => handleSort("ath_pct")}>ATH%{arr("ath_pct")}</th>
                 <th style={{ ...thStyle, width: 100, textAlign: "center" }}>Spark</th>
                 <th style={thStyle} onClick={() => handleSort("rsi")}>RSI{arr("rsi")}</th>
@@ -385,6 +429,42 @@ export default function ScreenerTable({
                     <td className={`cell-num pct-tri ${toneClass(a.change7d)}`}>{fmtPct(a.change7d)}</td>
                     <td className="cell-num cell-vol">{fmtVol(a.volume24h)}</td>
                     <td className="cell-num">
+                      {a.oiUsd == null
+                        ? <span style={{ color: "var(--text-mute)" }}>—</span>
+                        : fmtVol(a.oiUsd)}
+                    </td>
+                    <td className={`cell-num ${oiToneClass(a.oiChange24hPct)}`}>
+                      {a.oiChange24hUsd == null ? (
+                        <span style={{ color: "var(--text-mute)" }}>—</span>
+                      ) : (
+                        <>
+                          {fmtSignedVol(a.oiChange24hUsd)}
+                          {a.oiChange24hPct != null && (
+                            <span style={{ fontSize: 9, color: "var(--text-mute)", marginLeft: 4 }}>
+                              {fmtPct(a.oiChange24hPct)}
+                            </span>
+                          )}
+                        </>
+                      )}
+                    </td>
+                    <td className={`cell-num ${oiToneClass(a.oiChange7dPct)}`}>
+                      {a.oiChange7dUsd == null ? (
+                        <span style={{ color: "var(--text-mute)" }}>—</span>
+                      ) : (
+                        <>
+                          {fmtSignedVol(a.oiChange7dUsd)}
+                          {a.oiChange7dPct != null && (
+                            <span style={{ fontSize: 9, color: "var(--text-mute)", marginLeft: 4 }}>
+                              {fmtPct(a.oiChange7dPct)}
+                            </span>
+                          )}
+                        </>
+                      )}
+                    </td>
+                    <td className={`cell-num ${volOiClass(a.volOiRatio)}`}>
+                      {fmtVolOi(a.volOiRatio)}
+                    </td>
+                    <td className="cell-num">
                       {sr?.vol_ratio != null ? (
                         <span className={sr.vol_ratio >= 2 ? "vol-ratio-hot" : "vol-ratio"}>
                           {sr.vol_ratio.toFixed(2)}×
@@ -395,6 +475,9 @@ export default function ScreenerTable({
                     </td>
                     <td className={`cell-num ${fundingClass(fundingApr(a.fundingRate))}`}>
                       {fmtFundingApr(fundingApr(a.fundingRate))}
+                    </td>
+                    <td className={`cell-num ${fundingClass(fundingApr(a.fundingAvg24h))}`}>
+                      {fmtFundingApr(fundingApr(a.fundingAvg24h))}
                     </td>
                     <td className={`cell-num ${
                       sr?.ath_pct == null ? "tone-mute" :

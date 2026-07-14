@@ -42,6 +42,32 @@ function fmtPct(n: number | null): string {
   return `${sign}${n.toFixed(2)}%`;
 }
 
+// Flow context for the hover tooltip. The tile itself stays price-only —
+// these are the two numbers that say whether a move has money behind it,
+// but there's no room to render them without breaking the treemap.
+function fmtCompactUsd(n: number): string {
+  const abs = Math.abs(n);
+  if (abs >= 1e9) return `$${(abs / 1e9).toFixed(2)}B`;
+  if (abs >= 1e6) return `$${(abs / 1e6).toFixed(1)}M`;
+  if (abs >= 1e3) return `$${(abs / 1e3).toFixed(0)}K`;
+  return `$${abs.toFixed(0)}`;
+}
+
+function flowTooltip(asset: Props["asset"]): string {
+  const lines: string[] = [];
+  if (asset.oiUsd != null) lines.push(`OI ${fmtCompactUsd(asset.oiUsd)}`);
+  if (asset.oiChange24hUsd != null) {
+    const sign = asset.oiChange24hUsd > 0 ? "+" : "−";
+    const pct = asset.oiChange24hPct != null ? ` (${fmtPct(asset.oiChange24hPct)})` : "";
+    lines.push(`ΔOI 24h ${sign}${fmtCompactUsd(asset.oiChange24hUsd)}${pct}`);
+  }
+  if (asset.fundingAvg24h != null) {
+    const apr = asset.fundingAvg24h * 8760 * 100;
+    lines.push(`Mean funding 24h ${apr > 0 ? "+" : ""}${apr.toFixed(1)}% APR`);
+  }
+  return lines.length ? `\n${lines.join("\n")}` : "";
+}
+
 export default function HeatmapTile({
   asset, x, y, w, h, change, onClick,
   isHidden = false, onToggleHide,
@@ -89,7 +115,7 @@ export default function HeatmapTile({
           overflow: "hidden",
           boxSizing: "border-box",
         }}
-        title={`${asset.name} (${asset.symbol}) — ${fmtPct(change)}`}
+        title={`${asset.name} (${asset.symbol}) — ${fmtPct(change)}${flowTooltip(asset)}`}
       >
         <span className="sym" style={{ fontSize: 12, fontWeight: 600 }}>
           {asset.symbol}
