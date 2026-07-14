@@ -8,6 +8,8 @@ import {
   insertPriceSnapshots,
   startPruneJob,
   snapshotAtBounded,
+  snapshotFullAtBounded,
+  avgFundingSince,
   getCandlesBulkFromCache,
   type PriceSnapshotRow,
 } from "@/lib/db";
@@ -32,6 +34,33 @@ startHlWs();
 // step. `force-dynamic` makes Next.js evaluate the handler on every request
 // so our in-memory TTL cache is what actually controls freshness.
 export const dynamic = "force-dynamic";
+
+// HL quotes a few markets at a fixed fraction of the level a human expects:
+// its SPX perp trades at index/20000 (raw markPx ~0.37 for a ~7400 index).
+// We scale the price up so the UI shows the familiar number.
+//
+// The catch, and the reason this is a named constant rather than an inline
+// literal: openInterest is denominated in COINS, so `openInterest × price`
+// silently inherits the scale factor. Before this was centralised, SPX
+// reported $54.2B of OI against $2.3M of daily volume — 20000x its real
+// $2.7M, and the largest "market" on the whole board. ANY code multiplying
+// a coin quantity by a display price must divide the scale back out; use
+// rawPriceOf() below.
+//
+// Keyed by HL symbol; absent => scale 1 (the overwhelmingly common case).
+const PRICE_DISPLAY_SCALE: Record<string, number> = { SPX: 20000 };
+
+function displayScaleOf(symbol: string): number {
+  return PRICE_DISPLAY_SCALE[symbol] ?? 1;
+}
+
+// The price in HL's own quote units — what a coin-denominated size must be
+// multiplied by to get USD. Accepts a display price (live or historical:
+// price_snapshots stores the scaled mark, verified continuous over the full
+// 30d retention on 2026-07-14).
+function rawPriceOf(symbol: string, displayPrice: number): number {
+  return displayPrice / displayScaleOf(symbol);
+}
 
 export async function GET() {
   try {
@@ -68,14 +97,11 @@ export async function GET() {
       // or the value is too stale, in which case we keep the REST mark.
       const liveMid = getMid(name);
       if (liveMid != null && liveMid > 0) price = liveMid;
-      // HL's SPX perp is quoted as (index / 20000) — i.e. 1 unit = 1/20000th
-      // of the S&P 500 index level — so we scale back up here to display a
-      // number that matches the familiar SPX value (e.g. 5200, not 0.26).
-      // This multiplier is specific to HL's SPX contract; if they ever list
-      // an un-scaled SPX market (or rename this one) this branch becomes
-      // wrong and should be revisited. Applies to both REST and WS sources
-      // since allMids returns the same un-scaled value.
-      if (name === "SPX") { price *= 20000; prevDayPx *= 20000; }
+      // Scale fractionally-quoted markets up to their familiar level (see
+      // PRICE_DISPLAY_SCALE). Applies to both REST and WS sources since
+      // allMids returns the same un-scaled value.
+      const scale = displayScaleOf(name);
+      if (scale !== 1) { price *= scale; prevDayPx *= scale; }
       const change24h = prevDayPx > 0 ? ((price - prevDayPx) / prevDayPx) * 100 : null;
       const volume = parseFloat(ctx.dayNtlVlm || "0");
 
@@ -116,6 +142,14 @@ export async function GET() {
         markPrice: price,
         oraclePrice: parseFloat(ctx.oraclePx || "0"),
         source: "hyperliquid",
+        // Flow metrics are filled by the backfill pass below.
+        oiUsd: null,
+        oiChange24hUsd: null,
+        oiChange24hPct: null,
+        oiChange7dUsd: null,
+        oiChange7dPct: null,
+        fundingAvg24h: null,
+        volOiRatio: null,
       });
       snapshotRows.push({
         symbol: name,
@@ -194,6 +228,14 @@ export async function GET() {
           markPrice: price,
           oraclePrice: parseFloat(ctx.oraclePx || "0"),
           source: "hyperliquid",
+          // Flow metrics are filled by the backfill pass below.
+          oiUsd: null,
+          oiChange24hUsd: null,
+          oiChange24hPct: null,
+          oiChange7dUsd: null,
+          oiChange7dPct: null,
+          fundingAvg24h: null,
+          volOiRatio: null,
         });
         snapshotRows.push({
           symbol: ticker,
@@ -240,14 +282,27 @@ export async function GET() {
         markPrice: null,
         oraclePrice: null,
         source: "coingecko",
+        // CoinGecko rows have no perp context — no OI, no funding. These
+        // stay null permanently; the UI renders them as em-dashes.
+        oiUsd: null,
+        oiChange24hUsd: null,
+        oiChange24hPct: null,
+        oiChange7dUsd: null,
+        oiChange7dPct: null,
+        fundingAvg24h: null,
+        volOiRatio: null,
       });
     }
 
-    // ── Backfill 1h / 4h / 7d change% from local data ─────────────────
+    // ── Backfill change% + flow metrics from local data ───────────────
     // No new HL calls. Sources:
     //   change1h  ← price_snapshots taken 1h ago by a prior scan
     //   change4h  ← price_snapshots taken 4h ago
-    //   change7d  ← 1d candles from candles_cache (populated by signals + modal)
+    //   change7d  ← 1d candles from candles_cache (populated by signals + modal),
+    //               falling back to price_snapshots taken ~7d ago for symbols
+    //               with no cached candles (all HIP-3 builder perps)
+    //   OI deltas ← price_snapshots at 24h / 7d ago (oi × mark, same row)
+    //   fundingAvg24h ← mean of funding over the last 24h of snapshots
     // Missing data leaves the field at null — same as before this change.
     // On cold start (first hour after first deploy) all three will be null
     // for everything; the heatmap already handles null gracefully.
@@ -260,6 +315,20 @@ export async function GET() {
     // garbage % change to the UI.
     const snap1h = snapshotAtBounded(snapshotTs - 3_600_000, 30 * 60_000, hlSymbolsForBackfill);
     const snap4h = snapshotAtBounded(snapshotTs - 4 * 3_600_000, 60 * 60_000, hlSymbolsForBackfill);
+    // 24h/7d full snapshots — mark + oi + funding from a single row each,
+    // which is what makes the USD OI delta trustworthy: OI is denominated
+    // in coins, so it must be multiplied by the mark *from its own row*.
+    // Pairing a historical OI with today's price would report a delta that
+    // is really just the price move.
+    //
+    // The 7d row also serves as the change7d fallback for symbols without
+    // cached 1d candles (the signals job only warms candles_cache for the
+    // crypto screener set, so HIP-3 builder perps never get a candle-based
+    // 7d). ±6h tolerance is ≈3.6% of the horizon — generous, but still
+    // rejects stale rows after downtime.
+    const full24h = snapshotFullAtBounded(snapshotTs - 24 * 3_600_000, 2 * 3_600_000, hlSymbolsForBackfill);
+    const full7d = snapshotFullAtBounded(snapshotTs - 7 * 86_400_000, 6 * 3_600_000, hlSymbolsForBackfill);
+    const avgFunding24h = avgFundingSince(snapshotTs - 24 * 3_600_000, hlSymbolsForBackfill);
     // Bulk-read 1d candles for ALL HL symbols in one SQLite query.
     // Previously this was 230+ synchronous queries inside the asset
     // loop — measurably blocking the event loop on each markets scan.
@@ -282,10 +351,45 @@ export async function GET() {
       // 7d: 1d candles oldest-first. The last bar is "today (in progress)"
       // so the close 7 bars ago is candles[length - 8]. Need at least 8.
       const dailies = dailiesBySymbol.get(a.symbol) ?? [];
-      if (dailies.length >= 8) {
+      // SPX is excluded from the candle path: candles_cache stores HL's raw
+      // quote (index/20000) while a.price is scaled up for display, so the
+      // candle-based change7d comes out ~2,000,000%. The snapshot fallback
+      // below stores the scaled mark and computes it correctly.
+      if (a.symbol !== "SPX" && dailies.length >= 8) {
         const sevenAgo = dailies[dailies.length - 8].c;
         if (sevenAgo > 0) a.change7d = ((a.price - sevenAgo) / sevenAgo) * 100;
       }
+      const prior7d = full7d.get(a.symbol);
+      if (a.change7d == null) {
+        const p7 = prior7d?.mark;
+        if (p7 && p7 > 0) a.change7d = ((a.price - p7) / p7) * 100;
+      }
+
+      // ── Flow metrics ────────────────────────────────────────────────
+      // openInterest is in coins, so it pairs with the RAW quote price, not
+      // the display price — see PRICE_DISPLAY_SCALE.
+      const oiUsd =
+        a.openInterest != null && a.openInterest > 0
+          ? a.openInterest * rawPriceOf(a.symbol, a.price)
+          : null;
+      a.oiUsd = oiUsd;
+      if (oiUsd != null && oiUsd > 0) {
+        a.volOiRatio = a.volume24h / oiUsd;
+        for (const [prior, usdKey, pctKey] of [
+          [full24h.get(a.symbol), "oiChange24hUsd", "oiChange24hPct"],
+          [prior7d, "oiChange7dUsd", "oiChange7dPct"],
+        ] as const) {
+          // Both factors from the same historical row — see the comment on
+          // the snapshotFullAtBounded calls above.
+          if (prior?.oi == null || prior.mark <= 0) continue;
+          const priorOiUsd = prior.oi * rawPriceOf(a.symbol, prior.mark);
+          if (priorOiUsd <= 0) continue;
+          a[usdKey] = oiUsd - priorOiUsd;
+          a[pctKey] = ((oiUsd - priorOiUsd) / priorOiUsd) * 100;
+        }
+      }
+      const fAvg = avgFunding24h.get(a.symbol);
+      if (fAvg != null) a.fundingAvg24h = fAvg;
     }
 
     cache.set("api:markets", assets, 30_000);
