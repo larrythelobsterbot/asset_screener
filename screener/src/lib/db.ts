@@ -34,7 +34,7 @@ export function getDb(): Database.Database {
 // Versioned via PRAGMA user_version so we can add schema changes without
 // blowing away the local file. Bump VERSION and add a step.
 
-const VERSION = 9;
+const VERSION = 10;
 
 function migrate(db: Database.Database): void {
   const current = db.pragma("user_version", { simple: true }) as number;
@@ -49,6 +49,7 @@ function migrate(db: Database.Database): void {
   if (current < 7) db.exec(MIGRATION_V7);
   if (current < 8) db.exec(MIGRATION_V8);
   if (current < 9) db.exec(MIGRATION_V9);
+  if (current < 10) db.exec(MIGRATION_V10);
   db.pragma(`user_version = ${VERSION}`);
 }
 
@@ -301,6 +302,22 @@ const MIGRATION_V9 = `
     create index if not exists idx_derivs_ts on derivs_snapshots(ts desc);
   `;
 
+// Covering index for the 24h mean-funding read (avgFundingSince). That
+// query averages ~1440 rows per symbol; with only idx_snap_sym_ts it has
+// to fetch each row from the 13.7M-row table to reach `funding`, costing
+// ~490ms per call — which, because better-sqlite3 is synchronous, blocks
+// the event loop for every request in flight. Carrying `funding` in the
+// index lets SQLite answer from the index alone: ~27ms.
+//
+// Cost: ~300MB on a ~1.6GB db, and one extra index to maintain on the
+// ~320-row/60s snapshot insert (negligible). Building it over existing
+// history takes ~11s, which lands once, on the first getDb() after this
+// migration ships.
+const MIGRATION_V10 = `
+    create index if not exists idx_snap_sym_ts_funding
+      on price_snapshots(symbol, ts, funding);
+  `;
+
 // ── price_snapshots ─────────────────────────────────────────────────────
 
 export interface PriceSnapshotRow {
@@ -390,26 +407,124 @@ export function snapshotAt(targetTs: number, symbols?: string[]): Map<string, { 
   return out;
 }
 
-// Wrapper around snapshotAt that drops rows where the matched ts is more
-// than `maxAgeMs` away from `targetTs`. This is what callers should use
-// when they want "the price at horizon N ago" — without this guard, a
-// gap in snapshots can hand back a row from much earlier and produce
-// nonsense % changes downstream.
+// Returns, per symbol, the mark from the newest snapshot in the window
+// [targetTs - maxAgeMs, targetTs] — i.e. "the price at horizon N ago",
+// with a guard so that a gap in snapshots yields *nothing* rather than a
+// row from much earlier that would produce a nonsense % change.
 //
-// `maxAgeMs` is symmetric around the target: a 1h-ago target with
-// 30min tolerance accepts rows from 30-90min ago. Defaults to half the
-// distance from now to target, capped at 30 minutes.
+// Symbols with no row in the window are absent from the result; callers
+// must treat absence as "no data" (null), not as zero.
+//
+// Implementation note — do NOT reintroduce the `snapshotAt`-then-filter
+// shape this replaced. That ran a correlated subquery per candidate row
+// over the whole 13.7M-row table (~7.3s per call, ×5 calls per scan
+// cycle => the 20-40s /api/markets cache-miss latency measured on
+// 2026-07-14). Pushing both bounds into the WHERE lets SQLite walk
+// idx_snap_sym_ts backwards from targetTs and stop at the first hit:
+// ~4.5ms for all ~340 symbols, a ~1600x improvement.
+//
+// The results are identical to the old shape, not merely similar: the
+// newest row <= targetTs is the closest one from below, so if it falls
+// outside the tolerance then every older row does too — which is exactly
+// what bounding the range below at targetTs - maxAgeMs expresses.
 export function snapshotAtBounded(
   targetTs: number,
   maxAgeMs: number,
   symbols?: string[],
 ): Map<string, number> {
-  const rows = snapshotAt(targetTs, symbols);
   const out = new Map<string, number>();
-  for (const [sym, row] of rows) {
-    if (Math.abs(targetTs - row.ts) <= maxAgeMs) {
-      out.set(sym, row.mark);
-    }
+  const db = getDb();
+  const list = symbols && symbols.length > 0 ? symbols : distinctSnapshotSymbols();
+  const stmt = db.prepare(
+    `select mark from price_snapshots
+      where symbol = ? and ts <= ? and ts >= ?
+      order by ts desc limit 1`
+  );
+  for (const sym of list) {
+    const row = stmt.get(sym, targetTs, targetTs - maxAgeMs) as { mark: number } | undefined;
+    if (row) out.set(sym, row.mark);
+  }
+  return out;
+}
+
+// Distinct symbol list for the unfiltered variants of the bounded
+// lookups. Callers in the app always pass an explicit symbol list; this
+// is the fallback so `symbols`-less calls keep working.
+function distinctSnapshotSymbols(): string[] {
+  const db = getDb();
+  const rows = db.prepare(`select distinct symbol from price_snapshots`).all() as Array<{ symbol: string }>;
+  return rows.map((r) => r.symbol);
+}
+
+// Like snapshotAtBounded, but returns the full market context from the
+// matched row rather than just the mark.
+//
+// Why this exists: OI is denominated in COINS, so USD OI at time T is
+// oi(T) × mark(T) — the oi and the mark MUST come from the same row. A
+// caller that combined snapshotAtBounded's historical mark with a
+// separately-fetched oi (or vice versa) would silently compute a delta
+// against a price/OI pair that never coexisted. Returning the row whole
+// makes that mistake hard to write.
+//
+// Same bounding semantics as snapshotAtBounded: rows whose actual ts is
+// more than maxAgeMs from targetTs are dropped rather than returned, so
+// a snapshot gap yields null downstream instead of a garbage delta.
+export interface SnapshotPointFull {
+  mark: number;
+  oi: number | null;
+  funding: number | null;
+  ts: number;
+}
+
+export function snapshotFullAtBounded(
+  targetTs: number,
+  maxAgeMs: number,
+  symbols?: string[],
+): Map<string, SnapshotPointFull> {
+  const out = new Map<string, SnapshotPointFull>();
+  const db = getDb();
+  const list = symbols && symbols.length > 0 ? symbols : distinctSnapshotSymbols();
+  // Same bounded-seek shape as snapshotAtBounded — see the perf note there
+  // before changing it.
+  const stmt = db.prepare(
+    `select mark, oi, funding, ts from price_snapshots
+      where symbol = ? and ts <= ? and ts >= ?
+      order by ts desc limit 1`
+  );
+  for (const sym of list) {
+    const row = stmt.get(sym, targetTs, targetTs - maxAgeMs) as
+      | { mark: number; oi: number | null; funding: number | null; ts: number }
+      | undefined;
+    if (row) out.set(sym, row);
+  }
+  return out;
+}
+
+// Mean hourly funding rate per symbol since a timestamp.
+//
+// The instantaneous funding print is noisy on the HIP-3 builder markets —
+// SKHX swung from +454% to -215% APR inside an hour on 2026-07-14. A
+// screener column reading the spot value therefore flags "crowded" on what
+// is really a two-sided battleground. The 24h mean separates structural
+// positioning (persistently one-signed) from that noise.
+//
+// Rows with null funding are excluded by SQL avg(), so the mean is over
+// observations we actually have rather than treating gaps as zero.
+// Per-symbol seeks rather than one `group by symbol` over the window: the
+// grouped form can't use idx_snap_sym_ts_funding as a covering index for
+// the aggregate and lands at ~470ms, while looping indexed seeks stays at
+// ~27ms for all ~340 symbols. Same reasoning as snapshotAtBounded.
+export function avgFundingSince(sinceTs: number, symbols?: string[]): Map<string, number> {
+  const out = new Map<string, number>();
+  const db = getDb();
+  const list = symbols && symbols.length > 0 ? symbols : distinctSnapshotSymbols();
+  const stmt = db.prepare(
+    `select avg(funding) as f from price_snapshots
+      where symbol = ? and ts >= ? and funding is not null`
+  );
+  for (const sym of list) {
+    const row = stmt.get(sym, sinceTs) as { f: number | null } | undefined;
+    if (row?.f != null && Number.isFinite(row.f)) out.set(sym, row.f);
   }
   return out;
 }
