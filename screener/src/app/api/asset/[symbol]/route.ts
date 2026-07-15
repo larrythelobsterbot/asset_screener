@@ -2,7 +2,7 @@ import { NextResponse } from "next/server";
 import { getCandles, getFundingHistory, getMetaAndCtxs, getAllMids } from "@/lib/hyperliquid";
 import { computeAllIndicators } from "@/lib/indicators";
 import { detectSignals } from "@/lib/signals";
-import { HL_SPOT_STOCKS, HL_PERP_SECTOR_MAP, HL_BUILDER_PERP_MAP } from "@/config/sectors";
+import { HL_SPOT_STOCKS, HL_PERP_SECTOR_MAP, HL_BUILDER_PERP_MAP, BUILDER_DEXES } from "@/config/sectors";
 import { getMid } from "@/lib/hyperliquidWs";
 
 // Reverse lookup: ticker → @name for spot stocks
@@ -55,11 +55,33 @@ export async function GET(
     const spotName = TICKER_TO_SPOT[symbol]; // e.g. "@287" for META
     const isSpotStock = !!spotName;
 
-    // For spot stocks, use the @N name for candles; otherwise try as perp directly
-    const candleCoin = isSpotStock ? spotName : symbol;
+    // Candle coin resolution, in precedence order:
+    //   spot stock → its "@N" name; native perp → bare symbol;
+    //   builder-only ticker → its dex-prefixed coin ("xyz:SKHX").
+    // HL's candleSnapshot returns null for a bare builder ticker, so
+    // without the prefix every HIP-3 modal open fired a guaranteed-null
+    // HL call and rendered empty. Dex search order mirrors the dedup
+    // precedence everywhere else (earliest dex in BUILDER_DEXES wins).
+    // cacheSymbol stays the bare ticker so these 4h bars land in
+    // candles_cache under the same key the rest of the app reads.
+    let candleCoin = isSpotStock ? spotName : symbol;
+    // Cache key: bare ticker ONLY for the builder branch. Spot stocks keep
+    // caching under their "@N" name — a ticker like META names BOTH a spot
+    // stock and a builder perp, and filing two venues' series under one
+    // (symbol, interval) key would let them overwrite each other.
+    let candleCacheAs = candleCoin;
+    if (!isSpotStock && !HL_PERP_SECTOR_MAP[symbol] && BUILDER_TICKERS.has(symbol)) {
+      for (const dex of BUILDER_DEXES) {
+        if (HL_BUILDER_PERP_MAP[`${dex}:${symbol}`]) {
+          candleCoin = `${dex}:${symbol}`;
+          candleCacheAs = symbol;
+          break;
+        }
+      }
+    }
 
     const [candles, funding, hlData, allMids] = await Promise.all([
-      getCandles(candleCoin, "4h", 350).catch(() => []),
+      getCandles(candleCoin, "4h", 350, candleCacheAs).catch(() => []),
       !isSpotStock ? getFundingHistory(symbol).catch(() => []) : Promise.resolve([]),
       getMetaAndCtxs(),
       getAllMids(),

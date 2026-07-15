@@ -435,7 +435,20 @@ export async function getBuilderUniverse(): Promise<
     getMetaAndCtxs().catch(() => null),
     ...BUILDER_DEXES.map((dex) => getBuilderDexData(dex).catch(() => null)),
   ]);
-  const taken = new Set<string>(native?.meta.universe.map((u) => u.name) ?? []);
+  // If the NATIVE universe is unavailable, abort the whole cycle instead of
+  // proceeding with an empty `taken` set. Several builder dexes list tickers
+  // that native HL owns (km:BTC, km:TSLA, ...); with `taken` empty those
+  // would be emitted as builder-owned, and the candle warmer would then
+  // upsert the BUILDER venue's candles over the native symbol's rows in
+  // candles_cache (on conflict do update) — silently corrupting RSI/ATH/7d
+  // for native markets long after the transient fetch failure healed.
+  // A skipped warm cycle costs nothing (next one is 6h away, data ages
+  // gracefully); cross-venue corruption is persistent.
+  if (!native) {
+    console.warn("[builder-universe] native meta unavailable — skipping cycle (dedup would be unsafe)");
+    return [];
+  }
+  const taken = new Set<string>(native.meta.universe.map((u) => u.name));
   const out: Array<{ ticker: string; coin: string; dex: string; vol: number }> = [];
   for (let d = 0; d < BUILDER_DEXES.length; d++) {
     const dex = BUILDER_DEXES[d];

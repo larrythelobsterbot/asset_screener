@@ -84,8 +84,13 @@ export async function computeHlDerivs(): Promise<HlDerivsItem[]> {
     const base = meta.universe[i].name;
     const ctx = assetCtxs[i];
     const vol = parseFloat(ctx?.dayNtlVlm || "0");
-    if (!ctx || !(vol > 0)) continue;
+    // A native perp claims its ticker OUTRIGHT, even when quiet (zero
+    // volume) — matching /api/markets, which keeps natives on price alone.
+    // Claiming only on vol > 0 let a builder dex take the ticker of a
+    // quiet native listing, and its deltas would then be computed against
+    // snapshot history recorded from the NATIVE contract.
     seen.add(base);
+    if (!ctx || !(vol > 0)) continue;
     candidates.push({ base, ctx, vol, dex: null, sector: HL_PERP_SECTOR_MAP[base]?.sector ?? null });
   }
 

@@ -1,4 +1,5 @@
 import { startHlWs, getMid, getAllLiveMids } from "@/lib/hyperliquidWs";
+import { displayScaleOf } from "@/lib/hyperliquid";
 
 // Server-Sent Events: live HL mids pushed to the browser ~1/s.
 //
@@ -13,7 +14,11 @@ startHlWs();
 export const dynamic = "force-dynamic";
 
 const PUSH_INTERVAL_MS = 1000;
-const MAX_SYMBOLS = 80;
+// Must comfortably exceed the derivs radar's TOP_N (100): useLiveMids sends
+// the radar's full base list sorted alphabetically, and this slice silently
+// drops the tail. At the old cap of 80 the last ~20 symbols (SPX, SUI, TAO,
+// XRP, ZEC, ...) never received a live mid and sat on the 20s-stale price.
+const MAX_SYMBOLS = 150;
 const STALE_MS = 60_000;
 
 export async function GET(req: Request) {
@@ -30,16 +35,23 @@ export async function GET(req: Request) {
   const stream = new ReadableStream({
     start(controller) {
       const send = () => {
+        // Mids leave this route in DISPLAY units. The WS map holds HL's raw
+        // quotes, but every consumer of this stream (radar, tiles) renders
+        // prices scaled for display — serving SPX raw here would make the
+        // row flip between ~0.37 (live mid) and ~7400 (REST refresh).
+        // NOTE: /api/markets does NOT read this route — it calls getMid()
+        // directly and applies the scale itself; scaling in the WS map
+        // instead would double-scale that path.
         const payload: Record<string, number> = {};
         if (symbols.length > 0) {
           for (const s of symbols) {
             const m = getMid(s);
-            if (m != null) payload[s] = m;
+            if (m != null) payload[s] = m * displayScaleOf(s);
           }
         } else {
           const now = Date.now();
           for (const [sym, e] of getAllLiveMids()) {
-            if (now - e.ts < STALE_MS) payload[sym] = e.mid;
+            if (now - e.ts < STALE_MS) payload[sym] = e.mid * displayScaleOf(sym);
           }
         }
         try {

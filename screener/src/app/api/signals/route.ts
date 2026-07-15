@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server";
-import { getMetaAndCtxs, getCandles, getFundingHistory } from "@/lib/hyperliquid";
+import { getMetaAndCtxs, getCandles, getFundingHistory, displayScaleOf } from "@/lib/hyperliquid";
 import { HL_PERP_SECTOR_MAP } from "@/config/sectors";
 import {
   detectSignals,
@@ -73,14 +73,20 @@ export async function GET() {
     const snap4hAgo = snapshotAtBounded(now - 4 * 3_600_000, TOLERANCE_4H, allMappedSymbols);
 
     const fullSnapshot: SectorMultiSnapshot[] = mappedUniverse.map(({ u, ctx }) => {
-      const price = parseFloat(ctx.markPx || "0");
-      const prevDay = parseFloat(ctx.prevDayPx || "0");
+      // Snapshot marks are stored in DISPLAY units (/api/markets scales
+      // before insertPriceSnapshots), so the live side of the 1h/4h
+      // comparison must be display-scaled too. Without this, SPX (raw
+      // ~0.37 vs stored ~7400) computed change1h/4h ≈ -99.995% every
+      // scan and fed it to the indices sector stats — the old comment
+      // below claimed off-scale rows were skipped, but the guard only
+      // ever checked p > 0. The 24h ratio is scale-invariant (both
+      // factors scaled identically), so this changes nothing for it.
+      const scale = displayScaleOf(u.name);
+      const price = parseFloat(ctx.markPx || "0") * scale;
+      const prevDay = parseFloat(ctx.prevDayPx || "0") * scale;
       const change24h = prevDay > 0 ? ((price - prevDay) / prevDay) * 100 : null;
       const p1h = snap1hAgo.get(u.name);
       const p4h = snap4hAgo.get(u.name);
-      // Sanity: if the historical price is zero or wildly off-scale
-      // (e.g. SPX scaling artefact persisted), skip it — better no signal
-      // than a misleading one.
       const change1h = p1h && p1h > 0 ? ((price - p1h) / p1h) * 100 : null;
       const change4h = p4h && p4h > 0 ? ((price - p4h) / p4h) * 100 : null;
       return {

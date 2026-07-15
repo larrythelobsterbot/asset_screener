@@ -173,13 +173,18 @@ export async function GET() {
           });
           continue;
         }
-        seenBuilderSymbols.add(ticker);
 
         const ctx = dexCtxs[i];
         const price = parseFloat(ctx.markPx || "0");
         const volume = parseFloat(ctx.dayNtlVlm || "0");
-        // Skip ghost listings — no price or no trading activity
+        // Skip ghost listings — no price or no trading activity. The ghost
+        // must NOT claim the ticker (claim happens below, after this gate):
+        // an earlier dex's dead listing would otherwise suppress a later
+        // dex's live market entirely — no table row, no snapshots — while
+        // hlDerivs/getBuilderUniverse (which ghost-check before claiming)
+        // would still show it in the radar and warm its candles.
         if (price === 0 || volume === 0) continue;
+        seenBuilderSymbols.add(ticker);
 
         const prevDayPx = parseFloat(ctx.prevDayPx || "0");
         const change24h = prevDayPx > 0 ? ((price - prevDayPx) / prevDayPx) * 100 : null;
@@ -311,16 +316,26 @@ export async function GET() {
     // Bulk-read 1d candles for ALL HL symbols in one SQLite query.
     // Previously this was 230+ synchronous queries inside the asset
     // loop — measurably blocking the event loop on each markets scan.
-    let dailiesBySymbol = new Map<string, Array<{ c: number }>>();
+    let dailiesBySymbol = new Map<string, Array<{ c: number; t: number }>>();
     try {
       const bulk = getCandlesBulkFromCache(hlSymbolsForBackfill, "1d", 10);
-      // We only need the close field downstream; preserve the shape.
+      // Keep close + open-timestamp; t drives the freshness gate below.
       dailiesBySymbol = new Map(
-        [...bulk.entries()].map(([s, rows]) => [s, rows.map((r) => ({ c: r.c }))])
+        [...bulk.entries()].map(([s, rows]) => [s, rows.map((r) => ({ c: r.c, t: r.t }))])
       );
     } catch (err) {
       console.warn(`[markets] bulk 1d candle read failed:`, err);
     }
+    // A candle series only supports "7 bars ago == 7 days ago" if its newest
+    // bar is TODAY's (in progress). Native symbols always qualify (/api/
+    // signals refetches them every scan); HIP-3 candles refresh on the
+    // warmer's 6h cadence, so between UTC midnight and the next warm their
+    // newest bar is yesterday's and bars[len-8] is 8 days back — and a
+    // market that leaves the warmer's set would drift a day further stale
+    // every day, forever, while still passing a bare length check. Stale
+    // series fall through to the snapshot fallback, which is exact-horizon
+    // and staleness-bounded by construction.
+    const todayUtcMidnight = snapshotTs - (snapshotTs % 86_400_000);
     for (const a of assets) {
       if (a.source !== "hyperliquid") continue;
       const p1 = snap1h.get(a.symbol);
@@ -335,7 +350,7 @@ export async function GET() {
       // against a.price — unscaled, its change7d reads ~2,000,000%. Scaling
       // rather than skipping keeps every market on one code path.
       const candleScale = displayScaleOf(a.symbol);
-      if (dailies.length >= 8) {
+      if (dailies.length >= 8 && dailies[dailies.length - 1].t >= todayUtcMidnight) {
         const sevenAgo = dailies[dailies.length - 8].c * candleScale;
         if (sevenAgo > 0) a.change7d = ((a.price - sevenAgo) / sevenAgo) * 100;
       }
@@ -348,13 +363,17 @@ export async function GET() {
       // ── Flow metrics ────────────────────────────────────────────────
       // openInterest is in coins, so it pairs with the RAW quote price, not
       // the display price — see PRICE_DISPLAY_SCALE.
+      // OI of exactly 0 is REAL data (full deleverage), not missing data:
+      // it must produce oiUsd = 0 and a −100% delta against a prior book,
+      // not em-dashes. Only a null openInterest (CoinGecko rows) is no-data.
       const oiUsd =
-        a.openInterest != null && a.openInterest > 0
+        a.openInterest != null
           ? a.openInterest * rawPriceOf(a.symbol, a.price)
           : null;
       a.oiUsd = oiUsd;
-      if (oiUsd != null && oiUsd > 0) {
-        a.volOiRatio = a.volume24h / oiUsd;
+      if (oiUsd != null) {
+        // Turnover is undefined at zero OI (division), not zero.
+        a.volOiRatio = oiUsd > 0 ? a.volume24h / oiUsd : null;
         for (const [prior, usdKey, pctKey] of [
           [full24h.get(a.symbol), "oiChange24hUsd", "oiChange24hPct"],
           [prior7d, "oiChange7dUsd", "oiChange7dPct"],

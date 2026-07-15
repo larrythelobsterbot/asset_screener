@@ -24,7 +24,19 @@ import { getBuilderUniverse, getCandles } from "./hyperliquid";
 
 const WARM_INTERVAL_MS = 6 * 3_600_000;
 const FIRST_RUN_DELAY_MS = 45_000; // let boot settle; HL WS + first scans first
-const TOP_N = 40;
+// Warm EVERY live builder market (capped defensively), not a top-N-by-volume
+// cut. /api/screener lists all mapped HIP-3 tickers, so a top-40 cut meant a
+// market that slipped down the volume ranks kept serving progressively
+// staler RSI/ATH/sparklines with nothing marking them stale — for a
+// leveraged trader, indistinguishable from live data. ~100 fetches per 6h
+// cycle is still negligible against the 10 req/s limiter.
+const MAX_MARKETS = 100;
+// Pace fetches so a cycle never drains the shared token bucket. Unpaced,
+// 100 back-to-back calls empty the burst allowance and queue user-facing
+// HL calls (asset modal, signals scan) behind the warmer for several
+// seconds. 300ms spacing stays under the 10 req/s refill; the cycle
+// stretching to ~30s is irrelevant at a 6h cadence.
+const FETCH_SPACING_MS = 300;
 // Match the native crypto set's depth (/api/signals fetches 300 1d bars).
 // /api/screener's ath_pct is "% off the high observed in cached candles", so
 // a shallower window here would quietly make that column mean something
@@ -45,7 +57,7 @@ async function runOnce(): Promise<void> {
   let empty = 0;
   let failed = 0;
   try {
-    const universe = (await getBuilderUniverse()).slice(0, TOP_N);
+    const universe = (await getBuilderUniverse()).slice(0, MAX_MARKETS);
     for (const { ticker, coin } of universe) {
       try {
         // Fetch under the dex-prefixed coin, file under the bare ticker.
@@ -56,6 +68,7 @@ async function runOnce(): Promise<void> {
         // One dead market must not abort the sweep.
         failed++;
       }
+      await new Promise((r) => setTimeout(r, FETCH_SPACING_MS));
     }
     console.info(
       `[hip3-warmer] ${ok} warmed, ${empty} empty, ${failed} failed ` +
