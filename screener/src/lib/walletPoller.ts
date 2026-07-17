@@ -50,7 +50,11 @@ async function runOnce(): Promise<void> {
   const cycleTs = t0;
   let ok = 0;
   let failed = 0;
+  let skippedRows = 0;
   const rows: WalletPositionRow[] = [];
+  // Failures collected here and only counted as strikes AFTER the sweep,
+  // and only when the cycle wasn't systemic — see below.
+  const failedThisCycle: Array<{ address: string; err: unknown }> = [];
 
   try {
     const wallets = trackedWallets();
@@ -74,13 +78,33 @@ async function runOnce(): Promise<void> {
         } else {
           for (const ap of state.assetPositions) {
             const p = ap.position;
+            const szi = parseFloat(p.szi);
+            const positionValue = parseFloat(p.positionValue);
+            // Quarantine malformed rows instead of letting them into the
+            // batch: szi/position_value are NOT NULL columns, and binding
+            // NaN converts to NULL in better-sqlite3 — one bad field would
+            // violate the constraint and roll back the ENTIRE cycle's
+            // transaction, silently losing every wallet's positions for
+            // that 15-min window. (The shape validation upstream only
+            // guarantees these are strings, not that they parse.)
+            if (!Number.isFinite(szi) || !Number.isFinite(positionValue)) {
+              skippedRows++;
+              continue;
+            }
             rows.push({
               address: wallet.address,
               ts: cycleTs,
-              coin: p.coin,
-              szi: parseFloat(p.szi),
+              // Bare-ticker identity, same as everywhere else in the app:
+              // if HL ever reports a builder-dex position under its
+              // prefixed coin id ("xyz:SKHX"), the crowd-OI join in
+              // smartFlow.ts and the terminal panel both key on the bare
+              // ticker — an unstripped prefix would silently null the
+              // divergence read for exactly the HIP-3 markets. No-op for
+              // native coins.
+              coin: p.coin.includes(":") ? p.coin.split(":")[1] : p.coin,
+              szi,
               entry_px: p.entryPx != null ? parseFloat(p.entryPx) : null,
-              position_value: parseFloat(p.positionValue),
+              position_value: positionValue,
               unrealized_pnl: parseFloat(p.unrealizedPnl),
               leverage: p.leverage?.value ?? null,
               account_value: Number.isFinite(accountValue) ? accountValue : null,
@@ -91,29 +115,49 @@ async function runOnce(): Promise<void> {
         consecutiveFailures.delete(wallet.address);
       } catch (err) {
         failed++;
-        const failures = (consecutiveFailures.get(wallet.address) ?? 0) + 1;
-        consecutiveFailures.set(wallet.address, failures);
+        failedThisCycle.push({ address: wallet.address, err });
+      }
+      await new Promise((r) => setTimeout(r, FETCH_SPACING_MS));
+    }
+
+    // Strike accounting happens after the sweep so a SYSTEMIC failure (HL
+    // outage, network partition) can be told apart from individually dead
+    // wallets. During an outage every wallet fails in lockstep; counting
+    // those as strikes would demote the ENTIRE cohort within ~75 minutes
+    // (5 cycles × 15 min), and the only restoration path is the next
+    // daily 00:20 ingest cron — up to 24h of a dead panel from one bad
+    // hour at HL. If the majority of the sweep failed, the problem is not
+    // the wallets: skip strikes entirely for this cycle.
+    const systemic = failed > ok;
+    if (systemic && failed > 0) {
+      console.warn(
+        `[wallet-poller] ${failed}/${ok + failed} wallets failed — treating as systemic (HL outage?), no strikes counted`
+      );
+    } else {
+      for (const { address, err } of failedThisCycle) {
+        const failures = (consecutiveFailures.get(address) ?? 0) + 1;
+        consecutiveFailures.set(address, failures);
         if (failures >= MAX_CONSECUTIVE_FAILURES) {
           try {
-            demoteWallet(wallet.address);
+            demoteWallet(address);
             console.warn(
-              `[wallet-poller] demoted ${wallet.address} after ${failures} consecutive failures:`,
+              `[wallet-poller] demoted ${address} after ${failures} consecutive failures:`,
               err
             );
           } catch (demoteErr) {
-            console.warn(`[wallet-poller] failed to demote ${wallet.address}:`, demoteErr);
+            console.warn(`[wallet-poller] failed to demote ${address}:`, demoteErr);
           }
-          consecutiveFailures.delete(wallet.address);
+          consecutiveFailures.delete(address);
         }
       }
-      await new Promise((r) => setTimeout(r, FETCH_SPACING_MS));
     }
 
     insertWalletPositions(rows);
 
     console.info(
-      `[wallet-poller] ${ok} ok, ${failed} failed, ${rows.length} positions, ` +
-        `${((Date.now() - t0) / 1000).toFixed(0)}s`
+      `[wallet-poller] ${ok} ok, ${failed} failed, ${rows.length} positions` +
+        (skippedRows > 0 ? `, ${skippedRows} malformed rows skipped` : "") +
+        `, ${((Date.now() - t0) / 1000).toFixed(0)}s`
     );
   } catch (err) {
     console.warn("[wallet-poller] cycle failed:", err);

@@ -34,7 +34,7 @@ export function getDb(): Database.Database {
 // Versioned via PRAGMA user_version so we can add schema changes without
 // blowing away the local file. Bump VERSION and add a step.
 
-const VERSION = 11;
+const VERSION = 12;
 
 function migrate(db: Database.Database): void {
   const current = db.pragma("user_version", { simple: true }) as number;
@@ -51,6 +51,7 @@ function migrate(db: Database.Database): void {
   if (current < 9) db.exec(MIGRATION_V9);
   if (current < 10) db.exec(MIGRATION_V10);
   if (current < 11) db.exec(MIGRATION_V11);
+  if (current < 12) db.exec(MIGRATION_V12);
   db.pragma(`user_version = ${VERSION}`);
 }
 
@@ -334,6 +335,17 @@ const MIGRATION_V10 = `
 // each wallet's newest row in a bounded ts window, same shape as
 // snapshotAtBounded); idx_wpos_coin_ts serves per-coin time-series reads
 // (the /api/smart-flow route, the Task 6 validation report).
+// V12 — ts-only index for pruneWalletPositions' range delete. Neither V11
+// composite (coin,ts / address,ts) has ts as the leading column, so the
+// daily prune's `delete ... where ts < ?` was a full table scan — the
+// exact synchronous-scan-blocks-everything gotcha idx_snap_ts exists to
+// prevent on price_snapshots, reintroduced on a table projected to hold
+// ~3.5M rows at steady state. Added while the table is still small so the
+// index build is instant.
+const MIGRATION_V12 = `
+    create index if not exists idx_wpos_ts on wallet_positions(ts);
+  `;
+
 const MIGRATION_V11 = `
     create table if not exists wallet_registry (
       address        text primary key,
@@ -1441,7 +1453,21 @@ export interface SmartFlowPoint {
 // Magnitude is always position_value (HL's own USD figure) — never
 // szi × price; see AGENTS.md's SPX OI gotcha for why that multiplication
 // is unsafe in general.
-export function smartFlowAt(targetTs: number, maxAgeMs: number): Map<string, SmartFlowPoint> {
+// `addresses` scopes the aggregation to a known wallet set. Callers that
+// compute DELTAS (the smart-flow route diffs three points in time) must
+// pass the SAME list for every point — otherwise the delta conflates
+// position changes with cohort-composition changes (a wallet demoted an
+// hour ago would count in the -24h total but not the NOW total, showing
+// a phantom outflow). It is also the perf-critical path: the fallback
+// distinctWalletAddresses() scans all-history DISTINCT — including
+// demoted wallets whose rows haven't aged out, a set that only grows —
+// measured at ~600ms of blocked event loop per route call at projected
+// scale, vs ~14ms when scoped to the tracked registry.
+export function smartFlowAt(
+  targetTs: number,
+  maxAgeMs: number,
+  addresses?: string[],
+): Map<string, SmartFlowPoint> {
   const out = new Map<string, SmartFlowPoint>();
   const walletsByCoin = new Map<string, Set<string>>();
   const db = getDb();
@@ -1456,7 +1482,8 @@ export function smartFlowAt(targetTs: number, maxAgeMs: number): Map<string, Sma
       where address = ? and ts = ?`
   );
 
-  for (const address of distinctWalletAddresses()) {
+  const walletList = addresses ?? distinctWalletAddresses();
+  for (const address of walletList) {
     const latest = latestTsStmt.get(address, targetTs, targetTs - maxAgeMs) as
       | { ts: number }
       | undefined;

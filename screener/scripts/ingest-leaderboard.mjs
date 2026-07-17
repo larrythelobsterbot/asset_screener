@@ -32,6 +32,7 @@
 // (MIGRATION_V11) changes, update UPSERT_SQL here to match, by hand.
 
 import Database from "better-sqlite3";
+import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -142,6 +143,29 @@ const UPSERT_SQL = `insert into wallet_registry
 
 async function main() {
   const t0 = Date.now();
+
+  // ── Single-instance lock ─────────────────────────────────────────────
+  // Two overlapping runs (pm2 cron + a manual invocation) would each fetch
+  // their own leaderboard snapshot and race their upsert/untrack writes —
+  // final is_tracked state would depend on commit order, silently. An
+  // exclusive-create lockfile makes the second run a no-op. A stale lock
+  // (crashed run) is ignored after 30 minutes — a full run takes ~3.
+  const LOCK_PATH = path.join(SCREENER_DIR, "data", ".ingest-leaderboard.lock");
+  try {
+    const st = fs.statSync(LOCK_PATH);
+    if (Date.now() - st.mtimeMs < 30 * 60_000) {
+      warn(`another ingest appears to be running (lock ${LOCK_PATH} is fresh) — exiting`);
+      process.exit(0);
+    }
+    fs.unlinkSync(LOCK_PATH); // stale lock from a crashed run
+  } catch {
+    /* no lock — proceed */
+  }
+  fs.writeFileSync(LOCK_PATH, String(process.pid), { flag: "w" });
+  const releaseLock = () => {
+    try { fs.unlinkSync(LOCK_PATH); } catch { /* already gone */ }
+  };
+  process.on("exit", releaseLock);
 
   // ── Open the existing DB. Never migrate — that's the main app's job. ──
   let db;
