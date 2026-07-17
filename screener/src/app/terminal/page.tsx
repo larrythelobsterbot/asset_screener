@@ -25,6 +25,7 @@ import HypePressureCard from "@/components/HypePressureCard";
 import FeedStream from "@/components/FeedStream";
 import MoversPanel from "@/components/MoversPanel";
 import DerivsRadar from "@/components/DerivsRadar";
+import SmartFlowPanel from "@/components/SmartFlowPanel";
 import VariationalPanel from "@/components/VariationalPanel";
 import TermClock from "@/components/TermClock";
 import StatusBar from "@/components/StatusBar";
@@ -50,6 +51,7 @@ export default function Terminal() {
           <div className="cell feed-cell"><FeedStream symbol={symbol} onPickSymbol={setSymbol} /></div>
           <div className="term-rail">
             <div className="cell rail-radar"><DerivsRadar symbol={symbol} onPickSymbol={setSymbol} /></div>
+            <div className="cell rail-smartflow"><SmartFlowPanel /></div>
             <div className="cell rail-var"><VariationalPanel /></div>
             <div className="cell rail-movers"><MoversPanel symbol={symbol} onPickSymbol={setSymbol} /></div>
           </div>
@@ -103,7 +105,7 @@ export default function Terminal() {
         }
         .term-rail {
           display: grid;
-          grid-template-rows: minmax(0, 7fr) minmax(0, 3fr) minmax(0, 4fr);
+          grid-template-rows: minmax(0, 5fr) minmax(0, 3fr) minmax(0, 3fr) minmax(0, 4fr);
           gap: 1px;
           min-height: 0;
         }
@@ -113,7 +115,7 @@ export default function Terminal() {
           .term { height: auto; }
           .term-grid { grid-template-columns: 1fr; }
           .feed-cell { height: 60vh; }
-          .term-rail { grid-template-rows: 420px 180px 260px; }
+          .term-rail { grid-template-rows: 380px 200px 180px 260px; }
         }
       `}</style>
     </main>
