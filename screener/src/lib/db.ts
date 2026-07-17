@@ -34,7 +34,7 @@ export function getDb(): Database.Database {
 // Versioned via PRAGMA user_version so we can add schema changes without
 // blowing away the local file. Bump VERSION and add a step.
 
-const VERSION = 10;
+const VERSION = 11;
 
 function migrate(db: Database.Database): void {
   const current = db.pragma("user_version", { simple: true }) as number;
@@ -50,6 +50,7 @@ function migrate(db: Database.Database): void {
   if (current < 8) db.exec(MIGRATION_V8);
   if (current < 9) db.exec(MIGRATION_V9);
   if (current < 10) db.exec(MIGRATION_V10);
+  if (current < 11) db.exec(MIGRATION_V11);
   db.pragma(`user_version = ${VERSION}`);
 }
 
@@ -316,6 +317,43 @@ const MIGRATION_V9 = `
 const MIGRATION_V10 = `
     create index if not exists idx_snap_sym_ts_funding
       on price_snapshots(symbol, ts, funding);
+  `;
+
+// V11 — smart-money flow (Phase 1, wallet cohorts). wallet_registry is the
+// curated cohort (~300 "sharp" + up to 100 "whale" wallets, selected by the
+// leaderboard-ingest script and re-validated for liveness — see
+// smart-flow-build-plan.md). wallet_positions is the poller's raw feed: one
+// row per open position per snapshot, PLUS one heartbeat row (coin='',
+// szi=0) when a wallet has zero open positions, so "cohort went flat" is
+// distinguishable from "poller didn't run".
+//
+// Volume math: 300 wallets × 96 snapshots/day (15-min cadence) × ~4
+// positions/wallet ≈ 115k rows/day, ~3.5M rows at the 30-day retention this
+// table gets (pruneWalletPositions) — about a quarter of price_snapshots'
+// steady-state size. idx_wpos_addr_ts is what smartFlowAt seeks on (find
+// each wallet's newest row in a bounded ts window, same shape as
+// snapshotAtBounded); idx_wpos_coin_ts serves per-coin time-series reads
+// (the /api/smart-flow route, the Task 6 validation report).
+const MIGRATION_V11 = `
+    create table if not exists wallet_registry (
+      address        text primary key,
+      cohort         text not null,          -- 'sharp' | 'whale'
+      account_value  real,                   -- LIVE value from validation, not leaderboard
+      pnl_week       real, pnl_month real, roi_month real,
+      turnover_month real,                   -- vlm_month / account_value (MM screen input)
+      is_tracked     integer not null default 1,
+      first_seen     integer not null, last_validated integer not null
+    );
+    create table if not exists wallet_positions (
+      address  text not null,  ts integer not null,
+      coin     text not null,
+      szi      real not null,                -- signed, coins
+      entry_px real,  position_value real,   -- USD, unsigned (HL's own figure)
+      unrealized_pnl real,  leverage real,
+      account_value  real                    -- marginSummary at snapshot time
+    );
+    create index if not exists idx_wpos_coin_ts on wallet_positions(coin, ts);
+    create index if not exists idx_wpos_addr_ts on wallet_positions(address, ts);
   `;
 
 // ── price_snapshots ─────────────────────────────────────────────────────
@@ -1056,9 +1094,10 @@ export function startPruneJob(): void {
       const bb = pruneBtcBinarySnapshots();
       const fe = pruneFeedEvents();
       const dv = pruneDerivsSnapshots();
-      if (sp > 0 || cp > 0 || ss > 0 || hp > 0 || bb > 0 || fe > 0 || dv > 0) {
+      const wp = pruneWalletPositions();
+      if (sp > 0 || cp > 0 || ss > 0 || hp > 0 || bb > 0 || fe > 0 || dv > 0 || wp > 0) {
         console.info(
-          `[db] pruned ${sp} price, ${cp} candle, ${ss} social, ${hp} hype-pressure, ${bb} btc-binary, ${fe} feed, ${dv} derivs snapshots`
+          `[db] pruned ${sp} price, ${cp} candle, ${ss} social, ${hp} hype-pressure, ${bb} btc-binary, ${fe} feed, ${dv} derivs, ${wp} wallet-position snapshots`
         );
       }
     } catch (err) {
@@ -1266,4 +1305,190 @@ export function pruneDerivsSnapshots(maxAgeMs: number = 7 * 86_400_000): number 
   const db = getDb();
   const cutoff = Date.now() - maxAgeMs;
   return db.prepare(`delete from derivs_snapshots where ts < ?`).run(cutoff).changes;
+}
+
+// ── wallet_registry / wallet_positions (smart-money flow, v11) ──────────
+
+export interface WalletRegistryRow {
+  address: string;
+  cohort: string;                 // 'sharp' | 'whale'
+  account_value: number | null;   // LIVE value from validation, not the leaderboard
+  pnl_week: number | null;
+  pnl_month: number | null;
+  roi_month: number | null;
+  turnover_month: number | null;
+  is_tracked: number;             // 0 | 1
+  first_seen: number;
+  last_validated: number;
+}
+
+// Upsert cohort rows keyed on address. `first_seen` is preserved across
+// re-ingests (min of existing/incoming) so a wallet that drops out and
+// re-qualifies later doesn't look freshly discovered; every other column
+// reflects the latest ingest run, including is_tracked — this is how the
+// ingest script "untracks" a wallet that fell out of the cohort without
+// deleting its history.
+export function upsertWalletRegistry(rows: WalletRegistryRow[]): void {
+  if (rows.length === 0) return;
+  const db = getDb();
+  const stmt = db.prepare(
+    `insert into wallet_registry
+       (address, cohort, account_value, pnl_week, pnl_month, roi_month,
+        turnover_month, is_tracked, first_seen, last_validated)
+     values (@address, @cohort, @account_value, @pnl_week, @pnl_month, @roi_month,
+        @turnover_month, @is_tracked, @first_seen, @last_validated)
+     on conflict(address) do update set
+       cohort = excluded.cohort,
+       account_value = excluded.account_value,
+       pnl_week = excluded.pnl_week,
+       pnl_month = excluded.pnl_month,
+       roi_month = excluded.roi_month,
+       turnover_month = excluded.turnover_month,
+       is_tracked = excluded.is_tracked,
+       first_seen = min(wallet_registry.first_seen, excluded.first_seen),
+       last_validated = excluded.last_validated`
+  );
+  const upsertMany = db.transaction((batch: WalletRegistryRow[]) => {
+    for (const r of batch) stmt.run(r);
+  });
+  upsertMany(rows);
+}
+
+// Currently-tracked cohort — the poller's work list.
+export function trackedWallets(): WalletRegistryRow[] {
+  const db = getDb();
+  return db
+    .prepare(`select * from wallet_registry where is_tracked = 1`)
+    .all() as WalletRegistryRow[];
+}
+
+export interface WalletPositionRow {
+  address: string;
+  ts: number;
+  coin: string;                    // '' = heartbeat row (wallet has zero open positions)
+  szi: number;                     // signed, coins
+  entry_px: number | null;
+  position_value: number | null;   // USD, unsigned (HL's own figure — never derive from szi × price)
+  unrealized_pnl: number | null;
+  leverage: number | null;
+  account_value: number | null;    // marginSummary.accountValue at snapshot time
+}
+
+export function insertWalletPositions(rows: WalletPositionRow[]): void {
+  if (rows.length === 0) return;
+  const db = getDb();
+  const stmt = db.prepare(
+    `insert into wallet_positions
+       (address, ts, coin, szi, entry_px, position_value, unrealized_pnl, leverage, account_value)
+     values (@address, @ts, @coin, @szi, @entry_px, @position_value, @unrealized_pnl, @leverage, @account_value)`
+  );
+  const insertMany = db.transaction((batch: WalletPositionRow[]) => {
+    for (const r of batch) stmt.run(r);
+  });
+  insertMany(rows);
+}
+
+// Distinct addresses ever seen in wallet_positions. Covered by
+// idx_wpos_addr_ts (leading column address) so this is an index-only scan,
+// not a table scan — same fallback pattern as distinctSnapshotSymbols.
+function distinctWalletAddresses(): string[] {
+  const db = getDb();
+  const rows = db.prepare(`select distinct address from wallet_positions`).all() as Array<{ address: string }>;
+  return rows.map((r) => r.address);
+}
+
+export interface SmartFlowPoint {
+  longUsd: number;
+  shortUsd: number;
+  netUsd: number;
+  wallets: number;
+}
+
+// Per-coin aggregate of the cohort's positioning at a point in time.
+//
+// The unit of truth is a WALLET's newest snapshot batch inside the window
+// [targetTs - maxAgeMs, targetTs] — not a per-(coin) newest row. The
+// poller writes one row per open position (all sharing the same ts) plus,
+// for a flat wallet, a single heartbeat row (coin='', szi=0) at that ts.
+// So for each address we first seek its own newest ts in the window (a
+// bounded index seek on idx_wpos_addr_ts, same shape as snapshotAtBounded
+// — see that function's perf comment before changing this), then pull
+// every row written at exactly that ts and fold it into the per-coin
+// totals in one pass.
+//
+// This is deliberate, not incidental, for two invariants:
+//   1. Same-row pairing — szi (direction) and position_value (magnitude)
+//      always come from the row the wallet wrote together, so a position
+//      that flipped between two polls contributes the newer poll's
+//      direction AND magnitude, never a mix of the two.
+//   2. Heartbeat semantics — if a wallet's newest row in-window is the
+//      heartbeat, it contributes to no coin at all, even if an OLDER
+//      in-window row shows it holding a position. A naive per-(coin,
+//      address) seek (ignoring the wallet's other rows) would miss this:
+//      it would still find that older coin row and report the wallet as
+//      still holding, silently double-counting a position the wallet has
+//      since closed.
+//
+// Magnitude is always position_value (HL's own USD figure) — never
+// szi × price; see AGENTS.md's SPX OI gotcha for why that multiplication
+// is unsafe in general.
+export function smartFlowAt(targetTs: number, maxAgeMs: number): Map<string, SmartFlowPoint> {
+  const out = new Map<string, SmartFlowPoint>();
+  const walletsByCoin = new Map<string, Set<string>>();
+  const db = getDb();
+
+  const latestTsStmt = db.prepare(
+    `select ts from wallet_positions
+      where address = ? and ts <= ? and ts >= ?
+      order by ts desc limit 1`
+  );
+  const rowsAtTsStmt = db.prepare(
+    `select coin, szi, position_value from wallet_positions
+      where address = ? and ts = ?`
+  );
+
+  for (const address of distinctWalletAddresses()) {
+    const latest = latestTsStmt.get(address, targetTs, targetTs - maxAgeMs) as
+      | { ts: number }
+      | undefined;
+    if (!latest) continue; // no row for this wallet in the window
+
+    const batch = rowsAtTsStmt.all(address, latest.ts) as Array<{
+      coin: string;
+      szi: number;
+      position_value: number | null;
+    }>;
+
+    // A heartbeat batch is a single coin='' row — the wallet is flat at
+    // its newest in-window snapshot. Contributes to no coin.
+    if (batch.length === 1 && batch[0].coin === "") continue;
+
+    for (const row of batch) {
+      if (row.coin === "" || row.szi === 0) continue; // heartbeat noise / no exposure
+      const magnitude = row.position_value ?? 0;
+      const point = out.get(row.coin) ?? { longUsd: 0, shortUsd: 0, netUsd: 0, wallets: 0 };
+      if (row.szi > 0) point.longUsd += magnitude;
+      else point.shortUsd += magnitude;
+      point.netUsd = point.longUsd - point.shortUsd;
+      out.set(row.coin, point);
+
+      const wset = walletsByCoin.get(row.coin) ?? new Set<string>();
+      wset.add(address);
+      walletsByCoin.set(row.coin, wset);
+    }
+  }
+
+  for (const [coin, wset] of walletsByCoin) {
+    const point = out.get(coin);
+    if (point) point.wallets = wset.size;
+  }
+
+  return out;
+}
+
+// 30-day retention prune, same cadence as the other time-series tables.
+export function pruneWalletPositions(maxAgeMs: number = 30 * 86_400_000): number {
+  const db = getDb();
+  const cutoff = Date.now() - maxAgeMs;
+  return db.prepare(`delete from wallet_positions where ts < ?`).run(cutoff).changes;
 }
