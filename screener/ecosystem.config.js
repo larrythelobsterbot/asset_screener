@@ -30,5 +30,20 @@ module.exports = {
       exp_backoff_restart_delay: 1000,
       max_restarts: 10,
     },
+    {
+      // Standalone leaderboard ingest (smart-money flow, Task 2). Fetches
+      // and parses a ~32MB payload — deliberately NOT run inside the
+      // asset-screener process, which is capped at 512M (see
+      // docs/smart-flow-build-plan.md, ground rule 5). Runs once daily,
+      // writes wallet_registry directly via better-sqlite3, then exits;
+      // PM2 just starts it back up on the next cron tick, so no
+      // autorestart-on-exit and no memory cap needed.
+      name: "smart-flow-ingest",
+      script: "scripts/ingest-leaderboard.mjs",
+      cwd: __dirname,
+      autorestart: false,
+      cron_restart: "20 0 * * *",
+      log_date_format: "YYYY-MM-DD HH:mm:ss",
+    },
   ],
 };
