@@ -471,6 +471,68 @@ export async function getBuilderUniverse(): Promise<
   return out.sort((a, b) => b.vol - a.vol);
 }
 
+// ── clearinghouseState (smart-money flow poller) ─────────────────────────
+//
+// Per-wallet account + position snapshot. NO caching here, unlike every
+// other function in this file — each call addresses a distinct user, so
+// there is nothing to reuse across callers the way metaAndCtxs or candles
+// are shared. Goes through the same hlPost/token-bucket path as everything
+// else so the wallet poller's 300ms-paced sweep is naturally rate-limited
+// alongside user-facing HL calls.
+export interface HLClearinghouseState {
+  marginSummary: { accountValue: string };
+  assetPositions: Array<{
+    position: {
+      coin: string;
+      szi: string;
+      entryPx: string | null;
+      positionValue: string;
+      unrealizedPnl: string;
+      leverage: { value: number };
+    };
+  }>;
+  time: number;
+}
+
+export async function getClearinghouseState(user: string): Promise<HLClearinghouseState> {
+  const data = await hlPost<unknown>({ type: "clearinghouseState", user });
+  // Same defensive-validation shape as getBuilderDexData. This is the
+  // OFFICIAL api host (unlike the leaderboard's stats host), but the
+  // response shape isn't versioned, and callers here are per-wallet
+  // try/catch in the poller — a descriptive throw lets one malformed
+  // wallet fail cleanly instead of an opaque `undefined.marginSummary`
+  // crash taking the sweep down.
+  if (
+    typeof data !== "object" ||
+    data === null ||
+    typeof (data as { marginSummary?: unknown }).marginSummary !== "object" ||
+    (data as { marginSummary?: unknown }).marginSummary === null ||
+    typeof (data as { marginSummary: { accountValue?: unknown } }).marginSummary.accountValue !== "string" ||
+    !Array.isArray((data as { assetPositions?: unknown }).assetPositions) ||
+    typeof (data as { time?: unknown }).time !== "number"
+  ) {
+    throw new Error(
+      `Hyperliquid clearinghouseState response for "${user}" has unexpected shape — API may have changed`
+    );
+  }
+  const assetPositions = (data as HLClearinghouseState).assetPositions;
+  for (const ap of assetPositions) {
+    const p = ap?.position;
+    if (
+      !p ||
+      typeof p.coin !== "string" ||
+      typeof p.szi !== "string" ||
+      typeof p.positionValue !== "string" ||
+      typeof p.unrealizedPnl !== "string"
+    ) {
+      throw new Error(
+        `Hyperliquid clearinghouseState response for "${user}" has a malformed position entry`
+      );
+    }
+  }
+  return data as HLClearinghouseState;
+}
+
 export async function getFundingHistory(
   coin: string,
   hours: number = 168

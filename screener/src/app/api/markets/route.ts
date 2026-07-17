@@ -15,6 +15,7 @@ import {
 } from "@/lib/db";
 import { startHlWs, getMid } from "@/lib/hyperliquidWs";
 import { startHip3CandleWarmer } from "@/lib/hip3CandleWarmer";
+import { startWalletPoller } from "@/lib/walletPoller";
 
 // Kick the periodic prune job once per process. Idempotent — repeated
 // calls are no-ops. This is the natural place to hook startup because
@@ -32,6 +33,11 @@ startHlWs();
 // Same idempotent-init pattern: keeps candles_cache warm for the HIP-3
 // board, which no other job fetches candles for. Self-schedules every 6h.
 startHip3CandleWarmer();
+
+// Same idempotent-init pattern: polls clearinghouseState for the smart-
+// money-flow wallet cohort and writes wallet_positions. Self-schedules
+// every 15min (first run 90s after boot). See lib/walletPoller.ts.
+startWalletPoller();
 
 // Without this, Next.js 14 App Router prerenders this route at BUILD TIME
 // and the built-in response gets served forever — meaning every price in

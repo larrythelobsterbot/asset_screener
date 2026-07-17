@@ -1362,6 +1362,15 @@ export function trackedWallets(): WalletRegistryRow[] {
     .all() as WalletRegistryRow[];
 }
 
+// Untrack a single wallet — used by the position poller after N consecutive
+// clearinghouseState failures (dead/vanished account). Targeted UPDATE, not
+// a delete: history in wallet_positions stays, and a re-ingest can revive
+// the wallet later by flipping is_tracked back via upsertWalletRegistry.
+export function demoteWallet(address: string): void {
+  const db = getDb();
+  db.prepare(`update wallet_registry set is_tracked = 0 where address = ?`).run(address);
+}
+
 export interface WalletPositionRow {
   address: string;
   ts: number;
