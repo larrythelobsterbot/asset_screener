@@ -79,6 +79,7 @@ export interface MarketOpenOiTelegramPayload {
   openAt: number;
   generatedAt: number;
   lookbackMs: number;
+  calendarCovered: boolean;
   selection: MarketOpenOiSelection;
 }
 
@@ -211,6 +212,9 @@ export function formatMarketOpenOiTelegram(payload: MarketOpenOiTelegramPayload)
     `<code>${escapeHtml(payload.localDate)}</code> · cash open in ${minutesToOpen}m · data age ≤${snapshotAgeMinutes}m`,
     "<i>Informational positioning watch — not a trade signal.</i>",
   ];
+  if (!payload.calendarCovered) {
+    blocks.push("⚠ <b>CALENDAR COVERAGE UNAVAILABLE</b> · weekday schedule is provisional; holiday accuracy is not guaranteed.");
+  }
   if (payload.selection.crypto.length > 0) {
     blocks.push("", "<b>CRYPTO</b>", payload.selection.crypto
       .map((item, index) => formatItem(item, index + 1)).join("\n"));

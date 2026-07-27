@@ -175,6 +175,7 @@ export function buildMarketOpenOiPreview(
     openAt: schedule.openAt,
     generatedAt,
     lookbackMs: MARKET_OPEN_OI_LOOKBACK_MS,
+    calendarCovered: schedule.calendarCovered,
     selection,
   });
   if (!body) return { status: "suppressed", reason: "insufficient_assets" };

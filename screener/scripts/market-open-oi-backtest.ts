@@ -1,34 +1,37 @@
-import type { AssetData } from "../src/lib/types";
-import { snapshotFullAtBounded } from "../src/lib/db";
+import Database from "better-sqlite3";
+import { join } from "node:path";
+
+import { sectorOf } from "../src/config/sectors";
+import { displayScaleOf } from "../src/lib/hyperliquid";
 import {
   recentMarketOpenSchedules,
   type MarketOpenSchedule,
 } from "../src/lib/marketOpenOiCalendar";
-import type { MarketOpenRegion } from "../src/lib/marketOpenOi";
+import {
+  DEFAULT_MARKET_OPEN_OI_SELECTION,
+  marketOpenUniverse,
+  type MarketOpenOiItem,
+  type MarketOpenRegion,
+  type MarketOpenOiSnapshot,
+} from "../src/lib/marketOpenOi";
+import {
+  summarizeMarketOpenOiBacktest,
+  type MarketOpenOiBacktestCohort,
+  type MarketOpenOiBacktestObservation,
+} from "../src/lib/marketOpenOiBacktest";
 import {
   buildMarketOpenOiPreview,
-  defaultMarketOpenOiBuildDeps,
-  marketOpenOiAssetsFromMarkets,
+  type MarketOpenOiSourceAsset,
 } from "../src/lib/marketOpenOiService";
 
 const HOUR_MS = 60 * 60_000;
 const DAY_MS = 24 * HOUR_MS;
+const MINIMUM_GROUP_SIZE = 5;
 const HORIZONS = [
   { label: "1h", offsetMs: HOUR_MS },
   { label: "4h", offsetMs: 4 * HOUR_MS },
   { label: "24h", offsetMs: DAY_MS },
 ] as const;
-
-interface Observation {
-  cohort: "open" | "control+2h";
-  region: MarketOpenRegion;
-  universe: "crypto" | "equity";
-  quadrant: string;
-  horizon: string;
-  returnPct: number;
-  absReturnPct: number;
-  continuationReturnPct: number;
-}
 
 function numberArg(name: string, fallback: number): number {
   const index = process.argv.indexOf(name);
@@ -37,7 +40,6 @@ function numberArg(name: string, fallback: number): number {
   if (!Number.isFinite(value) || value <= 0) throw new Error(`${name} requires a positive number`);
   return value;
 }
-
 
 function shiftedSchedule(schedule: MarketOpenSchedule, offsetMs: number): MarketOpenSchedule {
   return {
@@ -49,33 +51,32 @@ function shiftedSchedule(schedule: MarketOpenSchedule, offsetMs: number): Market
   };
 }
 
-function mean(values: number[]): number | null {
-  if (values.length === 0) return null;
-  return values.reduce((sum, value) => sum + value, 0) / values.length;
+interface LatestOiSnapshot {
+  symbol: string;
+  oi: number | null;
 }
 
-function summarize(observations: Observation[]) {
-  const groups = new Map<string, Observation[]>();
-  for (const observation of observations) {
-    const key = [observation.cohort, observation.region, observation.universe, observation.horizon].join(":");
-    const group = groups.get(key) ?? [];
-    group.push(observation);
-    groups.set(key, group);
+function latestOiSnapshots(db: Database.Database): LatestOiSnapshot[] {
+  return db.prepare(`
+    select p.symbol, p.oi
+    from price_snapshots p
+    join (select symbol, max(ts) as max_ts from price_snapshots group by symbol) latest
+      on p.symbol = latest.symbol and p.ts = latest.max_ts
+  `).all() as LatestOiSnapshot[];
+}
+
+function historicalSourceAssets(rows: LatestOiSnapshot[]): MarketOpenOiSourceAsset[] {
+  const assets: MarketOpenOiSourceAsset[] = [];
+  const seen = new Set<string>();
+  for (const row of rows) {
+    if (row.oi === null || !Number.isFinite(row.oi) || row.oi < 0) continue;
+    if (seen.has(row.symbol)) continue;
+    seen.add(row.symbol);
+    const sector = sectorOf(row.symbol);
+    if (!marketOpenUniverse(sector)) continue;
+    assets.push({ symbol: row.symbol, sector, displayScale: displayScaleOf(row.symbol) });
   }
-  return [...groups.entries()].map(([key, rows]) => {
-    const [cohort, region, universe, horizon] = key.split(":");
-    return {
-      cohort,
-      region,
-      universe,
-      horizon,
-      n: rows.length,
-      meanReturnPct: mean(rows.map((row) => row.returnPct)),
-      meanAbsReturnPct: mean(rows.map((row) => row.absReturnPct)),
-      meanContinuationReturnPct: mean(rows.map((row) => row.continuationReturnPct)),
-      positiveContinuationRate: rows.filter((row) => row.continuationReturnPct > 0).length / rows.length,
-    };
-  });
+  return assets.sort((left, right) => left.symbol.localeCompare(right.symbol));
 }
 
 async function main() {
@@ -83,77 +84,153 @@ async function main() {
   if (!Number.isInteger(days) || days > 90) {
     throw new Error("--days requires an integer from 1 through 90");
   }
-  const origin = process.env.SCREENER_SELF_ORIGIN ?? "http://127.0.0.1:3003";
-  const response = await fetch(`${origin}/api/markets`, { cache: "no-store" });
-  if (!response.ok) throw new Error(`market universe request failed: HTTP ${response.status}`);
-  const markets = await response.json() as AssetData[];
-  const assets = marketOpenOiAssetsFromMarkets(markets);
-  const deps = { ...defaultMarketOpenOiBuildDeps, assets: () => assets };
+  const dbPath = process.env.SCREENER_DB_PATH ?? join(process.cwd(), "data", "screener.db");
+  const db = new Database(dbPath, { readonly: true, fileMustExist: true });
+  db.pragma("query_only = ON");
+  const snapshotStatement = db.prepare(`
+    select mark, oi, funding, volume, ts
+    from price_snapshots
+    where symbol = ? and ts <= ? and ts >= ?
+    order by ts desc limit 1
+  `);
+  const snapshots = (
+    targetAt: number,
+    toleranceMs: number,
+    symbols: string[],
+  ): Map<string, MarketOpenOiSnapshot> => {
+    const rows = new Map<string, MarketOpenOiSnapshot>();
+    for (const symbol of symbols) {
+      const row = snapshotStatement.get(
+        symbol,
+        targetAt,
+        targetAt - toleranceMs,
+      ) as MarketOpenOiSnapshot | undefined;
+      if (row) rows.set(symbol, row);
+    }
+    return rows;
+  };
+  const assets = historicalSourceAssets(latestOiSnapshots(db));
+  const deps = {
+    assets: () => assets,
+    snapshots,
+    smartFlowDeltas: () => new Map<string, number>(),
+  };
+  const eligibleDeps = {
+    ...deps,
+  };
+  const allEligibleSelection = {
+    ...DEFAULT_MARKET_OPEN_OI_SELECTION,
+    maxPerUniverse: assets.length,
+  };
   const assetScale = new Map(assets.map((asset) => [asset.symbol, asset.displayScale]));
   const now = Date.now();
-  const observations: Observation[] = [];
+  const observations: MarketOpenOiBacktestObservation[] = [];
   const sampleBodies: Array<{ cohort: string; key: string; body: string }> = [];
   let evaluatedCohorts = 0;
   let suppressedCohorts = 0;
+  let requestedObservations = 0;
+  let missingObservations = 0;
   const tradingSessionsByRegion: Record<MarketOpenRegion, number> = { asia: 0, europe: 0, us: 0 };
   const schedules = recentMarketOpenSchedules(now, days, 26 * HOUR_MS + 10 * 60_000);
 
+  function appendOutcomes(
+    cohort: MarketOpenOiBacktestCohort,
+    base: MarketOpenSchedule,
+    schedule: MarketOpenSchedule,
+    items: MarketOpenOiItem[],
+  ): void {
+    const appendMissing = (item: MarketOpenOiItem, horizon: string) => {
+      observations.push({
+        cohort,
+        region: base.region,
+        universe: item.universe,
+        quadrant: item.quadrant,
+        horizon,
+        returnPct: null,
+        absReturnPct: null,
+        continuationReturnPct: null,
+      });
+    };
+    for (const item of items) {
+      const scale = assetScale.get(item.symbol) ?? 1;
+      const openPoint = snapshots(schedule.openAt, 10 * 60_000, [item.symbol]).get(item.symbol);
+      if (!openPoint || openPoint.mark <= 0) {
+        requestedObservations += HORIZONS.length;
+        missingObservations += HORIZONS.length;
+        for (const horizon of HORIZONS) appendMissing(item, horizon.label);
+        continue;
+      }
+      const openPrice = openPoint.mark / scale;
+      for (const horizon of HORIZONS) {
+        requestedObservations += 1;
+        const point = snapshots(
+          schedule.openAt + horizon.offsetMs,
+          10 * 60_000,
+          [item.symbol],
+        ).get(item.symbol);
+        if (!point || point.mark <= 0) {
+          missingObservations += 1;
+          appendMissing(item, horizon.label);
+          continue;
+        }
+        const price = point.mark / scale;
+        const returnPct = ((price - openPrice) / openPrice) * 100;
+        const priorDirection = Math.sign(item.priceChangePct);
+        observations.push({
+          cohort,
+          region: base.region,
+          universe: item.universe,
+          quadrant: item.quadrant,
+          horizon: horizon.label,
+          returnPct,
+          absReturnPct: Math.abs(returnPct),
+          continuationReturnPct: priorDirection === 0 ? 0 : priorDirection * returnPct,
+        });
+      }
+    }
+  }
+
   for (const base of schedules) {
     tradingSessionsByRegion[base.region] += 1;
-    for (const [cohort, schedule] of [
-      ["open", base],
-      ["control+2h", shiftedSchedule(base, 2 * HOUR_MS)],
+    for (const [cohort, schedule, selection, buildDeps] of [
+      ["selected-open", base, DEFAULT_MARKET_OPEN_OI_SELECTION, deps],
+      ["eligible-open", base, allEligibleSelection, eligibleDeps],
+      ["selected-control+2h", shiftedSchedule(base, 2 * HOUR_MS), DEFAULT_MARKET_OPEN_OI_SELECTION, deps],
     ] as const) {
-      const preview = buildMarketOpenOiPreview(schedule, schedule.reportAt, undefined, deps);
+      const preview = buildMarketOpenOiPreview(schedule, schedule.reportAt, selection, buildDeps);
       if (preview.status !== "ready") {
         suppressedCohorts += 1;
         continue;
       }
       evaluatedCohorts += 1;
-      if (sampleBodies.length < 3 && cohort === "open") {
+      if (sampleBodies.length < 3 && cohort === "selected-open") {
         sampleBodies.push({ cohort, key: base.key, body: preview.body });
       }
-      for (const item of [...preview.selection.crypto, ...preview.selection.equity]) {
-        const scale = assetScale.get(item.symbol) ?? 1;
-        const openPoint = snapshotFullAtBounded(schedule.openAt, 10 * 60_000, [item.symbol]).get(item.symbol);
-        if (!openPoint || openPoint.mark <= 0) continue;
-        const openPrice = openPoint.mark / scale;
-        for (const horizon of HORIZONS) {
-          const point = snapshotFullAtBounded(
-            schedule.openAt + horizon.offsetMs,
-            10 * 60_000,
-            [item.symbol],
-          ).get(item.symbol);
-          if (!point || point.mark <= 0) continue;
-          const price = point.mark / scale;
-          const returnPct = ((price - openPrice) / openPrice) * 100;
-          const priorDirection = Math.sign(item.priceChangePct);
-          observations.push({
-            cohort,
-            region: base.region,
-            universe: item.universe,
-            quadrant: item.quadrant,
-            horizon: horizon.label,
-            returnPct,
-            absReturnPct: Math.abs(returnPct),
-            continuationReturnPct: priorDirection === 0 ? 0 : priorDirection * returnPct,
-          });
-        }
-      }
+      appendOutcomes(
+        cohort,
+        base,
+        schedule,
+        [...preview.selection.crypto, ...preview.selection.equity],
+      );
     }
   }
 
+  db.close();
   console.log(JSON.stringify({
     generatedAt: new Date(now).toISOString(),
     requestedDays: days,
-    policy: "descriptive shadow analysis; no writes and no Telegram sends",
+    policy: "descriptive shadow analysis; SQLite reads only; no API routes, writes, or Telegram sends",
+    source: "price_snapshots and static sector/display-scale configuration",
     assets: assets.length,
+    minimumGroupSize: MINIMUM_GROUP_SIZE,
     tradingSessionsByRegion,
     eligibleTradingSessions: schedules.length,
     evaluatedCohorts,
     suppressedCohorts,
-    observations: observations.length,
-    summary: summarize(observations),
+    requestedObservations,
+    missingObservations,
+    observations: requestedObservations - missingObservations,
+    summary: summarizeMarketOpenOiBacktest(observations, MINIMUM_GROUP_SIZE),
     samples: sampleBodies,
   }, null, 2));
 }

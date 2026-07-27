@@ -170,6 +170,7 @@ test("formats an HTML-safe compact briefing with both universes and required con
     openAt: Date.parse("2026-07-27T00:00:00.000Z"),
     generatedAt: Date.parse("2026-07-26T23:31:00.000Z"),
     lookbackMs: 4 * 60 * 60_000,
+    calendarCovered: false,
     selection: { crypto: [crypto], equity: [equity] },
   });
 
@@ -183,6 +184,7 @@ test("formats an HTML-safe compact briefing with both universes and required con
   assert.match(body, /Px/);
   assert.match(body, /fund/);
   assert.match(body, /smart/);
+  assert.match(body, /CALENDAR COVERAGE UNAVAILABLE/);
   assert.match(body, /1\. <b>&lt;BTC&amp;&gt;<\/b>/);
   assert.match(body, /&lt;BTC&amp;&gt;/);
   assert.doesNotMatch(body, /<BTC&>/);
@@ -199,6 +201,7 @@ test("suppresses a briefing with fewer than two valid items", () => {
     openAt: 2,
     generatedAt: 1,
     lookbackMs: 4 * 60 * 60_000,
+    calendarCovered: true,
     selection: { crypto: [only], equity: [] },
   }), null);
 });
