@@ -79,7 +79,10 @@ function summarize(observations: Observation[]) {
 }
 
 async function main() {
-  const days = Math.min(90, Math.floor(numberArg("--days", 14)));
+  const days = numberArg("--days", 14);
+  if (!Number.isInteger(days) || days > 90) {
+    throw new Error("--days requires an integer from 1 through 90");
+  }
   const origin = process.env.SCREENER_SELF_ORIGIN ?? "http://127.0.0.1:3003";
   const response = await fetch(`${origin}/api/markets`, { cache: "no-store" });
   if (!response.ok) throw new Error(`market universe request failed: HTTP ${response.status}`);
