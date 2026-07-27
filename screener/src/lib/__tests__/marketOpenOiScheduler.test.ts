@@ -21,6 +21,7 @@ function deps(overrides: Partial<MarketOpenOiSchedulerDeps> = {}): MarketOpenOiS
     dueSessions: () => [],
     build: () => ({ status: "suppressed", reason: "insufficient_assets" }),
     deliver: async () => "delivered",
+    persistPending: () => "pending",
     persistShadow: () => "shadowed",
     recover: async () => ({ reconciledUnknown: 0, resumed: 0, expired: 0, delivered: 0, failed: 0, unknown: 0 }),
     evaluate: () => outcome,
@@ -106,16 +107,37 @@ test("enabled due tick recovers first, builds once, and delivers the ready repor
   assert.equal(result.delivered, 1);
 });
 
-test("missing Telegram configuration blocks all external delivery work", async () => {
+test("missing Telegram configuration durably reserves due work without delivery", async () => {
+  const schedule = marketOpenScheduleForDate("us", "2026-07-27");
   const events: string[] = [];
   const result = await runMarketOpenOiTick(deps({
     enabled: () => true,
     telegramConfigured: () => false,
+    dueSessions: () => [schedule],
+    build: () => {
+      events.push("build");
+      return {
+        status: "ready",
+        report: {
+          report_key: schedule.key, region: "us", local_date: schedule.localDate,
+          report_at: schedule.reportAt, open_at: schedule.openAt, generated_at: schedule.reportAt,
+          lookback_ms: 4 * 60 * 60_000, calendar_covered: 1,
+          selection_config_json: "{}", message_body: "body",
+        },
+        items: [], selection: { crypto: [], equity: [] }, body: "body",
+      };
+    },
+    ...({
+      persistPending: () => { events.push("pending"); return "pending"; },
+    } as Partial<MarketOpenOiSchedulerDeps>),
     recover: async () => { events.push("recover"); throw new Error("must not run"); },
+    deliver: async () => { events.push("deliver"); throw new Error("must not run"); },
     evaluate: () => { events.push("evaluate"); return outcome; },
   }));
-  assert.deepEqual(events, ["evaluate"]);
+  assert.deepEqual(events, ["evaluate", "build", "pending"]);
   assert.equal(result.status, "blocked");
+  assert.equal(result.pending, 1);
+  assert.equal(result.delivered, 0);
 });
 
 test("outcome evaluator failures remain visible in tick health", async () => {

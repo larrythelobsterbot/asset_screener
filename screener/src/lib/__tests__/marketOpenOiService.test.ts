@@ -8,6 +8,7 @@ import {
   computeMarketOpenOiSmartFlowDeltas,
   deliverMarketOpenOiPreview,
   marketOpenOiAssetsFromMarkets,
+  persistPendingMarketOpenOiPreview,
   persistShadowMarketOpenOiPreview,
   resumeMarketOpenOiDeliveries,
   type MarketOpenOiBuildDeps,
@@ -237,6 +238,25 @@ test("shadow persistence reserves report evidence without creating a Telegram at
   assert.equal(result, "shadowed");
   assert.equal(calls.length, 1);
   assert.equal(calls[0][2], "shadow");
+});
+
+test("pending persistence reserves recoverable evidence without creating a delivery attempt", () => {
+  const calls: unknown[][] = [];
+  const preview = {
+    status: "ready" as const,
+    report: {
+      report_key: "us:2026-07-28", region: "us" as const, local_date: "2026-07-28",
+      report_at: 1, open_at: 2, generated_at: 1, lookback_ms: 4 * 60 * 60_000,
+      calendar_covered: 1 as const, selection_config_json: "{}", message_body: "body",
+    },
+    items: [], selection: { crypto: [], equity: [] }, body: "body",
+  };
+  const result = persistPendingMarketOpenOiPreview(preview, {
+    reserve: (...args) => { calls.push(args); return { kind: "inserted", id: 8 }; },
+  });
+  assert.equal(result, "pending");
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0][2], "pending");
 });
 
 test("recovery marks stale attempted rows unknown, expires stale unsent rows, and resumes only current bodies", async () => {

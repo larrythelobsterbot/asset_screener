@@ -8,6 +8,7 @@ import {
   buildMarketOpenOiPreview,
   defaultMarketOpenOiBuildDeps,
   deliverMarketOpenOiPreview,
+  persistPendingMarketOpenOiPreview,
   persistShadowMarketOpenOiPreview,
   resumeMarketOpenOiDeliveries,
   type MarketOpenOiPreview,
@@ -29,6 +30,9 @@ export interface MarketOpenOiSchedulerDeps {
   persistShadow: (
     preview: Extract<MarketOpenOiPreview, { status: "ready" }>,
   ) => "shadowed" | "duplicate";
+  persistPending: (
+    preview: Extract<MarketOpenOiPreview, { status: "ready" }>,
+  ) => "pending" | "duplicate";
   recover: typeof resumeMarketOpenOiDeliveries;
   evaluate: () => MarketOpenOiOutcomeEvaluation;
   now: () => number;
@@ -59,6 +63,7 @@ const defaultDeps: MarketOpenOiSchedulerDeps = {
     defaultMarketOpenOiBuildDeps,
   ),
   deliver: deliverMarketOpenOiPreview,
+  persistPending: persistPendingMarketOpenOiPreview,
   persistShadow: persistShadowMarketOpenOiPreview,
   recover: resumeMarketOpenOiDeliveries,
   evaluate: evaluateMarketOpenOiOutcomes,
@@ -75,6 +80,7 @@ export interface MarketOpenOiTickResult {
   ready: number;
   suppressed: number;
   shadowed: number;
+  pending: number;
   delivered: number;
   duplicates: number;
   failed: number;
@@ -148,6 +154,7 @@ export async function runMarketOpenOiTick(
     ready: 0,
     suppressed: 0,
     shadowed: 0,
+    pending: 0,
     delivered: 0,
     duplicates: 0,
     failed: 0,
@@ -162,12 +169,12 @@ export async function runMarketOpenOiTick(
   if (!deliveryEnabled && !shadowEnabled) {
     return finishTick({ ...base, status: "disabled" });
   }
-  if (deliveryEnabled && !deps.telegramConfigured()) {
+  const telegramConfigured = !deliveryEnabled || deps.telegramConfigured();
+  if (!telegramConfigured) {
     base.errors.push("Telegram is not configured");
-    return finishTick({ ...base, status: "blocked" });
   }
 
-  if (deliveryEnabled) {
+  if (deliveryEnabled && telegramConfigured) {
     try {
       const recovery = await deps.recover();
       base.delivered += recovery.delivered;
@@ -195,6 +202,12 @@ export async function runMarketOpenOiTick(
         else base.duplicates += 1;
         continue;
       }
+      if (!telegramConfigured) {
+        const persisted = deps.persistPending(preview);
+        if (persisted === "pending") base.pending += 1;
+        else base.duplicates += 1;
+        continue;
+      }
       const delivery = await deps.deliver(preview);
       if (delivery === "delivered") base.delivered += 1;
       else if (delivery === "duplicate") base.duplicates += 1;
@@ -210,7 +223,11 @@ export async function runMarketOpenOiTick(
       `delivery failed=${base.failed} unknown=${base.unknown}; unknown acknowledgements require manual reconciliation`,
     );
   }
-  base.status = base.errors.length > 0 ? "degraded" : deliveryEnabled ? "ok" : "shadow";
+  base.status = !telegramConfigured
+    ? "blocked"
+    : base.errors.length > 0
+      ? "degraded"
+      : deliveryEnabled ? "ok" : "shadow";
   return finishTick(base);
 }
 

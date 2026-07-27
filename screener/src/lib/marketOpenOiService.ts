@@ -366,6 +366,14 @@ export function persistShadowMarketOpenOiPreview(
   return reservation.kind === "inserted" ? "shadowed" : "duplicate";
 }
 
+export function persistPendingMarketOpenOiPreview(
+  preview: ReadyMarketOpenOiPreview,
+  deps: MarketOpenOiShadowDeps = { reserve: reserveMarketOpenOiReport },
+): "pending" | "duplicate" {
+  const reservation = deps.reserve(preview.report, preview.items, "pending");
+  return reservation.kind === "inserted" ? "pending" : "duplicate";
+}
+
 export async function resumeMarketOpenOiDeliveries(
   deps: MarketOpenOiRecoveryDeps = defaultMarketOpenOiRecoveryDeps,
 ): Promise<{
