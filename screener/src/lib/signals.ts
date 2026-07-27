@@ -6,7 +6,15 @@ import {
   type VolRegime,
 } from "./indicators";
 import type { Sector } from "@/config/sectors";
-import { loadEventHistory, recordEventFire, eventHistoryKey } from "./db";
+import {
+  loadEventHistory,
+  recordEventFire,
+  eventHistoryKey,
+  loadSignalStates,
+  signalStateKey,
+  upsertSignalState,
+  type SignalStateRow,
+} from "./db";
 
 // Grouping signals by family makes downstream consumers (bot, UI) much easier
 // to reason about — e.g., "only act on momentum+trend confluence" or
@@ -100,6 +108,7 @@ export const SIGNAL_FAMILY: Record<SignalType, SignalFamily> = {
 // Module-level lazy init so tests that don't touch signals don't pay
 // the load cost.
 let eventHistory: Map<string, number> | null = null;
+let signalStates: Map<string, SignalStateRow> | null = null;
 
 function getEventHistory(): Map<string, number> {
   if (eventHistory) return eventHistory;
@@ -164,6 +173,70 @@ function fireEvent(
 // fires survive a "restart".
 export function _resetEventHistoryForTests(): void {
   eventHistory = null;
+  signalStates = null;
+}
+
+function getSignalStates(): Map<string, SignalStateRow> {
+  if (signalStates) return signalStates;
+  try {
+    signalStates = loadSignalStates();
+  } catch (err) {
+    console.warn("[signals] signal state hydrate failed, using in-memory only:", err);
+    signalStates = new Map();
+  }
+  return signalStates;
+}
+
+function fireStateEvent(
+  symbol: string,
+  type: SignalType,
+  direction: SignalDirection,
+  value: number,
+  label: string,
+  activate: boolean,
+  reset: boolean,
+  timeframe?: Timeframe,
+): Omit<Signal, "family" | "volRegime"> | null {
+  const states = getSignalStates();
+  const key = signalStateKey(symbol, type, timeframe);
+  const prior = states.get(key);
+  const now = Date.now();
+  const tf = timeframe ?? "_";
+
+  if (activate) {
+    if (prior?.active === 1 && prior.direction === direction) return null;
+    const next: SignalStateRow = {
+      symbol,
+      type,
+      timeframe: tf,
+      active: 1,
+      direction,
+      value,
+      updated_at: now,
+    };
+    states.set(key, next);
+    try { upsertSignalState(next); } catch (err) {
+      console.warn(`[signals] persist state activation(${key}) failed:`, err);
+    }
+    return { symbol, type, direction, value, label, firedAt: now };
+  }
+
+  if (reset && prior?.active === 1) {
+    const next: SignalStateRow = {
+      symbol,
+      type,
+      timeframe: tf,
+      active: 0,
+      direction: null,
+      value,
+      updated_at: now,
+    };
+    states.set(key, next);
+    try { upsertSignalState(next); } catch (err) {
+      console.warn(`[signals] persist state reset(${key}) failed:`, err);
+    }
+  }
+  return null;
 }
 
 export function detectSignals(
@@ -186,13 +259,7 @@ export function detectSignals(
   // series. Signals are tagged with this so consumers can suppress noise in
   // wild regimes (e.g., RSI extremes are far more common during volatility
   // spikes and mean less than in a quiet tape).
-  const atrSeries = atrPercent(highs, lows, closes, 14);
-  const currentAtr = atrSeries[last];
-  // Everything EXCEPT the latest value is "history" to rank the current bar
-  // against. Take the previous ~90 bars so we don't let stale regime info
-  // dominate a long-lived series.
-  const atrHist = atrSeries.slice(Math.max(0, last - 90), last);
-  const volRegime = classifyVolRegime(currentAtr, atrHist);
+  const volRegime = deriveVolRegime(highs, lows, closes);
 
   // tag() stamps every emitted signal with the scan-level metadata
   // (family derived from type, volRegime + timeframe from this invocation).
@@ -218,21 +285,37 @@ export function detectSignals(
   // RSI
   const rsiVal = ind.rsi[last];
   if (rsiVal !== null) {
-    if (rsiVal > 70) {
+    const overbought = fireStateEvent(
+      symbol,
+      "rsi_overbought",
+      "bearish",
+      rsiVal,
+      `RSI Overbought (${rsiVal.toFixed(1)})`,
+      rsiVal > 70,
+      rsiVal < 65,
+      timeframe,
+    );
+    if (overbought) {
       signals.push(tag({
-        symbol, type: "rsi_overbought", direction: "bearish",
-        value: rsiVal,
+        ...overbought,
         // Strength ramps from 0 at RSI 70 → 100 at RSI 90+
         strength: Math.min(100, ((rsiVal - 70) / 20) * 100),
-        label: `RSI Overbought (${rsiVal.toFixed(1)})`, firedAt: Date.now(),
       }));
     }
-    if (rsiVal < 30) {
+    const oversold = fireStateEvent(
+      symbol,
+      "rsi_oversold",
+      "bullish",
+      rsiVal,
+      `RSI Oversold (${rsiVal.toFixed(1)})`,
+      rsiVal < 30,
+      rsiVal > 35,
+      timeframe,
+    );
+    if (oversold) {
       signals.push(tag({
-        symbol, type: "rsi_oversold", direction: "bullish",
-        value: rsiVal,
+        ...oversold,
         strength: Math.min(100, ((30 - rsiVal) / 20) * 100),
-        label: `RSI Oversold (${rsiVal.toFixed(1)})`, firedAt: Date.now(),
       }));
     }
   }
@@ -270,14 +353,22 @@ export function detectSignals(
   // Volume spike
   if (volumes.length >= 21) {
     const avg = volumes.slice(last - 20, last).reduce((a, b) => a + b, 0) / 20;
-    if (avg > 0 && volumes[last] > 2 * avg) {
-      const ratio = volumes[last] / avg;
+    const ratio = avg > 0 ? volumes[last] / avg : 0;
+    const stateSignal = fireStateEvent(
+      symbol,
+      "volume_spike",
+      "bullish",
+      ratio,
+      `Volume Spike (${ratio.toFixed(1)}x)`,
+      ratio > 2,
+      ratio < 1.5,
+      timeframe,
+    );
+    if (stateSignal) {
       signals.push(tag({
-        symbol, type: "volume_spike", direction: "bullish",
-        value: ratio,
+        ...stateSignal,
         // 2x = 40, 5x = 100. Caps the tail so a 20× spike doesn't dominate.
         strength: Math.min(100, ((ratio - 2) / 3) * 60 + 40),
-        label: `Volume Spike (${ratio.toFixed(1)}x)`, firedAt: Date.now(),
       }));
     }
   }
@@ -307,41 +398,51 @@ export function detectSignals(
   if (fundingRate !== undefined) {
     const hist = fundingHistory ?? [];
     const samples = hist.filter((x) => Number.isFinite(x));
+    let fundingDirection: SignalDirection = fundingRate >= 0 ? "bearish" : "bullish";
+    let fundingLabel = `Funding ${fundingRate >= 0 ? "high" : "low"} (${(fundingRate * 100).toFixed(4)}%)`;
+    let fundingStrength = 60;
+    let fundingActive = false;
+    let fundingReset = false;
     if (samples.length >= 24) {
       // Need at least ~1 day of hourly samples for the percentiles to mean
       // anything. Copy before sorting to avoid mutating the caller's array.
       const sorted = [...samples].sort((a, b) => a - b);
       const p10 = sorted[Math.floor(sorted.length * 0.10)];
+      const p20 = sorted[Math.floor(sorted.length * 0.20)];
+      const p80 = sorted[Math.floor(sorted.length * 0.80)];
       const p90 = sorted[Math.floor(sorted.length * 0.90)];
       if (fundingRate >= p90 && fundingRate > 0.0001) {
-        signals.push(tag({
-          symbol, type: "funding_anomaly",
-          direction: "bearish",
-          value: fundingRate,
-          strength: 60,
-          label: `Funding top-decile (${(fundingRate * 100).toFixed(4)}%)`,
-          firedAt: Date.now(),
-        }));
+        fundingDirection = "bearish";
+        fundingLabel = `Funding top-decile (${(fundingRate * 100).toFixed(4)}%)`;
+        fundingActive = true;
       } else if (fundingRate <= p10 && fundingRate < -0.00005) {
-        signals.push(tag({
-          symbol, type: "funding_anomaly",
-          direction: "bullish",
-          value: fundingRate,
-          strength: 60,
-          label: `Funding bottom-decile (${(fundingRate * 100).toFixed(4)}%)`,
-          firedAt: Date.now(),
-        }));
+        fundingDirection = "bullish";
+        fundingLabel = `Funding bottom-decile (${(fundingRate * 100).toFixed(4)}%)`;
+        fundingActive = true;
+      } else {
+        fundingReset = fundingRate >= p20 && fundingRate <= p80;
       }
     } else if (Math.abs(fundingRate) > 0.0005) {
       // Cold-start fallback: 0.05%/hr ≈ 440% APR — genuinely extreme.
-      signals.push(tag({
-        symbol, type: "funding_anomaly",
-        direction: fundingRate > 0 ? "bearish" : "bullish",
-        value: fundingRate,
-        strength: 80,
-        label: `Funding ${fundingRate > 0 ? "extreme-high" : "extreme-low"} (${(fundingRate * 100).toFixed(4)}%)`,
-        firedAt: Date.now(),
-      }));
+      fundingDirection = fundingRate > 0 ? "bearish" : "bullish";
+      fundingLabel = `Funding ${fundingRate > 0 ? "extreme-high" : "extreme-low"} (${(fundingRate * 100).toFixed(4)}%)`;
+      fundingStrength = 80;
+      fundingActive = true;
+    } else {
+      fundingReset = Math.abs(fundingRate) < 0.0003;
+    }
+    const fundingSignal = fireStateEvent(
+      symbol,
+      "funding_anomaly",
+      fundingDirection,
+      fundingRate,
+      fundingLabel,
+      fundingActive,
+      fundingReset,
+      timeframe,
+    );
+    if (fundingSignal) {
+      signals.push(tag({ ...fundingSignal, strength: fundingStrength }));
     }
   }
 
@@ -449,6 +550,28 @@ export interface ConvictionResult {
   byTimeframe: Partial<Record<Timeframe, { score: number; count: number }>>;
 }
 
+export function deriveVolRegime(
+  highs: number[],
+  lows: number[],
+  closes: number[],
+): VolRegime {
+  if (closes.length === 0) return "unknown";
+  const atrSeries = atrPercent(highs, lows, closes, 14);
+  const last = closes.length - 1;
+  const currentAtr = atrSeries[last];
+  // Everything EXCEPT the latest value is history. Limit the comparison
+  // window so stale volatility does not dominate the primary regime.
+  const atrHist = atrSeries.slice(Math.max(0, last - 90), last);
+  return classifyVolRegime(currentAtr, atrHist);
+}
+
+export function filterClosedCandles<T extends { T: number }>(
+  candles: T[],
+  now: number = Date.now(),
+): T[] {
+  return candles.filter((candle) => Number.isFinite(candle.T) && candle.T <= now);
+}
+
 export function scoreConviction(
   signals: Signal[],
   // Sector-priority multiplier applied to the final score. Default 1
@@ -458,16 +581,20 @@ export function scoreConviction(
   // so the priority compounds with confluence rather than replacing
   // it. Resolver lives in sectors.ts to keep this lib sector-agnostic.
   sectorPriority: number = 1,
+  primaryVolRegime?: VolRegime,
 ): ConvictionResult {
   let score = 0;
   const familySet = new Set<SignalFamily>();
+  const bullishFamilySet = new Set<SignalFamily>();
+  const bearishFamilySet = new Set<SignalFamily>();
+  const strongestByFamilyDirection = new Map<string, number>();
   let bull = 0;
   let bear = 0;
   const byTf: Partial<Record<Timeframe, { score: number; count: number }>> = {};
   // Assume all signals in the list share a regime (they came from one
   // detectSignals call). If mixed, use the most recent.
-  const volRegime: VolRegime =
-    signals.length > 0 ? (signals[signals.length - 1].volRegime ?? "unknown") : "unknown";
+  const volRegime: VolRegime = primaryVolRegime
+    ?? (signals.length > 0 ? (signals[signals.length - 1].volRegime ?? "unknown") : "unknown");
 
   for (const s of signals) {
     const family = s.family ?? SIGNAL_FAMILY[s.type];
@@ -480,9 +607,18 @@ export function scoreConviction(
     const intensity = s.strength != null ? 0.5 + s.strength / 100 : 1;
     const delta = familyWeight * typeWeight * intensity * tfWeight;
     const signed = s.direction === "bullish" ? delta : -delta;
-    score += signed;
-    if (s.direction === "bullish") bull += 1;
-    else bear += 1;
+    const familyDirectionKey = `${family}:${s.direction}`;
+    const previous = strongestByFamilyDirection.get(familyDirectionKey);
+    if (previous == null || Math.abs(signed) > Math.abs(previous)) {
+      strongestByFamilyDirection.set(familyDirectionKey, signed);
+    }
+    if (s.direction === "bullish") {
+      bull += 1;
+      bullishFamilySet.add(family);
+    } else {
+      bear += 1;
+      bearishFamilySet.add(family);
+    }
     familySet.add(family);
 
     if (s.timeframe) {
@@ -492,6 +628,8 @@ export function scoreConviction(
       byTf[s.timeframe] = entry;
     }
   }
+
+  score = [...strongestByFamilyDirection.values()].reduce((sum, value) => sum + value, 0);
 
   // Diversity bonus: 3+ different families agreeing is stronger than the
   // same family firing three times. We multiply by a mild factor.
@@ -507,7 +645,8 @@ export function scoreConviction(
   if (tfScores.length >= 2) {
     const netDir = Math.sign(score);
     const aligned = tfScores.filter((x) => Math.sign(x) === netDir).length;
-    if (aligned >= 2) score *= 1 + 0.1 * (aligned - 1);
+    const alignedFamilies = netDir >= 0 ? bullishFamilySet.size : bearishFamilySet.size;
+    if (aligned >= 2 && alignedFamilies >= 2) score *= 1 + 0.1 * (aligned - 1);
   }
 
   // Final step: sector-priority multiplier. Compounds with diversity +
@@ -576,6 +715,8 @@ export type SectorHorizon = "1h" | "4h" | "24h";
 
 const SECTOR_RS_MIN_MEMBERS = 4;
 const SECTOR_RS_Z_THRESHOLD = 1.5; // ≈ top/bottom ~7% by Z-score
+const SECTOR_RS_RESET_Z = 1.0;
+const SECTOR_RS_MIN_MAD_PCT = 0.05;
 
 // Horizon → timeframe tag mapping. 24h sector RS lives at the daily
 // timeframe; 4h at the 4h scan; 1h at the 1h scan. This lets the
@@ -600,39 +741,56 @@ function rankSectorHorizon(
   const sorted = [...members].sort((a, b) => a.change - b.change);
   const median = sorted[Math.floor(sorted.length / 2)].change;
   const absDevs = members.map((m) => Math.abs(m.change - median)).sort((a, b) => a - b);
-  const mad = absDevs[Math.floor(absDevs.length / 2)] || 0.0001;
+  const mad = absDevs[Math.floor(absDevs.length / 2)] ?? 0;
+  const tf = HORIZON_TF[horizon];
+  if (mad < SECTOR_RS_MIN_MAD_PCT) {
+    for (const member of members) {
+      fireStateEvent(member.symbol, "sector_leader", "bullish", 0, "", false, true, tf);
+      fireStateEvent(member.symbol, "sector_laggard", "bearish", 0, "", false, true, tf);
+    }
+    return [];
+  }
   // 1.4826 scales MAD to an estimate of σ for a normal distribution.
   const sigma = mad * 1.4826;
-  const tf = HORIZON_TF[horizon];
 
   const out: Signal[] = [];
   for (const m of members) {
     const z = (m.change - median) / sigma;
-    if (z >= SECTOR_RS_Z_THRESHOLD) {
-      out.push({
-        symbol: m.symbol,
-        type: "sector_leader",
-        family: "structure",
-        direction: "bullish",
-        value: z,
-        strength: Math.min(100, ((z - SECTOR_RS_Z_THRESHOLD) / 2) * 80 + 40),
-        label: `Sector leader in ${sector} (${horizon}): ${m.change.toFixed(1)}% vs median ${median.toFixed(1)}% (z=${z.toFixed(1)})`,
-        firedAt,
-        timeframe: tf,
-      });
-    } else if (z <= -SECTOR_RS_Z_THRESHOLD) {
-      out.push({
-        symbol: m.symbol,
-        type: "sector_laggard",
-        family: "structure",
-        direction: "bearish",
-        value: z,
-        strength: Math.min(100, ((Math.abs(z) - SECTOR_RS_Z_THRESHOLD) / 2) * 80 + 40),
-        label: `Sector laggard in ${sector} (${horizon}): ${m.change.toFixed(1)}% vs median ${median.toFixed(1)}% (z=${z.toFixed(1)})`,
-        firedAt,
-        timeframe: tf,
-      });
-    }
+    const leader = fireStateEvent(
+      m.symbol,
+      "sector_leader",
+      "bullish",
+      z,
+      `Sector leader in ${sector} (${horizon}): ${m.change.toFixed(1)}% vs median ${median.toFixed(1)}% (z=${z.toFixed(1)})`,
+      z >= SECTOR_RS_Z_THRESHOLD,
+      z < SECTOR_RS_RESET_Z,
+      tf,
+    );
+    if (leader) out.push({
+      ...leader,
+      family: "structure",
+      strength: Math.min(100, ((z - SECTOR_RS_Z_THRESHOLD) / 2) * 80 + 40),
+      firedAt,
+      timeframe: tf,
+    });
+
+    const laggard = fireStateEvent(
+      m.symbol,
+      "sector_laggard",
+      "bearish",
+      z,
+      `Sector laggard in ${sector} (${horizon}): ${m.change.toFixed(1)}% vs median ${median.toFixed(1)}% (z=${z.toFixed(1)})`,
+      z <= -SECTOR_RS_Z_THRESHOLD,
+      z > -SECTOR_RS_RESET_Z,
+      tf,
+    );
+    if (laggard) out.push({
+      ...laggard,
+      family: "structure",
+      strength: Math.min(100, ((Math.abs(z) - SECTOR_RS_Z_THRESHOLD) / 2) * 80 + 40),
+      firedAt,
+      timeframe: tf,
+    });
   }
   return out;
 }
@@ -697,8 +855,8 @@ export function detectSocialSpike(snapshot: SocialSnapshot[]): Signal[] {
   const out: Signal[] = [];
   for (const s of snapshot) {
     if (s.change_pct == null || !Number.isFinite(s.change_pct)) continue;
-    if (s.mention_count < SOCIAL_SPIKE_MIN_COUNT) continue;
-    if (s.change_pct < SOCIAL_SPIKE_PCT) continue;
+    const active = s.mention_count >= SOCIAL_SPIKE_MIN_COUNT && s.change_pct >= SOCIAL_SPIKE_PCT;
+    const reset = s.mention_count < 75 || s.change_pct < 35;
 
     // Strength: linearly scale 50% → 40, 200%+ → 100. Caps protect
     // against the rare ticker that 10×s its mention count overnight.
@@ -706,14 +864,21 @@ export function detectSocialSpike(snapshot: SocialSnapshot[]): Signal[] {
       100,
       40 + ((s.change_pct - SOCIAL_SPIKE_PCT) / 150) * 60
     );
+    const stateSignal = fireStateEvent(
+      s.symbol,
+      "social_spike",
+      "bullish",
+      s.change_pct,
+      `Mindshare spike: ${s.mention_count} mentions (+${s.change_pct.toFixed(0)}% 24h)`,
+      active,
+      reset,
+      "cross",
+    );
+    if (!stateSignal) continue;
     out.push({
-      symbol: s.symbol,
-      type: "social_spike",
+      ...stateSignal,
       family: "social",
-      direction: "bullish",
-      value: s.change_pct,
       strength,
-      label: `Mindshare spike: ${s.mention_count} mentions (+${s.change_pct.toFixed(0)}% 24h)`,
       firedAt: now,
       // Tagged "cross" because mindshare is a cross-sectional signal
       // not tied to a candle timeframe. Mirrors sector_leader / laggard

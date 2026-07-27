@@ -26,9 +26,10 @@ const TIMEFRAMES: { tf: Timeframe; interval: "1h" | "4h" | "1d"; bars: number }[
 
 export async function GET(
   _req: NextRequest,
-  { params }: { params: { symbol: string } }
+  { params }: { params: Promise<{ symbol: string }> }
 ) {
-  const symbol = (params.symbol ?? "").toUpperCase();
+  const { symbol: symbolParam } = await params;
+  const symbol = (symbolParam ?? "").toUpperCase();
   if (!symbol) return NextResponse.json({ error: "missing symbol" }, { status: 400 });
   if (!HL_PERP_SECTOR_MAP[symbol]) {
     return NextResponse.json(

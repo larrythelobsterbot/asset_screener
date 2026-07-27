@@ -6,14 +6,17 @@
     "dev": "next dev",
     "build": "next build",
     "start": "next start -p 3003",
-    "lint": "next lint",
-    "test": "node --test --import tsx --test-reporter=spec 'src/lib/__tests__/*.test.ts'"
+    "lint": "eslint . --max-warnings=0",
+    "test": "node --test --import tsx --test-reporter=spec 'src/lib/__tests__/*.test.ts'",
+    "backfill:telegram": "tsx scripts/backfill-telegram-alerts.ts",
+    "report:stage2-shadow": "tsx scripts/stage2-shadow-report.ts",
+    "report:market-open-oi": "tsx scripts/market-open-oi-backtest.ts"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.103.3",
     "@types/better-sqlite3": "^7.6.13",
     "better-sqlite3": "^12.10.0",
-    "next": "14.2.35",
+    "next": "^15.5.20",
     "react": "^18",
     "react-dom": "^18"
   },
@@ -22,8 +25,8 @@
     "@types/react": "^18",
     "@types/react-dom": "^18",
     "eslint": "^8",
-    "eslint-config-next": "14.2.35",
-    "postcss": "^8",
+    "eslint-config-next": "^15.5.20",
+    "postcss": "^8.5.20",
     "tailwindcss": "^3.4.1",
     "tsx": "^4.21.0",
     "typescript": "^5"

@@ -28,6 +28,16 @@ export default function SignalTable({ signals, onSelectAsset }: Props) {
     }
   };
 
+  const handleSortKeyDown = (
+    event: React.KeyboardEvent<HTMLTableCellElement>,
+    key: SortKey,
+  ) => {
+    if (event.key === "Enter" || event.key === " ") {
+      event.preventDefault();
+      handleSort(key);
+    }
+  };
+
   const headers: { key: SortKey; label: string }[] = [
     { key: "symbol", label: "Asset" },
     { key: "type", label: "Signal" },
@@ -53,6 +63,9 @@ export default function SignalTable({ signals, onSelectAsset }: Props) {
                 key={h.key}
                 className="py-2 px-3 cursor-pointer hover:text-gray-300 transition-colors"
                 onClick={() => handleSort(h.key)}
+                onKeyDown={(event) => handleSortKeyDown(event, h.key)}
+                tabIndex={0}
+                aria-sort={sortKey === h.key ? (sortAsc ? "ascending" : "descending") : "none"}
               >
                 {h.label}
                 {sortKey === h.key && (
@@ -69,6 +82,14 @@ export default function SignalTable({ signals, onSelectAsset }: Props) {
               key={`${sig.symbol}-${sig.type}-${i}`}
               className="border-b border-white/3 hover:bg-white/3 cursor-pointer transition-colors"
               onClick={() => onSelectAsset(sig.symbol)}
+              tabIndex={0}
+              aria-label={`Open ${sig.symbol} details`}
+              onKeyDown={(event) => {
+                if (event.key === "Enter" || event.key === " ") {
+                  event.preventDefault();
+                  onSelectAsset(sig.symbol);
+                }
+              }}
             >
               <td className="py-2.5 px-3 font-semibold text-white">
                 {sig.symbol}

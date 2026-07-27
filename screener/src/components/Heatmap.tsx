@@ -17,6 +17,12 @@ import { SECTORS, Sector } from "@/config/sectors";
 import { Timeframe } from "./TimeframeToggle";
 import HeatmapTile from "./HeatmapTile";
 import { useAttention, attentionTone } from "@/lib/useAttention";
+import {
+  getHeatmapColorValue,
+  getHeatmapWeight,
+  type HeatmapColorMetric,
+  type HeatmapSizeMetric,
+} from "@/lib/heatmapMetrics";
 
 interface Props {
   assets: AssetData[];
@@ -118,22 +124,6 @@ function squarify<T extends { value: number }>(
 
 // ── Helpers ──────────────────────────────────────────────────────────────
 
-function assetWeight(a: AssetData): number {
-  // log10(value/1e6 + 1). +1 protects against negative when value < 1e6.
-  // We don't have market cap for HL perps, so use volume24h as the proxy.
-  const v = a.volume24h ?? 1e6;
-  return Math.log10(Math.max(1, v) / 1e6 + 1);
-}
-
-function changeFor(a: AssetData, tf: Timeframe): number | null {
-  switch (tf) {
-    case "1h":  return a.change1h;
-    case "4h":  return a.change4h;
-    case "24h": return a.change24h;
-    case "7d":  return a.change7d;
-  }
-}
-
 // ── Component ────────────────────────────────────────────────────────────
 
 const HEADER_H = 22;
@@ -145,6 +135,8 @@ export default function Heatmap({
 }: Props) {
   const wrapRef = useRef<HTMLDivElement | null>(null);
   const [dim, setDim] = useState({ w: 1200, h: 700 });
+  const [colorMetric, setColorMetric] = useState<HeatmapColorMetric>("price");
+  const [sizeMetric, setSizeMetric] = useState<HeatmapSizeMetric>("volume");
   // Attention radar lookup for the per-tile accel badge.
   const { bySymbol: attention } = useAttention();
 
@@ -190,7 +182,7 @@ export default function Heatmap({
       }
     }
     for (const g of groupsMap.values()) {
-      g.value = Math.max(0.0001, g.items.reduce((s, a) => s + assetWeight(a), 0));
+      g.value = Math.max(0.0001, g.items.reduce((s, a) => s + getHeatmapWeight(a, sizeMetric), 0));
     }
 
     const placedSectors = squarify([...groupsMap.values()], 0, 0, dim.w, dim.h);
@@ -199,12 +191,12 @@ export default function Heatmap({
       const innerH = Math.max(0, g.h - HEADER_H);
       const assetNodes = g.items.map((a) => ({
         asset: a,
-        value: assetWeight(a),
+        value: getHeatmapWeight(a, sizeMetric),
       }));
       const placedAssets = squarify(assetNodes, 0, HEADER_H, g.w, innerH);
       return { sector: g, tiles: placedAssets };
     });
-  }, [visibleAssets, dim]);
+  }, [visibleAssets, dim, sizeMetric]);
 
   if (isLoading) {
     return (
@@ -268,7 +260,7 @@ export default function Heatmap({
               letterSpacing: ".16em", textTransform: "uppercase",
               color: "var(--text)",
             }}>
-              Heatmap
+              Market Map
             </span>
             <span style={{
               fontSize: 10, color: "var(--text-mute)",
@@ -283,21 +275,48 @@ export default function Heatmap({
               fontFamily: "var(--font-geist-mono), ui-monospace, monospace",
               textTransform: "uppercase",
             }}>
-              · {timeframe} change
+              · color {colorMetric === "price" ? `${timeframe} price` : colorMetric === "oi-change" ? "24h OI" : "24h funding"}
+              · size {sizeMetric === "volume" ? "volume" : sizeMetric === "oi" ? "OI USD" : "equal"}
             </span>
           </div>
 
           <div style={{
-            display: "flex", alignItems: "center", gap: 8,
+            display: "flex", alignItems: "center", justifyContent: "flex-end", flexWrap: "wrap", gap: 8,
             fontSize: 10, color: "var(--text-mute)",
             fontFamily: "var(--font-geist-mono), ui-monospace, monospace",
           }}>
-            <span>−10%</span>
+            <label style={{ display: "flex", alignItems: "center", gap: 5 }}>
+              <span style={{ textTransform: "uppercase", letterSpacing: ".08em" }}>Color</span>
+              <select
+                value={colorMetric}
+                onChange={(event) => setColorMetric(event.target.value as HeatmapColorMetric)}
+                aria-label="Heatmap color metric"
+                style={{ background: "var(--bg-chip)", color: "var(--text)", border: ".5px solid var(--border)", borderRadius: 3, padding: "4px 6px", fontSize: 10 }}
+              >
+                <option value="price">Price change</option>
+                <option value="oi-change">OI change</option>
+                <option value="funding">Funding crowding</option>
+              </select>
+            </label>
+            <label style={{ display: "flex", alignItems: "center", gap: 5 }}>
+              <span style={{ textTransform: "uppercase", letterSpacing: ".08em" }}>Size</span>
+              <select
+                value={sizeMetric}
+                onChange={(event) => setSizeMetric(event.target.value as HeatmapSizeMetric)}
+                aria-label="Heatmap size metric"
+                style={{ background: "var(--bg-chip)", color: "var(--text)", border: ".5px solid var(--border)", borderRadius: 3, padding: "4px 6px", fontSize: 10 }}
+              >
+                <option value="volume">24h volume</option>
+                <option value="oi">OI USD</option>
+                <option value="equal">Equal</option>
+              </select>
+            </label>
+            <span>{colorMetric === "funding" ? "Long crowded" : "Negative"}</span>
             <span style={{
-              width: 100, height: 8, borderRadius: 2,
+              width: 70, height: 8, borderRadius: 2,
               background: "linear-gradient(90deg, var(--acc-down), var(--bg-chip), var(--acc-up))",
             }} />
-            <span>+10%</span>
+            <span>{colorMetric === "funding" ? "Short crowded" : "Positive"}</span>
           </div>
         </div>
 
@@ -352,6 +371,7 @@ export default function Heatmap({
 
               {tiles.map((t) => {
                 const at = attention.get(t.asset.symbol);
+                const metric = getHeatmapColorValue(t.asset, colorMetric, timeframe);
                 return (
                   <HeatmapTile
                     key={t.asset.symbol}
@@ -360,7 +380,9 @@ export default function Heatmap({
                     y={t.y}
                     w={t.w}
                     h={t.h}
-                    change={changeFor(t.asset, timeframe)}
+                    tone={metric.tone}
+                    displayValue={metric.display}
+                    metricLabel={metric.tooltip}
                     onClick={() => onSelectAsset(t.asset.symbol)}
                     isHidden={hidden?.has(t.asset.symbol) ?? false}
                     onToggleHide={onToggleHide}

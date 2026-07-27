@@ -39,9 +39,9 @@ function isValidSymbol(s: string): boolean {
 
 export async function GET(
   _req: Request,
-  { params }: { params: { symbol: string } }
+  { params }: { params: Promise<{ symbol: string }> }
 ) {
-  const { symbol } = params;
+  const { symbol } = await params;
 
   // Reject unknown symbols up-front (400) instead of fanning out to HL.
   if (!isValidSymbol(symbol)) {

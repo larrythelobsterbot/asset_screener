@@ -20,6 +20,8 @@ import {
   detectSectorRelativeStrength,
   detectSectorRelativeStrengthMulti,
   detectSocialSpike,
+  deriveVolRegime,
+  filterClosedCandles,
   scoreConviction,
   type Signal,
   type SectorSnapshot,
@@ -62,6 +64,59 @@ test("detectSignals fires volume_spike when last bar >2× avg", () => {
   assert.ok((vs?.strength ?? 0) >= 40, "strength should be scaled");
 });
 
+test("volume_spike fires only on activation and rearms after a hysteresis reset", () => {
+  const { closes, highs, lows } = uptrendSeries(80);
+  const volumes = new Array(80).fill(100);
+  const volumeSignals = () => detectSignals(
+    "STATEVOL",
+    closes,
+    volumes,
+    highs,
+    lows,
+    undefined,
+    undefined,
+    "4h",
+  ).filter((signal) => signal.type === "volume_spike");
+
+  volumes[volumes.length - 1] = 300;
+  assert.equal(volumeSignals().length, 1, "first threshold crossing should fire");
+  assert.equal(volumeSignals().length, 0, "persistent active state must not refire");
+
+  volumes[volumes.length - 1] = 170;
+  assert.equal(volumeSignals().length, 0, "hysteresis band should keep the state armed");
+
+  volumes[volumes.length - 1] = 120;
+  assert.equal(volumeSignals().length, 0, "reset scan does not fire");
+  volumes[volumes.length - 1] = 300;
+  assert.equal(volumeSignals().length, 1, "a fresh crossing after reset should fire again");
+});
+
+test("RSI level state does not refire until price action resets the hysteresis band", () => {
+  const hot = uptrendSeries(100);
+  const scan = (series: ReturnType<typeof uptrendSeries>) => detectSignals(
+    "STATERSI",
+    series.closes,
+    series.volumes,
+    series.highs,
+    series.lows,
+    undefined,
+    undefined,
+    "4h",
+  ).filter((signal) => signal.type === "rsi_overbought");
+
+  assert.equal(scan(hot).length, 1);
+  assert.equal(scan(hot).length, 0);
+
+  const reset = uptrendSeries(100);
+  for (let i = 80; i < 100; i++) {
+    reset.closes[i] = 150 - (i - 80) * 2;
+    reset.highs[i] = reset.closes[i] + 0.4;
+    reset.lows[i] = reset.closes[i] - 0.4;
+  }
+  assert.equal(scan(reset).length, 0);
+  assert.equal(scan(hot).length, 1);
+});
+
 // ── detectSignals / breakout ────────────────────────────────────────────
 test("detectSignals fires breakout_up when close breaks 20-bar high", () => {
   const { closes, highs, lows, volumes } = uptrendSeries(100);
@@ -96,6 +151,26 @@ test("funding_anomaly cold-start uses conservative absolute threshold", () => {
   assert.ok(extreme.find((s) => s.type === "funding_anomaly"));
 });
 
+test("funding anomaly rearms after returning to its central percentile band", () => {
+  const { closes, highs, lows, volumes } = uptrendSeries(60);
+  const hist = Array.from({ length: 48 }, () => 0.00005);
+  const scan = (rate: number) => detectSignals(
+    "STATEFUND",
+    closes,
+    volumes,
+    highs,
+    lows,
+    rate,
+    hist,
+    "4h",
+  ).filter((signal) => signal.type === "funding_anomaly");
+
+  assert.equal(scan(0.002).length, 1);
+  assert.equal(scan(0.002).length, 0);
+  assert.equal(scan(0.00005).length, 0);
+  assert.equal(scan(0.002).length, 1);
+});
+
 // ── Sector-relative strength ───────────────────────────────────────────
 test("detectSectorRelativeStrength flags outlier in a well-populated sector", () => {
   // 8 members, one clear leader, one clear laggard, rest flat around 1%.
@@ -126,6 +201,33 @@ test("detectSectorRelativeStrength skips sectors below the minimum member count"
   assert.equal(signals.length, 0, "3 members is below threshold — should not fire");
 });
 
+test("sector relative strength rejects near-zero dispersion instead of exploding the z-score", () => {
+  const snapshot: SectorSnapshot[] = [
+    { symbol: "D1", sector: "l1", change24h: 0.010 },
+    { symbol: "D2", sector: "l1", change24h: 0.011 },
+    { symbol: "D3", sector: "l1", change24h: 0.012 },
+    { symbol: "D4", sector: "l1", change24h: 0.200 },
+  ];
+  assert.equal(detectSectorRelativeStrength(snapshot).length, 0);
+});
+
+test("sector leader fires once, resets below hysteresis, then can fire again", () => {
+  const makeSnapshot = (leader: number): SectorMultiSnapshot[] => [
+    { symbol: "RS1", sector: "meme", change1h: null, change4h: null, change24h: 0 },
+    { symbol: "RS2", sector: "meme", change1h: null, change4h: null, change24h: 1 },
+    { symbol: "RS3", sector: "meme", change1h: null, change4h: null, change24h: 2 },
+    { symbol: "RS4", sector: "meme", change1h: null, change4h: null, change24h: 3 },
+    { symbol: "RSLEAD", sector: "meme", change1h: null, change4h: null, change24h: leader },
+  ];
+  const leaders = (value: number) => detectSectorRelativeStrengthMulti(makeSnapshot(value))
+    .filter((signal) => signal.symbol === "RSLEAD" && signal.type === "sector_leader");
+
+  assert.equal(leaders(10).length, 1);
+  assert.equal(leaders(10).length, 0);
+  assert.equal(leaders(2.1).length, 0);
+  assert.equal(leaders(10).length, 1);
+});
+
 // ── Multi-horizon sector RS ────────────────────────────────────────────
 test("detectSectorRelativeStrengthMulti emits one signal per horizon for the same outlier", () => {
   // 8 members per horizon; same shape across 1h / 4h / 24h. We expect
@@ -139,12 +241,12 @@ test("detectSectorRelativeStrengthMulti emits one signal per horizon for the sam
     change4h: c,
     change24h: c,
   }));
-  snap.push({ symbol: "LEADER", sector: "l1", change1h: 8, change4h: 8, change24h: 8 });
-  snap.push({ symbol: "LAGGARD", sector: "l1", change1h: -5, change4h: -5, change24h: -5 });
+  snap.push({ symbol: "MLEADER", sector: "l1", change1h: 8, change4h: 8, change24h: 8 });
+  snap.push({ symbol: "MLAGGARD", sector: "l1", change1h: -5, change4h: -5, change24h: -5 });
 
   const sigs = detectSectorRelativeStrengthMulti(snap);
-  const leaderSigs = sigs.filter((s) => s.symbol === "LEADER");
-  const laggardSigs = sigs.filter((s) => s.symbol === "LAGGARD");
+  const leaderSigs = sigs.filter((s) => s.symbol === "MLEADER");
+  const laggardSigs = sigs.filter((s) => s.symbol === "MLAGGARD");
   assert.equal(leaderSigs.length, 3, "leader should fire on all 3 horizons");
   assert.equal(laggardSigs.length, 3, "laggard should fire on all 3 horizons");
 
@@ -209,7 +311,7 @@ test("detectSocialSpike skips tiny-volume tickers even at high change_pct", () =
 test("detectSocialSpike strength scales with magnitude", () => {
   const at = (changePct: number): number | undefined => {
     const sigs = detectSocialSpike([
-      { symbol: "X", mention_count: 500, prev_count: 250, change_pct: changePct },
+      { symbol: `X${changePct}`, mention_count: 500, prev_count: 250, change_pct: changePct },
     ]);
     return sigs[0]?.strength;
   };
@@ -219,6 +321,18 @@ test("detectSocialSpike strength scales with magnitude", () => {
   assert.ok(s50 < s100, "+100% should be stronger than +50%");
   assert.ok(s100 < s200, "+200% should be stronger than +100%");
   assert.ok(s200 <= 100, "strength caps at 100");
+});
+
+test("social_spike fires on activation and rearms only after a hysteresis reset", () => {
+  const scan = (mention_count: number, change_pct: number) => detectSocialSpike([
+    { symbol: "SOCSTATE", mention_count, prev_count: 100, change_pct },
+  ]).filter((signal) => signal.type === "social_spike");
+
+  assert.equal(scan(200, 100).length, 1);
+  assert.equal(scan(200, 100).length, 0);
+  assert.equal(scan(90, 40).length, 0, "hysteresis band must not reset");
+  assert.equal(scan(50, 20).length, 0);
+  assert.equal(scan(200, 100).length, 1);
 });
 
 test("scoreConviction with social_spike + TA confluence pushes into Strong Buy", () => {
@@ -254,6 +368,31 @@ test("scoreConviction labels Strong Buy when multiple aligned bullish families f
   assert.equal(r.bullishCount, 4);
   assert.equal(r.bearishCount, 0);
   assert.ok(r.contributingFamilies.length >= 3, "diversity bonus depends on this");
+});
+
+test("scoreConviction caps repeated same-family evidence across timeframes", () => {
+  const now = Date.now();
+  const signals: Signal[] = (["1h", "4h", "1d"] as const).map((timeframe) => ({
+    symbol: "X",
+    type: "sector_leader",
+    family: "structure",
+    direction: "bullish",
+    value: 3,
+    strength: 100,
+    label: "",
+    firedAt: now,
+    timeframe,
+  }));
+
+  const result = scoreConviction(signals, 1, "normal");
+  assert.ok(result.score < 3.5, `expected bounded score below alert threshold, got ${result.score}`);
+  assert.notEqual(result.label, "Strong Buy");
+
+  const prioritized = scoreConviction(signals, 1.4, "normal");
+  assert.ok(
+    prioritized.score < 3.5,
+    `a single correlated family must stay below threshold even with sector priority, got ${prioritized.score}`,
+  );
 });
 
 test("scoreConviction: sectorPriority multiplier amplifies the final score", () => {
@@ -297,6 +436,34 @@ test("scoreConviction returns Neutral on no signals", () => {
   const r = scoreConviction([]);
   assert.equal(r.label, "Neutral");
   assert.equal(r.score, 0);
+});
+
+test("filterClosedCandles excludes the still-forming candle and keeps an exact-close candle", () => {
+  const now = 10_000;
+  const candles = [
+    { T: 9_000, value: "closed" },
+    { T: 10_000, value: "just-closed" },
+    { T: 11_000, value: "forming" },
+  ];
+
+  assert.deepEqual(filterClosedCandles(candles, now), candles.slice(0, 2));
+});
+
+test("scoreConviction uses the explicit primary volatility regime instead of signal ordering", () => {
+  const now = Date.now();
+  const signals: Signal[] = [
+    { symbol: "X", type: "rsi_oversold", family: "momentum", direction: "bullish", value: 25, label: "", firedAt: now, timeframe: "4h", volRegime: "normal" },
+    { symbol: "X", type: "sector_leader", family: "structure", direction: "bullish", value: 2, label: "", firedAt: now - 1, timeframe: "1d" },
+  ];
+
+  assert.equal(scoreConviction(signals, 1, "normal").volRegime, "normal");
+  assert.equal(scoreConviction(signals, 1, "unknown").volRegime, "unknown");
+});
+
+test("deriveVolRegime computes a primary regime without requiring any signal to fire", () => {
+  const { closes, highs, lows } = uptrendSeries(120);
+  assert.notEqual(deriveVolRegime(highs, lows, closes), "unknown");
+  assert.equal(deriveVolRegime([], [], []), "unknown");
 });
 
 test("scoreConviction nets out opposing signals", () => {

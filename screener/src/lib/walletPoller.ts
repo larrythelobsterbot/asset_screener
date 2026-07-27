@@ -32,6 +32,12 @@ const MAX_CONSECUTIVE_FAILURES = 5;
 
 let started = false;
 let running = false; // re-entrancy guard: a slow cycle must not overlap the next
+let lastCycleAt: number | null = null;
+let lastSuccessfulAt: number | null = null;
+let lastDurationMs: number | null = null;
+let lastOk = 0;
+let lastFailed = 0;
+let lastError: string | null = null;
 
 // In-memory strike counter. Resets on process restart (PM2 reload), which
 // just gives every wallet a fresh set of 5 strikes — acceptable, since a
@@ -154,12 +160,28 @@ async function runOnce(): Promise<void> {
 
     insertWalletPositions(rows);
 
+    lastCycleAt = Date.now();
+    lastDurationMs = lastCycleAt - t0;
+    lastOk = ok;
+    lastFailed = failed;
+    if (failed === 0 && ok > 0) {
+      lastSuccessfulAt = lastCycleAt;
+      lastError = null;
+    } else if (failed > 0) {
+      lastError = `${failed}/${ok + failed} wallet fetches failed`;
+    } else {
+      lastError = "no tracked wallets were available to poll";
+    }
+
     console.info(
       `[wallet-poller] ${ok} ok, ${failed} failed, ${rows.length} positions` +
         (skippedRows > 0 ? `, ${skippedRows} malformed rows skipped` : "") +
         `, ${((Date.now() - t0) / 1000).toFixed(0)}s`
     );
   } catch (err) {
+    lastCycleAt = Date.now();
+    lastDurationMs = lastCycleAt - t0;
+    lastError = String(err);
     console.warn("[wallet-poller] cycle failed:", err);
   } finally {
     running = false;
@@ -177,4 +199,26 @@ export function startWalletPoller(): void {
     if (typeof t.unref === "function") t.unref();
     console.info("[wallet-poller] started (15min cycle, 300ms spacing)");
   }, FIRST_RUN_DELAY_MS);
+}
+
+export function getWalletPollerStats(): {
+  started: boolean;
+  running: boolean;
+  lastCycleAt: number | null;
+  lastSuccessfulAt: number | null;
+  lastDurationMs: number | null;
+  lastOk: number;
+  lastFailed: number;
+  lastError: string | null;
+} {
+  return {
+    started,
+    running,
+    lastCycleAt,
+    lastSuccessfulAt,
+    lastDurationMs,
+    lastOk,
+    lastFailed,
+    lastError,
+  };
 }

@@ -2,7 +2,7 @@
 
 ## Overview
 
-A real-time multi-asset screener hosted at `assets.lekker.design` (VPS: 187.124.236.128). Built with Next.js 14 (App Router, TypeScript, Tailwind). Screens Hyperliquid HIP-3 perpetuals (stocks, commodities, pre-IPO) and crypto (CoinGecko). High-end visual design with vibrant colors.
+A real-time multi-asset screener hosted at `asset.lekker.design` (VPS: 187.124.236.128). Built with Next.js 14 (App Router, TypeScript, Tailwind). Screens Hyperliquid HIP-3 perpetuals (stocks, commodities, pre-IPO) and crypto (CoinGecko). High-end visual design with vibrant colors.
 
 ## Data Sources
 
@@ -216,10 +216,10 @@ export const SECTOR_MAP: Record<string, { sector: string; label: string }> = {
 
 ## Deployment
 
-- **Nginx:** `assets.lekker.design` → proxy_pass `localhost:3000`
+- **Nginx:** `asset.lekker.design` → proxy_pass `127.0.0.1:3003`
 - **SSL:** Let's Encrypt via certbot
-- **PM2:** `pm2 start npm --name asset-screener -- start`
-- **DNS:** A record `assets.lekker.design` → `187.124.236.128`
+- **PM2:** `pm2 start screener/ecosystem.config.js --only asset-screener`
+- **DNS:** A record `asset.lekker.design` → `187.124.236.128`
 
 ## Out of Scope
 - Twelve Data API (placeholder for now)

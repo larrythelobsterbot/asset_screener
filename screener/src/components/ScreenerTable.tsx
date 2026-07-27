@@ -39,6 +39,8 @@ type SortKey =
   | "funding_avg_apr"
   | "vol_oi";
 
+type ColumnPreset = "price" | "positioning" | "technical" | "all";
+
 function mapToCandleTF(tf: HeatmapTF): "1h" | "4h" | "1d" {
   if (tf === "1h") return "1h";
   if (tf === "4h") return "4h";
@@ -176,6 +178,8 @@ export default function ScreenerTable({
   const [screenerLoading, setScreenerLoading] = useState(true);
   const [sortKey, setSortKey] = useState<SortKey>("volume24h");
   const [sortAsc, setSortAsc] = useState(false);
+  const [columnPreset, setColumnPreset] = useState<ColumnPreset>("positioning");
+  const [density, setDensity] = useState<"compact" | "comfy">("compact");
 
   useEffect(() => {
     let cancelled = false;
@@ -270,6 +274,20 @@ export default function ScreenerTable({
       </span>
     ) : null;
 
+  const sortableHeaderProps = (key: SortKey) => ({
+    tabIndex: 0,
+    "aria-sort": (sortKey === key
+      ? (sortAsc ? "ascending" : "descending")
+      : "none") as React.AriaAttributes["aria-sort"],
+    onClick: () => handleSort(key),
+    onKeyDown: (event: React.KeyboardEvent<HTMLTableCellElement>) => {
+      if (event.key === "Enter" || event.key === " ") {
+        event.preventDefault();
+        handleSort(key);
+      }
+    },
+  });
+
   if (isLoading) {
     return (
       <div className="flex-1 flex items-center justify-center py-20">
@@ -312,7 +330,7 @@ export default function ScreenerTable({
   return (
     <div style={{ padding: "0 24px 24px" }}>
       <div
-        className="density-comfy"
+        className={`density-${density} table-preset-${columnPreset}`}
         style={{
           background: "var(--bg-card)",
           border: ".5px solid var(--border)",
@@ -352,35 +370,63 @@ export default function ScreenerTable({
               MAs: {candleTf}
             </span>
           </div>
-          {screenerLoading && (
-            <span style={{ fontSize: 10, color: "var(--text-mute)" }}>computing indicators…</span>
-          )}
+          <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap", justifyContent: "flex-end" }}>
+            <label style={{ display: "flex", alignItems: "center", gap: 5, color: "var(--text-mute)", fontSize: 9, textTransform: "uppercase", letterSpacing: ".08em" }}>
+              Lens
+              <select
+                value={columnPreset}
+                onChange={(event) => setColumnPreset(event.target.value as ColumnPreset)}
+                aria-label="Table column lens"
+                style={{ background: "var(--bg-chip)", color: "var(--text)", border: ".5px solid var(--border)", borderRadius: 3, padding: "4px 6px", fontSize: 10 }}
+              >
+                <option value="positioning">Positioning</option>
+                <option value="price">Price action</option>
+                <option value="technical">Technical</option>
+                <option value="all">All columns</option>
+              </select>
+            </label>
+            <div style={{ display: "flex", border: ".5px solid var(--border)", borderRadius: 3, overflow: "hidden" }}>
+              {(["compact", "comfy"] as const).map((value) => (
+                <button
+                  key={value}
+                  onClick={() => setDensity(value)}
+                  aria-pressed={density === value}
+                  style={{ border: 0, borderLeft: value === "comfy" ? ".5px solid var(--border)" : 0, background: density === value ? "var(--bg-chip)" : "transparent", color: density === value ? "var(--acc-warn)" : "var(--text-mute)", padding: "5px 7px", fontSize: 9, cursor: "pointer", textTransform: "capitalize" }}
+                >
+                  {value}
+                </button>
+              ))}
+            </div>
+            {screenerLoading && (
+              <span style={{ fontSize: 10, color: "var(--text-mute)" }}>computing indicators…</span>
+            )}
+          </div>
         </div>
 
         <div style={{ overflowX: "auto" }}>
           <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 12 }}>
             <thead>
               <tr>
-                <th style={{ ...thRight, width: 32 }}>#</th>
-                <th style={thStyle} onClick={() => handleSort("name")}>Name{arr("name")}</th>
-                <th style={thStyle}>Sym</th>
-                <th style={thRight} onClick={() => handleSort("price")}>Price{arr("price")}</th>
-                <th style={thRight} onClick={() => handleSort("change1h")}>1H%{arr("change1h")}</th>
-                <th style={thRight} onClick={() => handleSort("change4h")}>4H%{arr("change4h")}</th>
-                <th style={thRight} onClick={() => handleSort("change24h")}>24H%{arr("change24h")}</th>
-                <th style={thRight} onClick={() => handleSort("change7d")}>7D%{arr("change7d")}</th>
-                <th style={thRight} onClick={() => handleSort("volume24h")}>Vol 24H{arr("volume24h")}</th>
-                <th style={thRight} onClick={() => handleSort("oi_usd")} title="Open interest in USD (HL reports it in coins; this is coins × price).">OI{arr("oi_usd")}</th>
-                <th style={thRight} onClick={() => handleSort("oi_change_24h")} title="Change in USD open interest vs 24h ago. Green = OI grew (new money took positions), red = OI shrank (positions closed). This is money flow, not price direction.">ΔOI 24H{arr("oi_change_24h")}</th>
-                <th style={thRight} onClick={() => handleSort("oi_change_7d")} title="Change in USD open interest vs 7d ago.">ΔOI 7D{arr("oi_change_7d")}</th>
-                <th style={thRight} onClick={() => handleSort("vol_oi")} title="24h volume ÷ open interest. <0.5× = parked positions, >2× = actively churned.">Vol/OI{arr("vol_oi")}</th>
-                <th style={thRight} onClick={() => handleSort("vol_ratio")}>Vol Ratio{arr("vol_ratio")}</th>
-                <th style={thRight} onClick={() => handleSort("funding_apr")} title="Annualized funding APR, current print. + = longs pay shorts.">Fund APR{arr("funding_apr")}</th>
-                <th style={thRight} onClick={() => handleSort("funding_avg_apr")} title="Mean funding APR over the last 24h. The spot print whipsaws on thin markets; this is what separates structural crowding from noise.">F̄ 24H{arr("funding_avg_apr")}</th>
-                <th style={thRight} onClick={() => handleSort("ath_pct")}>ATH%{arr("ath_pct")}</th>
-                <th style={{ ...thStyle, width: 100, textAlign: "center" }}>Spark</th>
-                <th style={thStyle} onClick={() => handleSort("rsi")}>RSI{arr("rsi")}</th>
-                <th style={thStyle}>MAs ({candleTf})</th>
+                <th className="sticky-rank" style={{ ...thRight, width: 32 }}>#</th>
+                <th className="sticky-name" style={thStyle} {...sortableHeaderProps("name")}>Name{arr("name")}</th>
+                <th className="sticky-symbol" style={thStyle}>Sym</th>
+                <th style={thRight} {...sortableHeaderProps("price")}>Price{arr("price")}</th>
+                <th className="col-price" style={thRight} {...sortableHeaderProps("change1h")}>1H%{arr("change1h")}</th>
+                <th className="col-price" style={thRight} {...sortableHeaderProps("change4h")}>4H%{arr("change4h")}</th>
+                <th className="col-price" style={thRight} {...sortableHeaderProps("change24h")}>24H%{arr("change24h")}</th>
+                <th className="col-price" style={thRight} {...sortableHeaderProps("change7d")}>7D%{arr("change7d")}</th>
+                <th style={thRight} {...sortableHeaderProps("volume24h")}>Vol 24H{arr("volume24h")}</th>
+                <th className="col-positioning" style={thRight} {...sortableHeaderProps("oi_usd")} title="Open interest in USD (HL reports it in coins; this is coins × price).">OI{arr("oi_usd")}</th>
+                <th className="col-positioning" style={thRight} {...sortableHeaderProps("oi_change_24h")} title="Change in USD open interest vs 24h ago. Green = OI grew (new money took positions), red = OI shrank (positions closed). This is money flow, not price direction.">ΔOI 24H{arr("oi_change_24h")}</th>
+                <th className="col-positioning" style={thRight} {...sortableHeaderProps("oi_change_7d")} title="Change in USD open interest vs 7d ago.">ΔOI 7D{arr("oi_change_7d")}</th>
+                <th className="col-positioning" style={thRight} {...sortableHeaderProps("vol_oi")} title="24h volume ÷ open interest. <0.5× = parked positions, >2× = actively churned.">Vol/OI{arr("vol_oi")}</th>
+                <th className="col-technical" style={thRight} {...sortableHeaderProps("vol_ratio")}>Vol Ratio{arr("vol_ratio")}</th>
+                <th className="col-positioning" style={thRight} {...sortableHeaderProps("funding_apr")} title="Annualized funding APR, current print. + = longs pay shorts.">Fund APR{arr("funding_apr")}</th>
+                <th className="col-positioning" style={thRight} {...sortableHeaderProps("funding_avg_apr")} title="Mean funding APR over the last 24h. The spot print whipsaws on thin markets; this is what separates structural crowding from noise.">F̄ 24H{arr("funding_avg_apr")}</th>
+                <th className="col-technical" style={thRight} {...sortableHeaderProps("ath_pct")}>ATH%{arr("ath_pct")}</th>
+                <th className="col-technical" style={{ ...thStyle, width: 100, textAlign: "center" }}>Spark</th>
+                <th className="col-technical" style={thStyle} {...sortableHeaderProps("rsi")}>RSI{arr("rsi")}</th>
+                <th className="col-technical" style={thStyle}>MAs ({candleTf})</th>
                 <th style={{ ...thStyle, width: 56 }} />
               </tr>
             </thead>
@@ -398,13 +444,24 @@ export default function ScreenerTable({
                     key={a.symbol}
                     className={`screener-row${isHidden ? " row-hidden" : ""}`}
                     onClick={() => onSelectAsset(a.symbol)}
+                    tabIndex={0}
+                    aria-label={`Open ${a.name} (${a.symbol}) details`}
+                    onKeyDown={(event) => {
+                      if (
+                        event.target === event.currentTarget
+                        && (event.key === "Enter" || event.key === " ")
+                      ) {
+                        event.preventDefault();
+                        onSelectAsset(a.symbol);
+                      }
+                    }}
                   >
-                    <td className="cell-rank">{String(i + 1).padStart(2, "0")}</td>
-                    <td className="cell-name">
+                    <td className="cell-rank sticky-rank">{String(i + 1).padStart(2, "0")}</td>
+                    <td className="cell-name sticky-name">
                       <span className="sec-dot" style={{ background: sectorColor, marginRight: 8 }} />
                       <span className="name-txt">{a.name}</span>
                     </td>
-                    <td className="cell-sym">
+                    <td className="cell-sym sticky-symbol">
                       <span className="sym">{a.symbol}</span>
                       {(() => {
                         const at = attention.get(a.symbol);
@@ -423,17 +480,17 @@ export default function ScreenerTable({
                       })()}
                     </td>
                     <td className="cell-num cell-price">${fmtPrice(a.price)}</td>
-                    <td className={`cell-num pct-tri ${toneClass(a.change1h)}`}>{fmtPct(a.change1h, true)}</td>
-                    <td className={`cell-num pct-tri ${toneClass(a.change4h)}`}>{fmtPct(a.change4h, true)}</td>
-                    <td className={`cell-num pct-tri ${toneClass(a.change24h)}`}>{fmtPct(a.change24h)}</td>
-                    <td className={`cell-num pct-tri ${toneClass(a.change7d)}`}>{fmtPct(a.change7d)}</td>
+                    <td className={`cell-num pct-tri col-price ${toneClass(a.change1h)}`}>{fmtPct(a.change1h, true)}</td>
+                    <td className={`cell-num pct-tri col-price ${toneClass(a.change4h)}`}>{fmtPct(a.change4h, true)}</td>
+                    <td className={`cell-num pct-tri col-price ${toneClass(a.change24h)}`}>{fmtPct(a.change24h)}</td>
+                    <td className={`cell-num pct-tri col-price ${toneClass(a.change7d)}`}>{fmtPct(a.change7d)}</td>
                     <td className="cell-num cell-vol">{fmtVol(a.volume24h)}</td>
-                    <td className="cell-num">
+                    <td className="cell-num col-positioning">
                       {a.oiUsd == null
                         ? <span style={{ color: "var(--text-mute)" }}>—</span>
                         : fmtVol(a.oiUsd)}
                     </td>
-                    <td className={`cell-num ${oiToneClass(a.oiChange24hPct)}`}>
+                    <td className={`cell-num col-positioning ${oiToneClass(a.oiChange24hPct)}`}>
                       {a.oiChange24hUsd == null ? (
                         <span style={{ color: "var(--text-mute)" }}>—</span>
                       ) : (
@@ -447,7 +504,7 @@ export default function ScreenerTable({
                         </>
                       )}
                     </td>
-                    <td className={`cell-num ${oiToneClass(a.oiChange7dPct)}`}>
+                    <td className={`cell-num col-positioning ${oiToneClass(a.oiChange7dPct)}`}>
                       {a.oiChange7dUsd == null ? (
                         <span style={{ color: "var(--text-mute)" }}>—</span>
                       ) : (
@@ -461,10 +518,10 @@ export default function ScreenerTable({
                         </>
                       )}
                     </td>
-                    <td className={`cell-num ${volOiClass(a.volOiRatio)}`}>
+                    <td className={`cell-num col-positioning ${volOiClass(a.volOiRatio)}`}>
                       {fmtVolOi(a.volOiRatio)}
                     </td>
-                    <td className="cell-num">
+                    <td className="cell-num col-technical">
                       {sr?.vol_ratio != null ? (
                         <span className={sr.vol_ratio >= 2 ? "vol-ratio-hot" : "vol-ratio"}>
                           {sr.vol_ratio.toFixed(2)}×
@@ -473,13 +530,13 @@ export default function ScreenerTable({
                         <span style={{ color: "var(--text-mute)" }}>—</span>
                       )}
                     </td>
-                    <td className={`cell-num ${fundingClass(fundingApr(a.fundingRate))}`}>
+                    <td className={`cell-num col-positioning ${fundingClass(fundingApr(a.fundingRate))}`}>
                       {fmtFundingApr(fundingApr(a.fundingRate))}
                     </td>
-                    <td className={`cell-num ${fundingClass(fundingApr(a.fundingAvg24h))}`}>
+                    <td className={`cell-num col-positioning ${fundingClass(fundingApr(a.fundingAvg24h))}`}>
                       {fmtFundingApr(fundingApr(a.fundingAvg24h))}
                     </td>
-                    <td className={`cell-num ${
+                    <td className={`cell-num col-technical ${
                       sr?.ath_pct == null ? "tone-mute" :
                       sr.ath_pct <= -50 ? "tone-down" :
                       sr.ath_pct <= -20 ? "tone-warn" :
@@ -487,13 +544,13 @@ export default function ScreenerTable({
                     }`}>
                       {sr?.ath_pct == null ? "—" : `${sr.ath_pct.toFixed(1)}%`}
                     </td>
-                    <td className={`cell-spark ${sparkTone}`}>
+                    <td className={`cell-spark col-technical ${sparkTone}`}>
                       <Sparkline data={sr?.sparkline ?? []} width={80} height={24} />
                     </td>
-                    <td className="cell-rsi">
+                    <td className="cell-rsi col-technical">
                       <RSIGauge value={sr?.rsi ?? null} />
                     </td>
-                    <td className="cell-mas">
+                    <td className="cell-mas col-technical">
                       <MAGrid row={sr} />
                     </td>
                     <td className="cell-actions">
@@ -529,6 +586,28 @@ export default function ScreenerTable({
           inline style would lose the :hover-on-tr targeting; doing it in
           globals.css would scatter the table-only rules across the file. */}
       <style jsx>{`
+        .density-compact { --row-pad: 5px; }
+        .density-comfy { --row-pad: 9px; }
+        .table-preset-positioning :global(.col-price),
+        .table-preset-positioning :global(.col-technical),
+        .table-preset-price :global(.col-positioning),
+        .table-preset-price :global(.col-technical),
+        .table-preset-technical :global(.col-price),
+        .table-preset-technical :global(.col-positioning) {
+          display: none;
+        }
+        :global(.sticky-rank),
+        :global(.sticky-name),
+        :global(.sticky-symbol) {
+          position: sticky !important;
+          background: var(--bg-card) !important;
+        }
+        :global(.sticky-rank) { left: 0; min-width: 42px; z-index: 3; }
+        :global(.sticky-name) { left: 42px; min-width: 200px; max-width: 200px; z-index: 3; }
+        :global(.sticky-symbol) { left: 242px; min-width: 104px; z-index: 3; }
+        :global(thead .sticky-rank),
+        :global(thead .sticky-name),
+        :global(thead .sticky-symbol) { z-index: 5; }
         :global(.screener-row) {
           cursor: pointer;
           transition: background .12s, box-shadow .12s;
@@ -536,6 +615,11 @@ export default function ScreenerTable({
         :global(.screener-row:hover) {
           background: var(--bg-row-h);
           box-shadow: inset 0 0 0 .5px color-mix(in oklab, var(--acc-warn) 55%, transparent);
+        }
+        :global(.screener-row:hover .sticky-rank),
+        :global(.screener-row:hover .sticky-name),
+        :global(.screener-row:hover .sticky-symbol) {
+          background: var(--bg-row-h) !important;
         }
         :global(.screener-row:hover .sym),
         :global(.screener-row:hover .name-txt) {
@@ -642,7 +726,9 @@ export default function ScreenerTable({
           padding: 0;
           line-height: 1;
         }
-        :global(.screener-row:hover .row-btn) { opacity: 1; }
+        :global(.screener-row:hover .row-btn),
+        :global(.screener-row:focus-within .row-btn),
+        :global(.row-btn:focus-visible) { opacity: 1; }
         :global(.row-btn.star-on) {
           color: var(--acc-star);
           opacity: 1;

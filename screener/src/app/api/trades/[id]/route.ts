@@ -22,9 +22,10 @@ const VALID_REASONS = new Set(["stop", "target", "manual", "expired"]);
 
 export async function GET(
   _req: NextRequest,
-  { params }: { params: { id: string } }
+  { params }: { params: Promise<{ id: string }> }
 ) {
-  const id = parseInt(params.id, 10);
+  const { id: idParam } = await params;
+  const id = parseInt(idParam, 10);
   if (!Number.isFinite(id) || id <= 0) {
     return NextResponse.json({ error: "invalid id" }, { status: 400 });
   }
@@ -35,9 +36,10 @@ export async function GET(
 
 export async function PATCH(
   req: NextRequest,
-  { params }: { params: { id: string } }
+  { params }: { params: Promise<{ id: string }> }
 ) {
-  const id = parseInt(params.id, 10);
+  const { id: idParam } = await params;
+  const id = parseInt(idParam, 10);
   if (!Number.isFinite(id) || id <= 0) {
     return NextResponse.json({ error: "invalid id" }, { status: 400 });
   }

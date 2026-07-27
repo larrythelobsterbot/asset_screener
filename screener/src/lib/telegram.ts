@@ -73,6 +73,11 @@ export interface SendResult {
   // The returned message_id on success — useful if a caller wants to
   // edit / delete the alert later (e.g., trade-position lifecycle).
   messageId?: number;
+  // `rejected` means Telegram returned an explicit negative ACK. `unknown`
+  // means the request may have reached Telegram but no authoritative ACK was
+  // received (timeout/network/protocol failure), so automatic retry can
+  // duplicate a message that was actually accepted.
+  failureKind?: "rejected" | "unknown";
 }
 
 // Sends a text message to the configured chat. Returns a result object
@@ -84,7 +89,7 @@ export async function sendTelegramMessage(
 ): Promise<SendResult> {
   if (!BOT_TOKEN || !CHAT_ID) {
     warnOnce();
-    return { ok: false, error: "telegram not configured" };
+    return { ok: false, error: "telegram not configured", failureKind: "rejected" };
   }
 
   const url = `https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`;
@@ -114,13 +119,13 @@ export async function sendTelegramMessage(
       | { ok: false; description: string };
     if (!json.ok) {
       totalFailed += 1;
-      return { ok: false, error: json.description };
+      return { ok: false, error: json.description, failureKind: "rejected" };
     }
     totalSent += 1;
     return { ok: true, messageId: json.result.message_id };
   } catch (err) {
     totalFailed += 1;
-    return { ok: false, error: String(err) };
+    return { ok: false, error: String(err), failureKind: "unknown" };
   }
 }
 

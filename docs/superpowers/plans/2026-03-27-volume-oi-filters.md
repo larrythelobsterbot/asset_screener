@@ -481,7 +481,7 @@ pm2 restart asset-screener
 
 - [ ] **Step 3: Smoke test checklist**
 
-Check at https://assets.lekker.design:
+Check at https://asset.lekker.design:
 - [ ] Filters button visible in toolbar
 - [ ] Click Filters button → panel slides in from right
 - [ ] Click backdrop → panel closes

@@ -13,7 +13,9 @@ interface Props {
   y: number;
   w: number;
   h: number;
-  change: number | null;
+  tone: number | null;
+  displayValue: string;
+  metricLabel: string;
   onClick: () => void;
   // Optional hide-list integration. When provided, a small action
   // button appears in the top-right of the tile on hover.
@@ -69,7 +71,7 @@ function flowTooltip(asset: Props["asset"]): string {
 }
 
 export default function HeatmapTile({
-  asset, x, y, w, h, change, onClick,
+  asset, x, y, w, h, tone, displayValue, metricLabel, onClick,
   isHidden = false, onToggleHide,
   attention = null,
 }: Props) {
@@ -79,15 +81,15 @@ export default function HeatmapTile({
   const showHideBtn = !!onToggleHide && !tiny;
 
   let bg: string;
-  if (change == null) {
+  if (tone == null) {
     bg = "rgba(255,255,255,0.04)";
   } else {
-    const step = heatStep(Math.abs(change));
-    const hue = change >= 0 ? "up" : "down";
+    const step = heatStep(Math.abs(tone));
+    const hue = tone >= 0 ? "up" : "down";
     bg = `var(--heat-${hue}-${step})`;
   }
 
-  const toneClass = change == null ? "tone-flat" : change >= 0 ? "tone-up" : "tone-down";
+  const toneClass = tone == null ? "tone-flat" : tone >= 0 ? "tone-up" : "tone-down";
 
   return (
     <div
@@ -115,7 +117,8 @@ export default function HeatmapTile({
           overflow: "hidden",
           boxSizing: "border-box",
         }}
-        title={`${asset.name} (${asset.symbol}) — ${fmtPct(change)}${flowTooltip(asset)}`}
+        title={`${asset.name} (${asset.symbol}) — ${metricLabel}: ${displayValue}${flowTooltip(asset)}`}
+        aria-label={`${asset.symbol}, ${asset.name}. ${metricLabel}: ${displayValue}. ${flowTooltip(asset).trim().replaceAll("\n", ". ")}`.trim()}
       >
         <span className="sym" style={{ fontSize: 12, fontWeight: 600 }}>
           {asset.symbol}
@@ -125,7 +128,7 @@ export default function HeatmapTile({
             className={`pct-tri ${toneClass}`}
             style={{ fontSize: 10, opacity: 0.95, marginTop: 2 }}
           >
-            {fmtPct(change)}
+            {displayValue}
           </span>
         )}
         {!tiny && attention && (
@@ -143,7 +146,7 @@ export default function HeatmapTile({
           onClick={(e) => { e.stopPropagation(); onToggleHide!(asset.symbol); }}
           className={`tile-hide ${isHidden ? "tile-hide-on" : ""}`}
           title={isHidden ? "Unhide this asset" : "Hide this asset"}
-          aria-label={isHidden ? "Unhide" : "Hide"}
+          aria-label={isHidden ? `Unhide ${asset.symbol}` : `Hide ${asset.symbol}`}
         >
           {isHidden ? "↻" : "✕"}
         </button>
@@ -194,7 +197,9 @@ export default function HeatmapTile({
           z-index: 4;
           padding: 0;
         }
-        .heatmap-tile-wrap:hover .tile-hide { opacity: 0.9; }
+        .heatmap-tile-wrap:hover .tile-hide,
+        .heatmap-tile-wrap:focus-within .tile-hide,
+        .tile-hide:focus-visible { opacity: 0.9; }
         .tile-hide:hover {
           background: var(--acc-down);
           color: var(--text-strong);

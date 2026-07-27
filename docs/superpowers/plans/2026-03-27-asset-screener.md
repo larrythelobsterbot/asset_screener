@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Build and deploy a real-time multi-asset screener at assets.lekker.design that displays Hyperliquid perps and CoinGecko crypto in a heatmap with technical signal scanning.
+**Goal:** Build and deploy a real-time multi-asset screener at asset.lekker.design that displays Hyperliquid perps and CoinGecko crypto in a heatmap with technical signal scanning.
 
 **Architecture:** Next.js 14 App Router with server-side API routes that fetch from Hyperliquid Info API and CoinGecko, compute technical indicators, and cache results in-memory. Client polls API routes for fresh data. Deployed via pm2 + Nginx.
 
@@ -1176,7 +1176,7 @@ git commit -m "feat: assemble main page with all components"
 ### Task 14: Deployment — Nginx + PM2 + SSL
 
 **Files:**
-- Create: `/etc/nginx/sites-available/assets.lekker.design` (via sudo)
+- Create: `/etc/nginx/sites-available/asset.lekker.design` (via sudo)
 
 - [ ] **Step 1: Build production**
 
@@ -1198,7 +1198,7 @@ pm2 save
 ```nginx
 server {
     listen 80;
-    server_name assets.lekker.design;
+    server_name asset.lekker.design;
 
     location / {
         proxy_pass http://127.0.0.1:3000;
@@ -1215,20 +1215,20 @@ server {
 ```
 
 ```bash
-sudo ln -s /etc/nginx/sites-available/assets.lekker.design /etc/nginx/sites-enabled/
+sudo ln -s /etc/nginx/sites-available/asset.lekker.design /etc/nginx/sites-enabled/
 sudo nginx -t && sudo systemctl reload nginx
 ```
 
 - [ ] **Step 4: SSL with certbot**
 
 ```bash
-sudo certbot --nginx -d assets.lekker.design
+sudo certbot --nginx -d asset.lekker.design
 ```
 
 - [ ] **Step 5: Verify live**
 
 ```bash
-curl -s -o /dev/null -w "%{http_code}" https://assets.lekker.design
+curl -s -o /dev/null -w "%{http_code}" https://asset.lekker.design
 ```
 
 Expected: 200
@@ -1246,7 +1246,7 @@ git commit -m "feat: production build and deployment config"
 
 - [ ] **Step 1: Inform user about DNS**
 
-The user needs to add an A record in their DNS provider for `assets.lekker.design` pointing to `187.124.236.128`. This is an external action — provide exact instructions.
+The user needs to add an A record in their DNS provider for `asset.lekker.design` pointing to `187.124.236.128`. This is an external action — provide exact instructions.
 
 **DNS Record:**
 - Type: A

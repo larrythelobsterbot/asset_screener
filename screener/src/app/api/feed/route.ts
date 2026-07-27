@@ -4,13 +4,12 @@ import { listFeedEvents, type FeedEventRow } from "@/lib/db";
 import { startTreeNewsPoller } from "@/lib/treeNews";
 import { startTreeNewsWs } from "@/lib/treeNewsWs";
 
-// Boot both Tree News transports alongside the route. Idempotent —
-// repeated imports won't double-schedule. The authed websocket is the
-// primary real-time push; the REST poller is a 30s backfill for
-// reconnect gaps. Both write feed_events (deduped by _id); this route is
-// the read surface the /terminal page polls.
-startTreeNewsWs();
-startTreeNewsPoller();
+// Boot both transports on the first real request, not while Next imports
+// this module during `next build`. Both starters are idempotent.
+function ensureFeedRuntime() {
+  startTreeNewsWs();
+  startTreeNewsPoller();
+}
 
 export const dynamic = "force-dynamic";
 
@@ -49,6 +48,8 @@ function toItem(r: FeedEventRow): FeedItem {
 }
 
 export async function GET(req: Request) {
+  ensureFeedRuntime();
+
   const url = new URL(req.url);
   const source = url.searchParams.get("source") || undefined;
   const symbol = url.searchParams.get("symbol") || undefined;

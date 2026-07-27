@@ -15,9 +15,27 @@
 
 import type { Signal } from "./signals";
 import { scoreConviction, type ConvictionResult, SIGNAL_FAMILY } from "./signals";
-import { sendTelegramMessage, escapeHtml, isTelegramConfigured } from "./telegram";
-import { kvGet, kvSet } from "./db";
+import {
+  sendTelegramMessage,
+  escapeHtml,
+  isTelegramConfigured,
+  type SendResult,
+} from "./telegram";
+import {
+  reserveTelegramAlert,
+  insertAlertCandidate,
+  markAlertCandidateTelegramAttempted,
+  hasActiveTelegramThesis,
+  kvGet,
+  kvSet,
+  markTelegramAlertDelivered,
+  markTelegramAlertDeliveryUnknown,
+  markTelegramAlertFailed,
+  type NewTelegramAlert,
+  type TelegramAlertReservation,
+} from "./db";
 import { priorityOf, sectorOf } from "@/config/sectors";
+import { evaluateStage2ShadowPolicy } from "./shadowPolicies";
 
 // Trade-card sizing knobs — overridable via env so we can tune live without
 // a rebuild. Defaults match the $2k / 2% / 1.5×ATR / 3R LTF playbook.
@@ -41,6 +59,33 @@ const COOLDOWN_MS = 4 * 3_600_000;
 
 // Score thresholds matching the LTF playbook. ±3.5 = Strong Buy/Sell label.
 const STRONG_THRESHOLD = 3.5;
+export const ALERT_STRATEGY_VERSION = "stage1-closed-bars-v2";
+
+export type AlertEligibilityReason =
+  | "eligible"
+  | "score_below_threshold"
+  | "volatility_regime_quiet"
+  | "volatility_regime_unknown"
+  | "active_thesis";
+
+export function alertEligibility(
+  conviction: ConvictionResult,
+  context: { activeThesis?: boolean } = {},
+): { eligible: boolean; reason: AlertEligibilityReason } {
+  if (Math.abs(conviction.score) < STRONG_THRESHOLD) {
+    return { eligible: false, reason: "score_below_threshold" };
+  }
+  if (conviction.volRegime === "unknown") {
+    return { eligible: false, reason: "volatility_regime_unknown" };
+  }
+  if (conviction.volRegime === "quiet") {
+    return { eligible: false, reason: "volatility_regime_quiet" };
+  }
+  if (context.activeThesis) {
+    return { eligible: false, reason: "active_thesis" };
+  }
+  return { eligible: true, reason: "eligible" };
+}
 
 // Top N contributing signals to include in the alert body. Limits message
 // length so the Telegram render doesn't overflow on a wide confluence.
@@ -201,7 +246,7 @@ function formatAlert(
     signalLines || "<i>(no enriched signals)</i>",
     cardBlock,
     "",
-    `<a href="https://assets.lekker.design">open screener</a>`,
+    `<a href="https://asset.lekker.design">open screener</a>`,
   ].join("\n").replace(/\n{3,}/g, "\n\n");
 }
 
@@ -209,7 +254,83 @@ export interface AlertDispatchResult {
   considered: number;
   fired: number;
   cooledDown: number;
+  activeThesis: number;
   failed: number;
+  unknown: number;
+}
+
+export function sanitizeTelegramDeliveryError(error: unknown): string {
+  return String(error ?? "unknown Telegram delivery error")
+    .replace(/bot\d+:[A-Za-z0-9_-]+/gi, "bot[REDACTED]")
+    .replace(/(TELEGRAM_BOT_TOKEN\s*=\s*)[^\s&]+/gi, "$1[REDACTED]")
+    .slice(0, 1_000);
+}
+
+interface TrackedDeliveryDeps {
+  insert?: (row: NewTelegramAlert) => number;
+  reserve?: (row: NewTelegramAlert) => TelegramAlertReservation;
+  onAttempt?: (id: number) => void;
+  onBlocked?: () => void;
+  send: (body: string) => Promise<SendResult>;
+  markDelivered: (id: number, messageId: string, deliveredAt: number) => boolean;
+  markFailed: (id: number, error: string, failedAt: number) => boolean;
+  markUnknown: (id: number, error: string, observedAt: number) => boolean;
+  now: () => number;
+}
+
+const trackedDeliveryDeps: TrackedDeliveryDeps = {
+  reserve: reserveTelegramAlert,
+  send: sendTelegramMessage,
+  markDelivered: markTelegramAlertDelivered,
+  markFailed: markTelegramAlertFailed,
+  markUnknown: markTelegramAlertDeliveryUnknown,
+  now: Date.now,
+};
+
+// The ledger write is deliberately ordered before the network call. A DB
+// failure therefore prevents an untracked alert from being emitted; the
+// caller rewinds its cooldown and retries on the next scan.
+export async function deliverTrackedTelegramAlert(
+  pending: NewTelegramAlert,
+  body: string,
+  deps: TrackedDeliveryDeps = trackedDeliveryDeps,
+): Promise<"fired" | "active_thesis" | "failed" | "unknown"> {
+  const reservation = deps.reserve
+    ? deps.reserve(pending)
+    : deps.insert
+      ? { kind: "inserted" as const, id: deps.insert(pending) }
+      : (() => { throw new Error("Tracked Telegram delivery requires a reservation dependency"); })();
+  if (reservation.kind === "blocked") {
+    deps.onBlocked?.();
+    return "active_thesis";
+  }
+  const id = reservation.id;
+  deps.onAttempt?.(id);
+  let result: SendResult;
+  try {
+    result = await deps.send(body);
+  } catch (error) {
+    deps.markUnknown(id, sanitizeTelegramDeliveryError(error), deps.now());
+    return "unknown";
+  }
+
+  if (!result.ok || result.messageId == null) {
+    const error = result.ok
+      ? "Telegram acknowledged delivery without a message id"
+      : result.error ?? "Telegram delivery failed without an error description";
+    if (result.ok || result.failureKind === "unknown") {
+      deps.markUnknown(id, sanitizeTelegramDeliveryError(error), deps.now());
+      return "unknown";
+    }
+    deps.markFailed(id, sanitizeTelegramDeliveryError(error), deps.now());
+    return "failed";
+  }
+
+  if (!deps.markDelivered(id, String(result.messageId), deps.now())) {
+    deps.markUnknown(id, "Telegram acknowledgement could not be persisted", deps.now());
+    return "unknown";
+  }
+  return "fired";
 }
 
 // Group an aggregate signals list by symbol, score each group, decide
@@ -222,11 +343,12 @@ export interface AlertDispatchResult {
 export async function maybeDispatchAlerts(
   allSignals: Signal[],
   priceBySymbol?: Map<string, number>,
-  tradeCtxBySymbol?: Map<string, TradeContext>
+  tradeCtxBySymbol?: Map<string, TradeContext>,
+  primaryVolRegimeBySymbol?: Map<string, ConvictionResult["volRegime"]>,
+  decisionCandleAtBySymbol?: Map<string, number>,
+  evaluatedAt: number = Date.now(),
 ): Promise<AlertDispatchResult> {
-  if (!isTelegramConfigured()) {
-    return { considered: 0, fired: 0, cooledDown: 0, failed: 0 };
-  }
+  const telegramConfigured = isTelegramConfigured();
 
   // Group by symbol so we can score conviction per asset, not across
   // the whole universe.
@@ -237,8 +359,8 @@ export async function maybeDispatchAlerts(
     bySymbol.set(s.symbol, list);
   }
 
-  const now = Date.now();
-  const tasks: Array<Promise<"fired" | "cooldown" | "failed">> = [];
+  const now = evaluatedAt;
+  const tasks: Array<Promise<"fired" | "cooldown" | "active_thesis" | "failed" | "unknown">> = [];
   let considered = 0;
 
   for (const [symbol, signals] of bySymbol) {
@@ -247,17 +369,101 @@ export async function maybeDispatchAlerts(
     // sectors.ts SECTORS) get amplified scoring. A neutral-conviction
     // commodity setup that would have stayed below the alert threshold
     // can clear it once the multiplier compounds with confluence.
-    const conviction = scoreConviction(signals, priorityOf(symbol));
-    const absScore = Math.abs(conviction.score);
-    if (absScore < STRONG_THRESHOLD) continue;
-    if (conviction.volRegime === "quiet") continue;
+    const conviction = scoreConviction(
+      signals,
+      priorityOf(symbol),
+      primaryVolRegimeBySymbol?.get(symbol),
+    );
+    const direction: "bullish" | "bearish" = conviction.score >= 0 ? "bullish" : "bearish";
+    const ledgerDirection = direction === "bullish" ? "long" : "short";
+    const price = priceBySymbol?.get(symbol) ?? null;
+    const tradeCtx = tradeCtxBySymbol?.get(symbol);
+    const shadowPolicy = evaluateStage2ShadowPolicy({
+      direction: ledgerDirection,
+      convictionScore: conviction.score,
+      primaryVolRegime: conviction.volRegime,
+      byTimeframe: conviction.byTimeframe,
+      fundingHourly: tradeCtx?.fundingHourly ?? null,
+      signals,
+    });
+    const recordCandidate = (
+      decision: "rejected" | "suppressed" | "eligible",
+      decisionReason: string,
+      telegramAttempted: 0 | 1,
+    ): number | null => {
+      try {
+        return insertAlertCandidate({
+          evaluated_at: evaluatedAt,
+          decision_candle_at: decisionCandleAtBySymbol?.get(symbol) ?? null,
+          strategy_version: ALERT_STRATEGY_VERSION,
+          symbol,
+          direction: ledgerDirection,
+          conviction_score: conviction.score,
+          vol_regime: conviction.volRegime,
+          decision,
+          decision_reason: decisionReason,
+          conviction_json: JSON.stringify(conviction),
+          signal_json: JSON.stringify(signals),
+          family_json: JSON.stringify(conviction.contributingFamilies),
+          feature_json: JSON.stringify({
+            closedCandlesOnly: true,
+            decisionCandleAt: decisionCandleAtBySymbol?.get(symbol) ?? null,
+            primaryVolRegime: conviction.volRegime,
+            market: {
+              price,
+              atrPct: tradeCtx?.atrPct ?? null,
+              fundingHourly: tradeCtx?.fundingHourly ?? null,
+            },
+            signals: signals.map((signal) => ({
+              type: signal.type,
+              value: signal.value,
+              strength: signal.strength ?? null,
+              timeframe: signal.timeframe ?? "cross",
+            })),
+          }),
+          shadow_policy_json: JSON.stringify(shadowPolicy),
+          telegram_attempted: telegramAttempted,
+        });
+      } catch (err) {
+        console.warn(`[alerter] candidate ledger write failed for ${symbol}:`, err);
+        return null;
+      }
+    };
+
+    const baseEligibility = alertEligibility(conviction);
+    if (!baseEligibility.eligible) {
+      recordCandidate("rejected", baseEligibility.reason, 0);
+      continue;
+    }
     considered += 1;
 
-    const direction: "bullish" | "bearish" = conviction.score >= 0 ? "bullish" : "bearish";
+    const card = price != null && tradeCtx
+      ? computeTradeCard(price, tradeCtx.atrPct, direction)
+      : null;
+    if (!card) {
+      recordCandidate("rejected", "trade_card_unavailable", 0);
+      continue;
+    }
+
+    const activeEligibility = alertEligibility(conviction, {
+      activeThesis: hasActiveTelegramThesis(symbol, ledgerDirection, now),
+    });
+    if (!activeEligibility.eligible) {
+      recordCandidate("suppressed", activeEligibility.reason, 0);
+      tasks.push(Promise.resolve("active_thesis"));
+      continue;
+    }
     if (isOnCooldown(symbol, direction, now)) {
+      recordCandidate("suppressed", "cooldown", 0);
       tasks.push(Promise.resolve("cooldown"));
       continue;
     }
+    if (!telegramConfigured) {
+      recordCandidate("suppressed", "telegram_not_configured", 0);
+      continue;
+    }
+
+    const candidateId = recordCandidate("eligible", "selected_for_telegram", 0);
 
     // Stamp cooldown BEFORE sending so concurrent route calls don't
     // double-fire. If the send fails we REWIND the cooldown to a near-
@@ -267,23 +473,62 @@ export async function maybeDispatchAlerts(
     // Telegram outage into a missed alert).
     markCooldown(symbol, direction, now);
 
-    const price = priceBySymbol?.get(symbol) ?? null;
-    const tradeCtx = tradeCtxBySymbol?.get(symbol);
     const body = formatAlert(symbol, conviction, signals, price, tradeCtx);
+    const pendingAlert: NewTelegramAlert = {
+      created_at: now,
+      delivery_status: "pending",
+      delivery_error: null,
+      telegram_message_id: null,
+      symbol,
+      sector: sectorOf(symbol),
+      direction: ledgerDirection,
+      entry_price: price,
+      stop_price: card.stop,
+      target_price: card.target,
+      size: card.size,
+      risk_usd: card.riskUsd,
+      conviction_score: conviction.score,
+      conviction_json: JSON.stringify(conviction),
+      signal_json: JSON.stringify(signals),
+      family_json: JSON.stringify(conviction.contributingFamilies),
+      expires_at: now + 48 * 60 * 60 * 1000,
+      outcome_status: "open",
+      outcome_at: null,
+      outcome_price: null,
+      pnl_r: null,
+      evaluated_through: null,
+      outcome_note: null,
+      outcome_provenance: null,
+      candidate_id: candidateId,
+      candidate_attribution: candidateId === null ? "failed" : "linked",
+    };
 
     tasks.push(
-      sendTelegramMessage(body)
-        .then((r) => {
-          if (!r.ok) {
-            console.warn(`[alerter] send failed for ${symbol}:`, r.error);
+      deliverTrackedTelegramAlert(pendingAlert, body, {
+        ...trackedDeliveryDeps,
+        onBlocked: () => {
+          recordCandidate("suppressed", "active_thesis", 0);
+        },
+        onAttempt: () => {
+          if (candidateId !== null) markAlertCandidateTelegramAttempted(candidateId);
+        },
+      })
+        .then((result) => {
+          if (result === "active_thesis") return "active_thesis" as const;
+          if (result === "failed") {
+            console.warn(`[alerter] send failed for ${symbol}; details recorded in alert ledger`);
             // Rewind cooldown so the next scan retries in ~5 min.
             markCooldown(symbol, direction, now - COOLDOWN_MS + 5 * 60_000);
             return "failed" as const;
           }
+          if (result === "unknown") {
+            console.warn(`[alerter] Telegram acknowledgement unknown for ${symbol}; cooldown retained to prevent duplicate delivery`);
+            return "unknown" as const;
+          }
           return "fired" as const;
         })
         .catch((err) => {
-          console.warn(`[alerter] send threw for ${symbol}:`, err);
+          console.warn(`[alerter] tracked delivery threw for ${symbol}:`, sanitizeTelegramDeliveryError(err));
           markCooldown(symbol, direction, now - COOLDOWN_MS + 5 * 60_000);
           return "failed" as const;
         })
@@ -295,7 +540,9 @@ export async function maybeDispatchAlerts(
     considered,
     fired: results.filter((r) => r === "fired").length,
     cooledDown: results.filter((r) => r === "cooldown").length,
+    activeThesis: results.filter((r) => r === "active_thesis").length,
     failed: results.filter((r) => r === "failed").length,
+    unknown: results.filter((r) => r === "unknown").length,
   };
 }
 

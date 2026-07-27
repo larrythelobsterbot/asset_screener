@@ -6,16 +6,28 @@ import ContextChips from "@/components/ContextChips";
 import TimeframeToggle, { Timeframe } from "@/components/TimeframeToggle";
 import Heatmap from "@/components/Heatmap";
 import ScreenerTable from "@/components/ScreenerTable";
+import IdeasView from "@/components/IdeasView";
 import SignalScanner from "@/components/SignalScanner";
 import AttentionPanel from "@/components/AttentionPanel";
 import AssetDetailModal from "@/components/AssetDetailModal";
 import { FilterPanel } from "@/components/FilterPanel";
+import ActiveFilterBar from "@/components/ActiveFilterBar";
 import { useWatchlist } from "@/lib/useWatchlist";
 import { useHidelist } from "@/lib/useHidelist";
-import { useFilters, passesFilters } from "@/lib/useFilters";
+import {
+  clearActiveFilter,
+  getActiveFilters,
+  useFilters,
+  passesFilters,
+  type FilterKey,
+} from "@/lib/useFilters";
 import { AssetData } from "@/lib/types";
+import type { Signal } from "@/lib/signals";
+import { createLatestRequestGate, parseMarketPayload } from "@/lib/marketPolling";
+import { readStorage, writeStorage } from "@/lib/safeStorage";
+import { parseSignalSnapshot } from "@/lib/signalSnapshot";
 
-type View = "heatmap" | "table";
+type View = "ideas" | "heatmap" | "table";
 const VIEW_STORAGE_KEY = "asset-screener-view";
 
 export default function Home() {
@@ -27,16 +39,16 @@ export default function Home() {
   const [showHidden, setShowHidden] = useState(false);
   const [searchQuery, setSearchQuery] = useState("");
 
-  const [view, setView] = useState<View>("heatmap");
+  const [view, setView] = useState<View>("ideas");
   useEffect(() => {
     if (typeof window === "undefined") return;
-    const stored = localStorage.getItem(VIEW_STORAGE_KEY);
-    if (stored === "table" || stored === "heatmap") setView(stored);
+    const stored = readStorage(() => window.localStorage, VIEW_STORAGE_KEY);
+    if (stored === "ideas" || stored === "table" || stored === "heatmap") setView(stored);
   }, []);
   function changeView(next: View) {
     setView(next);
     if (typeof window !== "undefined") {
-      localStorage.setItem(VIEW_STORAGE_KEY, next);
+      writeStorage(() => window.localStorage, VIEW_STORAGE_KEY, next);
     }
   }
 
@@ -45,6 +57,8 @@ export default function Home() {
 
   const [allAssets, setAllAssets] = useState<AssetData[]>([]);
   const [isLoading, setIsLoading] = useState(true);
+  const [signals, setSignals] = useState<Signal[]>([]);
+  const [signalsLoading, setSignalsLoading] = useState(true);
   // Track the most recent fetch outcome so the UI can distinguish
   // "no data" (initial load) from "backend down" (existing data is
   // stale because /api/markets failed). For a financial dashboard
@@ -52,29 +66,73 @@ export default function Home() {
   // signaling the upstream is unreachable is worse than telling the
   // user something is wrong.
   const [marketsError, setMarketsError] = useState<string | null>(null);
+  const [marketsStale, setMarketsStale] = useState(false);
   const [lastFetchAt, setLastFetchAt] = useState<number | null>(null);
 
   useEffect(() => {
+    const gate = createLatestRequestGate();
+
     async function load() {
+      const requestId = gate.start();
       try {
         const res = await fetch("/api/markets");
+        if (!gate.isCurrent(requestId)) return;
         if (!res.ok) {
           setMarketsError(`HTTP ${res.status}`);
           return;
         }
-        const data = await res.json();
+        const data = parseMarketPayload(await res.json());
+        if (!gate.isCurrent(requestId)) return;
+        const stale = res.headers.get("X-Data-Stale") === "true";
+        const generatedAt = Number(res.headers.get("X-Data-Generated-At"));
         setAllAssets(data);
         setMarketsError(null);
-        setLastFetchAt(Date.now());
+        setMarketsStale(stale);
+        setLastFetchAt(Number.isFinite(generatedAt) && generatedAt > 0 ? generatedAt : Date.now());
       } catch (err) {
-        setMarketsError(err instanceof Error ? err.message : String(err));
+        if (gate.isCurrent(requestId)) {
+          setMarketsError(err instanceof Error ? err.message : String(err));
+        }
       } finally {
-        setIsLoading(false);
+        if (gate.isCurrent(requestId)) setIsLoading(false);
       }
     }
     load();
     const id = setInterval(load, 30_000);
-    return () => clearInterval(id);
+    return () => {
+      gate.close();
+      clearInterval(id);
+    };
+  }, []);
+
+  // One shared, cache-only signal snapshot feeds Ideas and the legacy scanner.
+  // Server instrumentation owns /api/signals refreshes; opening this page must
+  // never initiate persistence or Telegram work.
+  useEffect(() => {
+    const gate = createLatestRequestGate();
+
+    async function loadSignals() {
+      const requestId = gate.start();
+      try {
+        const response = await fetch("/api/signals/snapshot", { cache: "no-store" });
+        if (!gate.isCurrent(requestId)) return;
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        const data = parseSignalSnapshot(await response.json());
+        if (gate.isCurrent(requestId)) setSignals(data);
+      } catch {
+        // Preserve the last successful signal snapshot. Market freshness is
+        // surfaced separately and a missing signal feed renders honestly as
+        // no current signal evidence rather than fabricating a state.
+      } finally {
+        if (gate.isCurrent(requestId)) setSignalsLoading(false);
+      }
+    }
+    loadSignals();
+    const id = setInterval(loadSignals, 30_000);
+    return () => {
+      gate.close();
+      clearInterval(id);
+    };
   }, []);
 
   // Filter pipeline: filter panel rules → hide list → search query.
@@ -83,7 +141,7 @@ export default function Home() {
   // When `showHidden` is on, hidden assets DO appear (dimmed) so the
   // user can review + unhide.
   const filteredAssets = useMemo(() => {
-    let arr = allAssets.filter((a) => passesFilters(a, filters));
+    let arr = allAssets.filter((a) => passesFilters(a, filters, timeframe));
     if (!showHidden) {
       arr = arr.filter((a) => !hidden.has(a.symbol));
     }
@@ -94,10 +152,19 @@ export default function Home() {
       );
     }
     return arr;
-  }, [allAssets, filters, searchQuery, hidden, showHidden]);
+  }, [allAssets, filters, timeframe, searchQuery, hidden, showHidden]);
 
   const passingSymbols: Set<string> | null =
     allAssets.length === 0 ? null : new Set(filteredAssets.map((a) => a.symbol));
+
+  const activeFilters = useMemo(
+    () => getActiveFilters(filters, timeframe),
+    [filters, timeframe],
+  );
+
+  function removeFilter(key: FilterKey) {
+    setFilter(clearActiveFilter(filters, key));
+  }
 
   return (
     <div style={{ minHeight: "100vh", display: "flex", flexDirection: "column", background: "var(--bg)" }}>
@@ -107,6 +174,9 @@ export default function Home() {
           onChange={setFilter}
           onClear={clearFilters}
           onClose={() => setFilterPanelOpen(false)}
+          resultCount={filteredAssets.length}
+          totalCount={allAssets.length}
+          timeframe={timeframe}
         />
       )}
 
@@ -123,7 +193,7 @@ export default function Home() {
           users can still see prices, but the banner makes clear the
           numbers may be stale. Mustard-bordered to be visible
           without competing with the trade-action colors (green/red). */}
-      {marketsError && (
+      {(marketsError || marketsStale) && (
         <div
           role="alert"
           style={{
@@ -141,10 +211,19 @@ export default function Home() {
           }}
         >
           <span>⚠</span>
-          <span>Backend unreachable — showing last known data{lastFetchAt ? ` (${Math.round((Date.now() - lastFetchAt) / 1000)}s ago)` : ""}</span>
-          <span style={{ marginLeft: "auto", color: "var(--text-mute)" }}>
-            {marketsError}
+          <span>
+            {allAssets.length === 0
+              ? "Unable to load market data"
+              : marketsStale && !marketsError
+                ? "Upstream refresh failed — showing last known data"
+                : "Backend unreachable — showing last known data"}
+            {lastFetchAt ? ` (${Math.round((Date.now() - lastFetchAt) / 1000)}s old)` : ""}
           </span>
+          {marketsError && (
+            <span style={{ marginLeft: "auto", color: "var(--text-mute)" }}>
+              {marketsError}
+            </span>
+          )}
         </div>
       )}
 
@@ -182,12 +261,15 @@ export default function Home() {
 
         <div className="topbar-r">
           {/* View toggle */}
-          <div className="seg">
-            <button onClick={() => changeView("heatmap")} className={view === "heatmap" ? "on" : ""}>
-              Heatmap
+          <div className="seg" role="group" aria-label="Dashboard view">
+            <button aria-pressed={view === "ideas"} onClick={() => changeView("ideas")} className={view === "ideas" ? "on" : ""}>
+              Ideas
             </button>
-            <button onClick={() => changeView("table")} className={view === "table" ? "on" : ""}>
-              Table
+            <button aria-pressed={view === "heatmap"} onClick={() => changeView("heatmap")} className={view === "heatmap" ? "on" : ""}>
+              Explore
+            </button>
+            <button aria-pressed={view === "table"} onClick={() => changeView("table")} className={view === "table" ? "on" : ""}>
+              Data
             </button>
           </div>
 
@@ -212,6 +294,7 @@ export default function Home() {
           {/* Watchlist */}
           <button
             onClick={() => setShowWatchlist(!showWatchlist)}
+            aria-pressed={showWatchlist}
             className={`btn-ghost ${showWatchlist ? "on-watch" : ""}`}
             title="Show only watchlisted (starred) assets"
           >
@@ -225,6 +308,7 @@ export default function Home() {
           {hiddenCount > 0 && (
             <button
               onClick={() => setShowHidden(!showHidden)}
+              aria-pressed={showHidden}
               className="btn-ghost"
               style={showHidden ? {
                 color: "var(--acc-warn)",
@@ -271,12 +355,41 @@ export default function Home() {
             Journal
           </a>
 
+          <a
+            href="/signals"
+            className="btn-ghost"
+            title="Open Telegram signal delivery and TP/SL performance"
+            style={{ textDecoration: "none" }}
+          >
+            <span>◎</span>
+            Signals
+          </a>
+
           <TimeframeToggle selected={timeframe} onChange={setTimeframe} />
         </div>
       </div>
 
+      <ActiveFilterBar
+        filters={activeFilters}
+        resultCount={filteredAssets.length}
+        totalCount={allAssets.length}
+        onRemove={removeFilter}
+        onClear={clearFilters}
+        onOpen={() => setFilterPanelOpen(true)}
+      />
+
       {/* ── Main surface ────────────────────────────────────── */}
-      {view === "heatmap" ? (
+      {view === "ideas" ? (
+        <IdeasView
+          assets={showWatchlist ? filteredAssets.filter((asset) => watchlist.has(asset.symbol)) : filteredAssets}
+          signals={signals.filter((signal) => passingSymbols?.has(signal.symbol) ?? true)}
+          isLoading={isLoading || signalsLoading}
+          timeframe={timeframe}
+          watchlist={watchlist}
+          onToggleWatch={toggle}
+          onInspectAsset={setSelectedAsset}
+        />
+      ) : view === "heatmap" ? (
         <Heatmap
           assets={filteredAssets}
           isLoading={isLoading}
@@ -307,13 +420,17 @@ export default function Home() {
       {/* Bottom row: confirmation (signals) beside discovery (attention).
           Two-column on wide screens — the scanner needs the width for its
           table view; the radar is a fixed-rhythm list. Stacks on narrow. */}
-      <div className="bottom-grid">
-        <SignalScanner
-          onSelectAsset={setSelectedAsset}
-          allowedSymbols={passingSymbols}
-        />
-        <AttentionPanel onSelectAsset={setSelectedAsset} />
-      </div>
+      {view !== "ideas" && (
+        <div className="bottom-grid">
+          <SignalScanner
+            onSelectAsset={setSelectedAsset}
+            allowedSymbols={passingSymbols}
+            signals={signals}
+            loading={signalsLoading}
+          />
+          <AttentionPanel onSelectAsset={setSelectedAsset} />
+        </div>
+      )}
 
       {selectedAsset && (
         <AssetDetailModal
@@ -361,6 +478,25 @@ export default function Home() {
         :global(.search-icon) {
           color: var(--text-mute);
           font-size: 13px;
+        }
+        @media (max-width: 760px) {
+          .topbar {
+            align-items: stretch;
+            flex-direction: column;
+            gap: 8px;
+            padding: 12px 10px 10px;
+          }
+          .topbar-l { width: 100%; gap: 10px; }
+          .title { flex: 0 0 auto; }
+          :global(.search) { width: auto; flex: 1 1 auto; }
+          .topbar-r {
+            width: 100%;
+            flex-wrap: nowrap;
+            overflow-x: auto;
+            padding-bottom: 2px;
+            scrollbar-color: var(--border) transparent;
+          }
+          .topbar-r > * { flex: 0 0 auto; }
         }
       `}</style>
     </div>

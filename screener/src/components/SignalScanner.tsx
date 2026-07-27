@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useState } from "react";
 import { Signal } from "@/lib/signals";
 import SignalFeed from "./SignalFeed";
 import SignalTable from "./SignalTable";
@@ -8,41 +8,23 @@ import SignalTable from "./SignalTable";
 interface Props {
   onSelectAsset: (symbol: string) => void;
   allowedSymbols: Set<string> | null; // null = not loaded yet, show all
+  signals: Signal[];
+  loading: boolean;
 }
 
-export default function SignalScanner({ onSelectAsset, allowedSymbols }: Props) {
-  const [signals, setSignals] = useState<Signal[]>([]);
+export default function SignalScanner({
+  onSelectAsset,
+  allowedSymbols,
+  signals,
+  loading,
+}: Props) {
   const [view, setView] = useState<"feed" | "table">("feed");
-  const [loading, setLoading] = useState(true);
 
   const visibleSignals =
     allowedSymbols === null
       ? signals
       : signals.filter((s) => allowedSymbols.has(s.symbol));
 
-  useEffect(() => {
-    // Check r.ok before parsing — previously a 5xx response would
-    // .then() into the error payload (a {error: ...} object) and the
-    // Array.isArray guard would just leave the UI empty, indistinguish-
-    // able from "no signals fired". Now a non-OK leaves the last good
-    // signals visible and the page-level banner already signals the
-    // backend issue to the user.
-    const fetchSignals = () =>
-      fetch("/api/signals")
-        .then((r) => {
-          if (!r.ok) throw new Error(`HTTP ${r.status}`);
-          return r.json();
-        })
-        .then((data: Signal[]) => {
-          if (Array.isArray(data)) setSignals(data);
-          setLoading(false);
-        })
-        .catch(() => setLoading(false));
-
-    fetchSignals();
-    const interval = setInterval(fetchSignals, 30_000);
-    return () => clearInterval(interval);
-  }, []);
 
   return (
     <div className="bg-surface/50 rounded-xl border border-white/5 overflow-hidden">
@@ -56,9 +38,14 @@ export default function SignalScanner({ onSelectAsset, allowedSymbols }: Props) 
             {visibleSignals.length}
           </span>
         </div>
-        <div className="flex items-center gap-1 bg-surface rounded-lg p-0.5">
+        <div
+          className="flex items-center gap-1 bg-surface rounded-lg p-0.5"
+          role="group"
+          aria-label="Signal scanner display"
+        >
           <button
             onClick={() => setView("feed")}
+            aria-pressed={view === "feed"}
             className={`px-3 py-1 rounded-md text-xs font-medium transition-all ${
               view === "feed"
                 ? "bg-white/10 text-white"
@@ -69,6 +56,7 @@ export default function SignalScanner({ onSelectAsset, allowedSymbols }: Props) 
           </button>
           <button
             onClick={() => setView("table")}
+            aria-pressed={view === "table"}
             className={`px-3 py-1 rounded-md text-xs font-medium transition-all ${
               view === "table"
                 ? "bg-white/10 text-white"

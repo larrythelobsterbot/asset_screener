@@ -8,3 +8,7 @@ import { tmpdir } from "node:os";
 
 const tmp = mkdtempSync(join(tmpdir(), "screener-db-"));
 process.env.SCREENER_DB_PATH = join(tmp, "test.db");
+// Never allow unit tests that import the alerter to contact a real Telegram
+// destination inherited from the developer or PM2 environment.
+delete process.env.TELEGRAM_BOT_TOKEN;
+delete process.env.TELEGRAM_CHAT_ID;

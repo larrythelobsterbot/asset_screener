@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server";
-import { cache } from "@/lib/cache";
+import { boundedRemainingTtl, cache } from "@/lib/cache";
 import { getMid } from "@/lib/hyperliquidWs";
 import { getHypePressure } from "@/lib/hypurrscan";
 import {
@@ -8,12 +8,6 @@ import {
 } from "@/lib/db";
 import { startHypePressurePoller } from "@/lib/hypePressurePoller";
 
-// Boot the poller alongside the route. Idempotent — multiple imports
-// won't double-schedule it. The poller is what actually writes
-// snapshots and fires Telegram alerts on threshold crossings; this
-// route is the on-demand read surface.
-startHypePressurePoller();
-
 export const dynamic = "force-dynamic";
 
 const ROUTE_CACHE_TTL_MS = 60_000;
@@ -21,6 +15,16 @@ const ROUTE_CACHE_TTL_MS = 60_000;
 // instead of fetching. Lines up with the poller cadence (90s) so a
 // route hit between polls returns the most recent poll's data.
 const SQLITE_FRESH_MS = 120_000;
+
+function pressureResponse(body: PressureResponse, stale = false) {
+  return NextResponse.json(body, {
+    headers: {
+      "X-Data-Stale": String(stale),
+      "X-Data-Age-Ms": String(Math.max(0, Date.now() - body.generated_at)),
+      "X-Data-Generated-At": String(body.generated_at),
+    },
+  });
+}
 
 interface PressureResponse {
   generated_at: number;
@@ -37,8 +41,11 @@ const THRESHOLD_USD = parseFloat(
 );
 
 export async function GET() {
+  // Start on a real request; module imports also happen during `next build`.
+  startHypePressurePoller();
+
   const cached = cache.get<PressureResponse>("api:hype:pressure");
-  if (cached) return NextResponse.json(cached);
+  if (cached) return pressureResponse(cached);
 
   const now = Date.now();
   // L2: recent SQLite snapshot.
@@ -53,8 +60,8 @@ export async function GET() {
       active_twap_count: snap.active_twap_count,
       threshold_usd: THRESHOLD_USD,
     };
-    cache.set("api:hype:pressure", body, ROUTE_CACHE_TTL_MS - (now - snap.ts));
-    return NextResponse.json(body);
+    cache.set("api:hype:pressure", body, boundedRemainingTtl(ROUTE_CACHE_TTL_MS, now - snap.ts));
+    return pressureResponse(body);
   }
 
   // L3: live fetch + persist. Should only happen on cold start before
@@ -64,7 +71,7 @@ export async function GET() {
     // Best-effort fallback: return whatever we have in SQLite even if
     // stale. Better than an opaque 500 for a widget that polls.
     if (snap) {
-      return NextResponse.json({
+      return pressureResponse({
         generated_at: snap.ts,
         source: "sqlite" as const,
         pressure_1h_usd: snap.pressure_1h_usd,
@@ -72,8 +79,7 @@ export async function GET() {
         hype_price: snap.hype_price,
         active_twap_count: snap.active_twap_count,
         threshold_usd: THRESHOLD_USD,
-        note: "stale — HYPE WS mid unavailable",
-      });
+      } as PressureResponse, true);
     }
     return NextResponse.json(
       { error: "HYPE mid not yet available — WS still connecting" },
@@ -100,7 +106,7 @@ export async function GET() {
       threshold_usd: THRESHOLD_USD,
     };
     cache.set("api:hype:pressure", body, ROUTE_CACHE_TTL_MS);
-    return NextResponse.json(body);
+    return pressureResponse(body);
   } catch (err) {
     return NextResponse.json({ error: String(err) }, { status: 502 });
   }

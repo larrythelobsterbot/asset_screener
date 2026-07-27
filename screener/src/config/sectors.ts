@@ -695,10 +695,10 @@ export const COINGECKO_IDS = [
 
 // Macro indicators for the top bar
 export const MACRO_INDICATORS = [
-  { symbol: "DXY", label: "US Dollar", source: "static" as const },
-  { symbol: "VIX", label: "Volatility", source: "static" as const },
-  { symbol: "US10Y", label: "US 10Y", source: "static" as const },
-  { symbol: "SPX", label: "S&P 500", source: "live" as const },
+  { symbol: "USD", label: "Broad US Dollar", source: "delayed" as const },
+  { symbol: "VIX", label: "Volatility", source: "delayed" as const },
+  { symbol: "US10Y", label: "US 10Y Yield", source: "delayed" as const },
+  { symbol: "SP500", label: "S&P 500", source: "live" as const, dex: "xyz" as const },
   { symbol: "PAXG", label: "Gold", source: "live" as const },
 ];
 

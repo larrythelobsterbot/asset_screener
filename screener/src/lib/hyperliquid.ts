@@ -112,7 +112,7 @@ async function hlPost<T>(body: Record<string, unknown>): Promise<T> {
   await acquireToken();
   hlRequestCount += 1;
   try {
-    // Next.js 14 App Router auto-caches fetch() responses — POST included —
+    // Next App Router can cache fetch() responses — POST included —
     // unless we opt out explicitly. Without `cache: "no-store"` the same
     // metaAndCtxs response gets served to us forever from Next's fetch
     // cache, which is exactly the bug that made markets prices freeze.

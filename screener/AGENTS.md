@@ -1,6 +1,6 @@
 # AGENTS.md — Asset Screener
 
-Next.js 14 (App Router) Hyperliquid signal screener. Live at `assets.lekker.design`.
+Next.js 15 (App Router) Hyperliquid signal screener. Live at `asset.lekker.design`.
 
 ## Commands
 
@@ -8,7 +8,7 @@ Next.js 14 (App Router) Hyperliquid signal screener. Live at `assets.lekker.desi
 npm run dev          # local dev server (hot reload)
 npm run build        # production build
 npm start            # serve production build on :3003
-npm run lint         # next lint
+npm run lint         # ESLint (zero warnings)
 npm test             # node --test via tsx on src/lib/__tests__/*.test.ts
 ```
 
@@ -22,7 +22,7 @@ pm2 restart asset-screener        # after a build
 pm2 logs asset-screener           # tail logs
 ```
 
-Deploy = `npm run build` then `pm2 restart asset-screener`. nginx fronts it at `assets.lekker.design`.
+Deploy = `npm run build` then `pm2 restart asset-screener`. nginx fronts it at `asset.lekker.design`.
 
 ## Layout
 
@@ -57,6 +57,22 @@ scripts/         One-off + cron scripts
 - UI/component/styling changes: fine autonomously, but verify (below) before done.
 - `data/*.sqlite` holds accumulated market history — treat as append-only; never
   regenerate or truncate without approval.
+
+## Hermes delegation policy
+
+- The primary brain/orchestrator is `gpt-5.6-sol` with `xhigh` reasoning.
+- Delegated leaf executors use `gpt-5.6-luna` with `medium` reasoning through the
+  `openai-codex` provider. Keep delegation flat (`max_spawn_depth: 1`) with at most
+  three concurrent children.
+- The primary agent owns architecture, decomposition, safety decisions, coordination,
+  review, and final verification. Delegate bounded implementation, code inspection,
+  testing, and research tasks when parallel work is useful.
+- Give every child exact paths, constraints, acceptance criteria, relevant rules from
+  this file, and verification commands. Children have no parent-conversation context.
+- Treat child summaries as unverified. The primary agent must inspect changed files and
+  run the relevant tests/build before reporting success.
+- Never delegate approval decisions or bypass the trading-logic and data-safety rules
+  above. Subagents cannot ask the user for clarification.
 
 ## Verify (after any change)
 

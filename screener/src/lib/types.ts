@@ -44,4 +44,6 @@ export interface MacroData {
   value: number | null;
   change: number | null;
   source: "live" | "delayed" | "static";
+  asOf: number | null;
+  stale?: boolean;
 }

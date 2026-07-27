@@ -2,6 +2,7 @@
 
 import { useEffect, useState } from "react";
 import { MacroData } from "@/lib/types";
+import { readStorage } from "@/lib/safeStorage";
 import Sparkline from "./Sparkline";
 
 // Bracket-style macro bar with three layout variants.
@@ -51,7 +52,7 @@ export default function MacroBar({ variant: variantProp, children }: Props) {
   useEffect(() => {
     if (variantProp) return;
     if (typeof window === "undefined") return;
-    const stored = window.localStorage.getItem(STORAGE_KEY);
+    const stored = readStorage(() => window.localStorage, STORAGE_KEY);
     if (stored === "compact" || stored === "detailed" || stored === "marquee") {
       setVariant(stored);
     }
@@ -62,14 +63,25 @@ export default function MacroBar({ variant: variantProp, children }: Props) {
     // (which would clobber the last-known macros with garbage). On
     // failure we keep the previous macros visible; the page-level
     // banner already tells the user the backend is down.
-    const fetch_ = () =>
-      fetch("/api/macro")
-        .then((r) => (r.ok ? r.json() : Promise.reject(new Error(`HTTP ${r.status}`))))
-        .then(setMacros)
-        .catch(() => { /* keep last good macros */ });
-    fetch_();
+    const controller = new AbortController();
+    let requestId = 0;
+    const fetch_ = async () => {
+      const id = ++requestId;
+      try {
+        const response = await fetch("/api/macro", { signal: controller.signal });
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        const data = await response.json() as MacroData[];
+        if (id === requestId) setMacros(data);
+      } catch {
+        // Keep last good macros. Abort on unmount is expected.
+      }
+    };
+    void fetch_();
     const interval = setInterval(fetch_, 60_000);
-    return () => clearInterval(interval);
+    return () => {
+      clearInterval(interval);
+      controller.abort();
+    };
   }, []);
 
   // Marquee duplicates the list so the seam at -50% translate is
@@ -82,8 +94,19 @@ export default function MacroBar({ variant: variantProp, children }: Props) {
       <div className="macro-items">
         {items.map((m, i) => {
           const tone = toneClass(m.change);
+          const asOf = m.asOf ? new Date(m.asOf).toLocaleDateString() : "unavailable";
+          const duplicate = variant === "marquee" && i >= macros.length;
+          const ariaLabel = `${m.label}: ${m.value != null ? fmtPrice(m.value) : "unavailable"}, ${m.change != null ? fmtPct(m.change) : "change unavailable"}; ${m.source === "live" ? "live" : "delayed"}${m.stale ? ", stale fallback" : ""}; as of ${asOf}`;
           return (
-            <div key={`${m.symbol}-${i}`} className={`macro-item ${tone}`}>
+            <div
+              key={`${m.symbol}-${i}`}
+              className={`macro-item ${tone}`}
+              title={`${m.label}${m.asOf ? ` · as of ${asOf}` : ""}${m.stale ? " · stale fallback" : ""}`}
+              role="group"
+              aria-label={ariaLabel}
+              aria-hidden={duplicate || undefined}
+              tabIndex={duplicate ? -1 : 0}
+            >
               {variant === "detailed" && (
                 <span className="macro-spark">
                   {/* Sparkline source: we don't have per-macro candle
@@ -96,9 +119,10 @@ export default function MacroBar({ variant: variantProp, children }: Props) {
               <div className="macro-text">
                 <div className="macro-name">
                   <span className="sym macro-sym">{m.symbol}</span>
-                  {m.source === "static" && (
+                  {m.source !== "live" && (
                     <span className="macro-delayed">DELAYED</span>
                   )}
+                  {m.stale && <span className="macro-stale">STALE</span>}
                 </div>
                 <div className="macro-line">
                   {variant === "detailed" && m.value != null && (
@@ -165,6 +189,12 @@ export default function MacroBar({ variant: variantProp, children }: Props) {
           background: transparent;
           font-family: var(--font-geist-mono), ui-monospace, monospace;
         }
+        :global(.macro-stale) {
+          font-size: 9px;
+          letter-spacing: .12em;
+          color: var(--acc-warn);
+          font-family: var(--font-geist-mono), ui-monospace, monospace;
+        }
         :global(.macro-line) {
           display: flex; gap: 6px; align-items: baseline;
         }
@@ -197,13 +227,20 @@ export default function MacroBar({ variant: variantProp, children }: Props) {
           flex-wrap: nowrap;
           overflow: visible;
         }
-        .macro-marquee:hover .macro-items { animation-play-state: paused; }
+        .macro-marquee:hover .macro-items,
+        .macro-marquee:focus-within .macro-items { animation-play-state: paused; }
         :global(.macro-marquee .macro-spark) { display: none; }
         :global(.macro-marquee .macro-text) { flex-direction: row; gap: 6px; align-items: baseline; }
         :global(.macro-marquee .macro-val) { display: none; }
         @keyframes macro-marquee {
           from { transform: translateX(0); }
           to   { transform: translateX(-50%); }
+        }
+        @media (prefers-reduced-motion: reduce) {
+          .macro-marquee .macro-items {
+            animation: none;
+            transform: none;
+          }
         }
       `}</style>
     </div>

@@ -1,5 +1,6 @@
 interface CacheEntry<T> {
   data: T;
+  createdAt: number;
   expiresAt: number;
   // When a stale-while-revalidate refresh is inflight, the Promise is
   // parked here so concurrent callers await the same refresh instead of
@@ -10,6 +11,11 @@ interface CacheEntry<T> {
   // attaches a swallowing `.catch()` before returning; if you change
   // that code path, keep the swallow.
   refreshing?: Promise<T>;
+}
+
+/** Remaining TTL for data whose age may already exceed the nominal TTL. */
+export function boundedRemainingTtl(ttlMs: number, ageMs: number, minTtlMs = 1_000): number {
+  return Math.max(minTtlMs, ttlMs - Math.max(0, ageMs));
 }
 
 class TTLCache {
@@ -32,12 +38,38 @@ class TTLCache {
   }
 
   set<T>(key: string, data: T, ttlMs: number): void {
-    this.store.set(key, { data, expiresAt: Date.now() + ttlMs });
+    const createdAt = Date.now();
+    this.store.set(key, { data, createdAt, expiresAt: createdAt + ttlMs });
   }
 
   getStale<T>(key: string): T | null {
     const entry = this.store.get(key);
     return entry ? (entry.data as T) : null;
+  }
+
+  getStaleWithin<T>(key: string, maxAgeMs: number): T | null {
+    const entry = this.store.get(key);
+    if (!entry || Date.now() - entry.createdAt > maxAgeMs) return null;
+    return entry.data as T;
+  }
+
+  getInfo<T>(key: string): {
+    data: T;
+    createdAt: number;
+    expiresAt: number;
+    ageMs: number;
+    fresh: boolean;
+  } | null {
+    const entry = this.store.get(key);
+    if (!entry) return null;
+    const now = Date.now();
+    return {
+      data: entry.data as T,
+      createdAt: entry.createdAt,
+      expiresAt: entry.expiresAt,
+      ageMs: Math.max(0, now - entry.createdAt),
+      fresh: now <= entry.expiresAt,
+    };
   }
 
   // Stale-while-revalidate: returns fresh data if the TTL hasn't elapsed,
@@ -88,7 +120,8 @@ class TTLCache {
     // no stale data to serve).
     const internal: Promise<T> = fetcher().then(
       (data) => {
-        this.store.set(key, { data, expiresAt: Date.now() + ttlMs });
+        const createdAt = Date.now();
+        this.store.set(key, { data, createdAt, expiresAt: createdAt + ttlMs });
         this.coldInflight.delete(key);
         return data;
       },

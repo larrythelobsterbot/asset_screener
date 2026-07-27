@@ -18,7 +18,7 @@ export interface CGMarketData {
 }
 
 async function cgGet<T>(path: string): Promise<T> {
-  // Opt out of Next.js 14's fetch caching — our own TTL cache wraps this
+  // Opt out of Next App Router fetch caching — our own TTL cache wraps this
   // function and should be the single source of truth for freshness.
   // 15s timeout — CG free tier is slower than HL, so give it some room.
   const res = await fetchWithTimeout(`${CG_API}${path}`, {

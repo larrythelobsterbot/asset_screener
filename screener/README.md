@@ -1,17 +1,17 @@
 # Asset Screener
 
-Next.js 14 financial dashboard for Hyperliquid perps + spot. Aggregates
+Next.js 15 financial dashboard for Hyperliquid perps + spot. Aggregates
 real-time prices, multi-timeframe technical signals, Elfa social
 intelligence, and HYPE TWAP buy-pressure into a Bracket-styled UI
 with Telegram alerting on high-conviction setups.
 
-**Live deployment:** [assets.lekker.design](https://assets.lekker.design)
+**Live deployment:** [asset.lekker.design](https://asset.lekker.design)
 **Repo:** [github.com/larrythelobsterbot/asset_screener](https://github.com/larrythelobsterbot/asset_screener)
 
 ## Architecture (one-page tour)
 
 ```
-Browser → Nginx (TLS) → PM2 (Node, port 3003) → Next.js 14 App Router
+Browser → Nginx (TLS) → PM2 (Node, port 3003) → Next.js 15 App Router
                                                      ├─ Hyperliquid REST + WS
                                                      ├─ Elfa AI REST (budget-gated)
                                                      ├─ Hypurrscan REST + WS
@@ -92,7 +92,7 @@ upgrade headers for the HL WebSocket.
 | `src/app/api/macro/route.ts` | Macro indicator strip |
 | `src/app/api/social/trending/route.ts` | Elfa mindshare (1h cache) |
 | `src/app/api/hype/pressure/route.ts` | HYPE TWAP buy-pressure (90s poll) |
-| `src/lib/db.ts` | SQLite DAL + migrations (v5 currently) |
+| `src/lib/db.ts` | SQLite DAL + migrations (v12 currently) |
 | `src/lib/cache.ts` | In-memory TTL + SWR with single-flight |
 | `src/lib/fetchWithTimeout.ts` | Bounded outbound HTTP for all integrations |
 | `src/lib/hyperliquid.ts` | REST client + token-bucket rate limiter |
@@ -106,7 +106,7 @@ upgrade headers for the HL WebSocket.
 | `src/components/*.tsx` | Bracket UI — table, heatmap treemap, side panel |
 | `src/config/sectors.ts` | HL sector mappings, holdings, descriptions |
 
-## SQLite schema (v5)
+## SQLite schema (v12)
 
 | Table | Purpose | Retention |
 |---|---|---|
@@ -155,12 +155,12 @@ most 24 credits/day per active window, leaving ~280 for ad-hoc lookups.
 ## Testing
 
 ```bash
-npm test         # 45 tests, no external deps
+npm test         # 127 tests, no external network dependencies
 ```
 
 Coverage:
 - DAL round-trip (snapshots, candles, event history, social, kv)
-- Schema migration v0→v5 (run on each test invocation against a tmp file)
+- Schema migration v0→v12 (run on each test invocation against a tmp file)
 - Signal logic (RSI/MACD/divergence, sector RS, social spike)
 - Conviction composition + cross-TF de-bouncing
 - TWAP pressure formula (perp + spot merge, future-start guard, etc.)

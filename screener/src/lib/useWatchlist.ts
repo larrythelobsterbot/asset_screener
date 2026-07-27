@@ -1,26 +1,19 @@
 "use client";
 
 import { useState, useEffect, useCallback } from "react";
+import { readStorage, writeStorage } from "@/lib/safeStorage";
+import { parseStoredStringSet, serializeStringSet } from "@/lib/stringSetStorage";
 
 const STORAGE_KEY = "asset-screener-watchlist";
 
 function loadWatchlist(): Set<string> {
   if (typeof window === "undefined") return new Set();
-  try {
-    const raw = localStorage.getItem(STORAGE_KEY);
-    if (!raw) return new Set();
-    return new Set(JSON.parse(raw));
-  } catch {
-    return new Set();
-  }
+  return parseStoredStringSet(readStorage(() => window.localStorage, STORAGE_KEY));
 }
 
 function saveWatchlist(symbols: Set<string>) {
-  try {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify([...symbols]));
-  } catch {
-    // localStorage full or unavailable — silently fail
-  }
+  if (typeof window === "undefined") return;
+  writeStorage(() => window.localStorage, STORAGE_KEY, serializeStringSet(symbols));
 }
 
 export function useWatchlist() {

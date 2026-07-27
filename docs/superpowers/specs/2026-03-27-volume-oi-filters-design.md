@@ -1,7 +1,7 @@
 # Volume & Open Interest Filters — Design Spec
 
 **Date:** 2026-03-27
-**Project:** Asset Screener (assets.lekker.design)
+**Project:** Asset Screener (asset.lekker.design)
 
 ---
 

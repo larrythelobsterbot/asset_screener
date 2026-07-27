@@ -16,41 +16,50 @@ import {
 import { startHlWs, getMid } from "@/lib/hyperliquidWs";
 import { startHip3CandleWarmer } from "@/lib/hip3CandleWarmer";
 import { startWalletPoller } from "@/lib/walletPoller";
+import { shouldLogChangedOrExpired } from "@/lib/logThrottle";
 
-// Kick the periodic prune job once per process. Idempotent — repeated
-// calls are no-ops. This is the natural place to hook startup because
-// /api/markets is the most-hit route, so the prune timer is alive
-// shortly after process boot.
-startPruneJob();
+// Start long-lived jobs on the first real request, not while Next imports
+// route modules during `next build`. Every starter is idempotent, and the
+// instrumentation hook self-pings this route shortly after server boot.
+function ensureMarketsRuntime() {
+  startPruneJob();
+  startHlWs();
+  startHip3CandleWarmer();
+  startWalletPoller();
+}
 
-// Same idempotent-init pattern for the WS mid stream. The connection
-// stays alive for the process lifetime; reconnects on its own. Started
-// here (rather than at module top-level somewhere generic) because this
-// route is hit early enough that the connection is established before
-// the first request needs it.
-startHlWs();
-
-// Same idempotent-init pattern: keeps candles_cache warm for the HIP-3
-// board, which no other job fetches candles for. Self-schedules every 6h.
-startHip3CandleWarmer();
-
-// Same idempotent-init pattern: polls clearinghouseState for the smart-
-// money-flow wallet cohort and writes wallet_positions. Self-schedules
-// every 15min (first run 90s after boot). See lib/walletPoller.ts.
-startWalletPoller();
-
-// Without this, Next.js 14 App Router prerenders this route at BUILD TIME
+// Without this, Next App Router may prerender this route at BUILD TIME
 // and the built-in response gets served forever — meaning every price in
 // the response is frozen to whatever Hyperliquid returned during the build
 // step. `force-dynamic` makes Next.js evaluate the handler on every request
 // so our in-memory TTL cache is what actually controls freshness.
 export const dynamic = "force-dynamic";
 
+const MARKETS_CACHE_KEY = "api:markets";
+const MARKETS_MAX_STALE_MS = 10 * 60_000;
+const DEDUP_LOG_INTERVAL_MS = 60 * 60_000;
+let lastDedupSignature: string | null = null;
+let lastDedupLoggedAt = 0;
+
+function marketsResponse(data: AssetData[], stale: boolean) {
+  const info = cache.getInfo<AssetData[]>(MARKETS_CACHE_KEY);
+  return NextResponse.json(data, {
+    headers: {
+      "Cache-Control": "no-store, no-cache, must-revalidate",
+      "CDN-Cache-Control": "no-store",
+      "X-Data-Age-Ms": String(info?.ageMs ?? 0),
+      "X-Data-Generated-At": String(info?.createdAt ?? Date.now()),
+      "X-Data-Stale": String(stale),
+    },
+  });
+}
 
 export async function GET() {
+  ensureMarketsRuntime();
+
   try {
-    const cached = cache.get<AssetData[]>("api:markets");
-    if (cached) return NextResponse.json(cached);
+    const cached = cache.get<AssetData[]>(MARKETS_CACHE_KEY);
+    if (cached) return marketsResponse(cached, false);
 
     const [hlData, cgData, ...builderDexResults] = await Promise.all([
       getMetaAndCtxs(),
@@ -239,15 +248,29 @@ export async function GET() {
       }
     }
 
-    // Surface dedup conflicts once per scan (throttled to not spam logs).
+    // Surface conflicts when the set changes, plus one hourly reminder.
+    // /api/markets runs every 30-60s, so logging every scan buries real
+    // upstream and poller failures in hundreds of duplicate lines.
     if (dedupConflicts.length > 0) {
-      console.info(
-        `[markets] builder-dex dedup suppressed ${dedupConflicts.length} duplicate tickers: ` +
-          dedupConflicts
-            .slice(0, 10)
-            .map((c) => `${c.ticker}@${c.loserDex}<-${c.winnerSource}`)
-            .join(", ")
-      );
+      const details = dedupConflicts
+        .slice(0, 10)
+        .map((c) => `${c.ticker}@${c.loserDex}<-${c.winnerSource}`)
+        .join(", ");
+      const signature = `${dedupConflicts.length}:${details}`;
+      const now = Date.now();
+      if (shouldLogChangedOrExpired(
+        lastDedupSignature,
+        signature,
+        lastDedupLoggedAt,
+        now,
+        DEDUP_LOG_INTERVAL_MS,
+      )) {
+        console.info(
+          `[markets] builder-dex dedup suppressed ${dedupConflicts.length} duplicate tickers: ${details}`
+        );
+        lastDedupSignature = signature;
+        lastDedupLoggedAt = now;
+      }
     }
 
     // CoinGecko assets — skip any symbol already covered by a Hyperliquid perp
@@ -397,7 +420,7 @@ export async function GET() {
       if (fAvg != null) a.fundingAvg24h = fAvg;
     }
 
-    cache.set("api:markets", assets, 30_000);
+    cache.set(MARKETS_CACHE_KEY, assets, 30_000);
 
     // Fire-and-forget time-series snapshot. Only HL-sourced rows are
     // captured (assembled in the perp + builder-dex loops above) — we
@@ -413,12 +436,10 @@ export async function GET() {
       }
     });
 
-    return NextResponse.json(assets, {
-      headers: { "Cache-Control": "no-store, no-cache, must-revalidate", "CDN-Cache-Control": "no-store" },
-    });
+    return marketsResponse(assets, false);
   } catch (err) {
-    const stale = cache.getStale<AssetData[]>("api:markets");
-    if (stale) return NextResponse.json(stale);
+    const stale = cache.getStaleWithin<AssetData[]>(MARKETS_CACHE_KEY, MARKETS_MAX_STALE_MS);
+    if (stale) return marketsResponse(stale, true);
     return NextResponse.json({ error: String(err) }, { status: 500 });
   }
 }

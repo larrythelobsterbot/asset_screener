@@ -1,6 +1,8 @@
 "use client";
 
 import { useState, useEffect, useCallback } from "react";
+import { readStorage, writeStorage } from "@/lib/safeStorage";
+import { parseStoredStringSet, serializeStringSet } from "@/lib/stringSetStorage";
 
 // Hide-list — opposite of useWatchlist. Tracks symbols the user has
 // explicitly excluded from the heatmap/table. Persisted to localStorage
@@ -17,23 +19,12 @@ const STORAGE_KEY = "asset-screener-hidelist";
 
 function load(): Set<string> {
   if (typeof window === "undefined") return new Set();
-  try {
-    const raw = window.localStorage.getItem(STORAGE_KEY);
-    if (!raw) return new Set();
-    const parsed = JSON.parse(raw);
-    if (!Array.isArray(parsed)) return new Set();
-    return new Set(parsed.filter((x): x is string => typeof x === "string"));
-  } catch {
-    return new Set();
-  }
+  return parseStoredStringSet(readStorage(() => window.localStorage, STORAGE_KEY));
 }
 
 function save(symbols: Set<string>): void {
-  try {
-    window.localStorage.setItem(STORAGE_KEY, JSON.stringify([...symbols]));
-  } catch {
-    // localStorage full or unavailable — silently fail
-  }
+  if (typeof window === "undefined") return;
+  writeStorage(() => window.localStorage, STORAGE_KEY, serializeStringSet(symbols));
 }
 
 export function useHidelist() {
@@ -74,10 +65,9 @@ export function useHidelist() {
   }, []);
 
   const clear = useCallback(() => {
-    setHidden(new Set());
-    if (typeof window !== "undefined") {
-      window.localStorage.removeItem(STORAGE_KEY);
-    }
+    const empty = new Set<string>();
+    setHidden(empty);
+    save(empty);
   }, []);
 
   return { hidden, hide, unhide, toggle, clear, count: hidden.size };

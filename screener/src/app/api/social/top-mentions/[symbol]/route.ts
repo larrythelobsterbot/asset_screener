@@ -36,7 +36,7 @@ export interface TopMentionsRouteResponse {
 
 export async function GET(
   req: NextRequest,
-  { params }: { params: { symbol: string } }
+  { params }: { params: Promise<{ symbol: string }> }
 ) {
   if (!isElfaConfigured()) {
     return NextResponse.json(
@@ -45,7 +45,8 @@ export async function GET(
     );
   }
 
-  const symbol = (params.symbol ?? "").toUpperCase();
+  const { symbol: symbolParam } = await params;
+  const symbol = (symbolParam ?? "").toUpperCase();
   if (!SYMBOL_RE.test(symbol)) {
     return NextResponse.json({ error: "invalid symbol" }, { status: 400 });
   }

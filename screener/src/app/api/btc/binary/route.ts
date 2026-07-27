@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server";
-import { cache } from "@/lib/cache";
+import { boundedRemainingTtl, cache } from "@/lib/cache";
 import { getCurrentBtcBinary, annualizedRealizedVol, modelYesProbability } from "@/lib/btcBinary";
 import {
   insertBtcBinarySnapshot,
@@ -8,13 +8,20 @@ import {
 } from "@/lib/db";
 import { startBtcBinaryPoller } from "@/lib/btcBinaryPoller";
 
-// Kick the poller alongside the route. Idempotent.
-startBtcBinaryPoller();
-
 export const dynamic = "force-dynamic";
 
 const ROUTE_CACHE_TTL_MS = 30_000;
 const SQLITE_FRESH_MS = 90_000;       // accept snapshots up to 90s old
+
+function binaryResponse(body: BtcBinaryResponse, stale = false) {
+  return NextResponse.json(body, {
+    headers: {
+      "X-Data-Stale": String(stale),
+      "X-Data-Age-Ms": String(Math.max(0, Date.now() - body.generated_at)),
+      "X-Data-Generated-At": String(body.generated_at),
+    },
+  });
+}
 
 export interface BtcBinaryResponse {
   generated_at: number;
@@ -43,8 +50,11 @@ export interface BtcBinaryResponse {
 }
 
 export async function GET() {
+  // Start on a real request; module imports also happen during `next build`.
+  startBtcBinaryPoller();
+
   const cached = cache.get<BtcBinaryResponse>("api:btc:binary");
-  if (cached) return NextResponse.json(cached);
+  if (cached) return binaryResponse(cached);
 
   const now = Date.now();
 
@@ -65,8 +75,8 @@ export async function GET() {
       btc_mid: snap.btc_mid,
       now,
     });
-    cache.set("api:btc:binary", body, ROUTE_CACHE_TTL_MS - (now - snap.ts));
-    return NextResponse.json(body);
+    cache.set("api:btc:binary", body, boundedRemainingTtl(ROUTE_CACHE_TTL_MS, now - snap.ts));
+    return binaryResponse(body);
   }
 
   // L3: live fetch.
@@ -94,7 +104,7 @@ export async function GET() {
           now,
           note: "WS mids not yet populated — serving last persisted snapshot",
         });
-        return NextResponse.json(body);
+        return binaryResponse(body, true);
       }
       return NextResponse.json(
         { error: "outcome mids not yet streamed — try again in a moment" },
@@ -123,7 +133,7 @@ export async function GET() {
       now,
     });
     cache.set("api:btc:binary", body, ROUTE_CACHE_TTL_MS);
-    return NextResponse.json(body);
+    return binaryResponse(body);
   } catch (err) {
     return NextResponse.json({ error: String(err) }, { status: 500 });
   }

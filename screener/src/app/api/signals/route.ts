@@ -5,6 +5,8 @@ import {
   detectSignals,
   detectSectorRelativeStrengthMulti,
   detectSocialSpike,
+  deriveVolRegime,
+  filterClosedCandles,
   Signal,
   type SectorMultiSnapshot,
   type SocialSnapshot,
@@ -13,12 +15,18 @@ import { cache } from "@/lib/cache";
 import { logSignalFires } from "@/lib/signalPersistence";
 import { snapshotAtBounded, latestSocialSnapshots } from "@/lib/db";
 import { maybeDispatchAlerts, type TradeContext } from "@/lib/alerter";
-import { atrPercent } from "@/lib/indicators";
+import { atrPercent, type VolRegime } from "@/lib/indicators";
 
-// Without this, Next.js 14 prerenders this route statically at build time
+// Without this, Next App Router may prerender this route statically at build time
 // and serves a frozen snapshot forever. See markets/route.ts for the same
 // fix. All routes that read live market data must opt out of static gen.
 export const dynamic = "force-dynamic";
+
+// Browser polling and the visitor-independent instrumentation keepalive can
+// arrive on different phases. Keep results fresh for almost one minute so
+// both consumers share one expensive 160-call scan instead of alternating
+// scans every ~30 seconds; getWithRefresh still single-flights boundary races.
+const SIGNAL_CACHE_TTL_MS = 55_000;
 
 // Per-scan per-coin failure counts, so we can see at a glance whether a
 // fetch layer is degrading rather than silently swallowing errors.
@@ -28,11 +36,7 @@ interface ScanFailure {
   message: string;
 }
 
-export async function GET() {
-  try {
-    const cached = cache.get<Signal[]>("api:signals");
-    if (cached) return NextResponse.json(cached);
-
+async function scanSignals(): Promise<Signal[]> {
     const { meta, assetCtxs } = await getMetaAndCtxs();
     const allSignals: Signal[] = [];
     const failures: ScanFailure[] = [];
@@ -145,7 +149,7 @@ export async function GET() {
     //
     // API budget: 3 candle fetches + 1 funding fetch per symbol = 4 × 40
     // = 160 calls per scan. With the 10 req/s HL rate limiter that's a
-    // ~16 s worst-case scan, comfortably inside the 30 s route cache.
+    // ~16 s worst-case scan, comfortably inside the route cache window.
     const TIMEFRAMES: { tf: import("@/lib/signals").Timeframe; interval: "1h" | "4h" | "1d"; bars: number }[] = [
       { tf: "1h", interval: "1h", bars: 200 },
       { tf: "4h", interval: "4h", bars: 350 },
@@ -158,6 +162,11 @@ export async function GET() {
     // long/short alignment. Built here so the alerter doesn't have to
     // recompute anything from raw candles.
     const tradeCtxBySymbol = new Map<string, TradeContext>();
+    const primaryVolRegimeBySymbol = new Map<string, VolRegime>(
+      mapped.map((asset) => [asset.name, "unknown"]),
+    );
+    const decisionCandleAtBySymbol = new Map<string, number>();
+    const candleDecisionCutoff = Date.now();
 
     for (let i = 0; i < mapped.length; i += 5) {
       const batch = mapped.slice(i, i + 5);
@@ -193,7 +202,11 @@ export async function GET() {
           .filter((x) => Number.isFinite(x));
 
         for (let t = 0; t < TIMEFRAMES.length; t++) {
-          const candles = tfResults[t][j];
+          const candles = filterClosedCandles(tfResults[t][j], candleDecisionCutoff);
+          const isPrimary = TIMEFRAMES[t].tf === "4h";
+          if (isPrimary && candles.length > 0) {
+            decisionCandleAtBySymbol.set(batch[j].name, candles[candles.length - 1].T);
+          }
           if (candles.length < 30) continue;
           const closes = candles.map((c) => parseFloat(c.c));
           const volumes = candles.map((c) => parseFloat(c.v));
@@ -203,7 +216,12 @@ export async function GET() {
           // Only the 4h pass gets the funding rate — funding is a 1h-cadence
           // metric and doesn't meaningfully vary across the TF scans, so we
           // avoid firing the same anomaly 3× per scan.
-          const isPrimary = TIMEFRAMES[t].tf === "4h";
+          if (isPrimary) {
+            primaryVolRegimeBySymbol.set(
+              batch[j].name,
+              deriveVolRegime(highs, lows, closes),
+            );
+          }
 
           const signals = detectSignals(
             batch[j].name,
@@ -257,7 +275,7 @@ export async function GET() {
     const priceBySymbol = new Map<string, number>();
     for (let i = 0; i < meta.universe.length; i++) {
       const sym = meta.universe[i].name;
-      const px = parseFloat(assetCtxs[i].markPx || "0");
+      const px = parseFloat(assetCtxs[i].markPx || "0") * displayScaleOf(sym);
       if (px > 0) priceBySymbol.set(sym, px);
     }
     logSignalFires(allSignals, priceBySymbol).catch((e) =>
@@ -267,19 +285,33 @@ export async function GET() {
     // Telegram alerting — fire-and-forget. Scores conviction per symbol
     // and dispatches Strong Buy/Sell alerts that pass the cooldown +
     // vol-regime gate. No-ops if env isn't configured.
-    maybeDispatchAlerts(allSignals, priceBySymbol, tradeCtxBySymbol)
+    maybeDispatchAlerts(
+      allSignals,
+      priceBySymbol,
+      tradeCtxBySymbol,
+      primaryVolRegimeBySymbol,
+      decisionCandleAtBySymbol,
+      candleDecisionCutoff,
+    )
       .then((r) => {
         if (r.considered > 0) {
           console.info(
             `[alerter] considered=${r.considered} fired=${r.fired} ` +
-            `cooledDown=${r.cooledDown} failed=${r.failed}`
+            `activeThesis=${r.activeThesis} cooledDown=${r.cooledDown} ` +
+            `failed=${r.failed} unknown=${r.unknown}`
           );
         }
       })
       .catch((e) => console.warn("[alerter] dispatch error:", e));
 
-    cache.set("api:signals", allSignals, 30_000);
-    return NextResponse.json(allSignals);
+    return allSignals;
+}
+
+export async function GET() {
+  // Instrumentation pings this route independently of browser traffic.
+  try {
+    const signals = await cache.getWithRefresh("api:signals", scanSignals, SIGNAL_CACHE_TTL_MS, 120_000);
+    return NextResponse.json(signals);
   } catch (err) {
     const stale = cache.getStale<Signal[]>("api:signals");
     if (stale) return NextResponse.json(stale);

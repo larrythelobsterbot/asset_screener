@@ -9,8 +9,6 @@ import { displayScaleOf } from "@/lib/hyperliquid";
 // (X-Accel-Buffering: no). ?symbols=BTC,ETH limits the payload; without it
 // we stream every fresh mid (~330 symbols, a few KB/s).
 
-startHlWs();
-
 export const dynamic = "force-dynamic";
 
 const PUSH_INTERVAL_MS = 1000;
@@ -22,6 +20,9 @@ const MAX_SYMBOLS = 150;
 const STALE_MS = 60_000;
 
 export async function GET(req: Request) {
+  // Do not open the upstream websocket at build-time module import.
+  startHlWs();
+
   const url = new URL(req.url);
   const symbols = (url.searchParams.get("symbols") ?? "")
     .split(",")

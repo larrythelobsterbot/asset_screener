@@ -16,6 +16,7 @@
 // is live.
 
 import { useEffect, useState, useCallback, useMemo } from "react";
+import Link from "next/link";
 import type { TradeRow } from "@/lib/db";
 import { AssetData } from "@/lib/types";
 
@@ -228,16 +229,21 @@ export default function JournalPage() {
           </div>
         </div>
         <div style={{ display: "flex", gap: 8 }}>
-          <a href="/terminal" style={{
+          <Link href="/signals" style={{
+            fontSize: 11, color: "var(--acc-up)", textDecoration: "none",
+            padding: "6px 10px", borderRadius: "var(--radius)",
+            border: ".5px solid color-mix(in oklab, var(--acc-up) 45%, transparent)",
+          }}>◎ signal performance</Link>
+          <Link href="/terminal" style={{
             fontSize: 11, color: "var(--acc-warn)", textDecoration: "none",
             padding: "6px 10px", borderRadius: "var(--radius)",
             border: ".5px solid color-mix(in oklab, var(--acc-warn) 45%, transparent)",
             background: "color-mix(in oklab, var(--acc-warn) 9%, transparent)",
-          }}>⌗ terminal</a>
-          <a href="/" style={{
+          }}>⌗ terminal</Link>
+          <Link href="/" style={{
             fontSize: 11, color: "var(--text-mute)", textDecoration: "none",
             padding: "6px 10px", border: ".5px solid var(--border)", borderRadius: "var(--radius)",
-          }}>← screener</a>
+          }}>← screener</Link>
         </div>
       </header>
 

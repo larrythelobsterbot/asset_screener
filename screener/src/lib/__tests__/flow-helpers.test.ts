@@ -49,6 +49,7 @@ test("snapshotFullAtBounded returns mark, oi and funding from the SAME row", () 
   assert.equal(row?.mark, 105);
   assert.equal(row?.oi, 20, "oi must come from the same row as the mark");
   assert.equal(row?.funding, 0.0002, "funding must come from the same row as the mark");
+  assert.equal(row?.volume, 1, "volume must come from the same row as mark/OI/funding");
   assert.equal(row?.ts, base - 60_000);
 });
 

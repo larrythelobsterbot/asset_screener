@@ -34,25 +34,42 @@ export function getDb(): Database.Database {
 // Versioned via PRAGMA user_version so we can add schema changes without
 // blowing away the local file. Bump VERSION and add a step.
 
-const VERSION = 12;
+const VERSION = 23;
 
 function migrate(db: Database.Database): void {
   const current = db.pragma("user_version", { simple: true }) as number;
   if (current >= VERSION) return;
 
-  if (current < 1) db.exec(MIGRATION_V1);
-  if (current < 2) db.exec(MIGRATION_V2);
-  if (current < 3) db.exec(MIGRATION_V3);
-  if (current < 4) db.exec(MIGRATION_V4);
-  if (current < 5) db.exec(MIGRATION_V5);
-  if (current < 6) db.exec(MIGRATION_V6);
-  if (current < 7) db.exec(MIGRATION_V7);
-  if (current < 8) db.exec(MIGRATION_V8);
-  if (current < 9) db.exec(MIGRATION_V9);
-  if (current < 10) db.exec(MIGRATION_V10);
-  if (current < 11) db.exec(MIGRATION_V11);
-  if (current < 12) db.exec(MIGRATION_V12);
-  db.pragma(`user_version = ${VERSION}`);
+  db.transaction(() => {
+    if (current < 1) db.exec(MIGRATION_V1);
+    if (current < 2) db.exec(MIGRATION_V2);
+    if (current < 3) db.exec(MIGRATION_V3);
+    if (current < 4) db.exec(MIGRATION_V4);
+    if (current < 5) db.exec(MIGRATION_V5);
+    if (current < 6) db.exec(MIGRATION_V6);
+    if (current < 7) db.exec(MIGRATION_V7);
+    if (current < 8) db.exec(MIGRATION_V8);
+    if (current < 9) db.exec(MIGRATION_V9);
+    if (current < 10) db.exec(MIGRATION_V10);
+    if (current < 11) db.exec(MIGRATION_V11);
+    if (current < 12) db.exec(MIGRATION_V12);
+    if (current < 13) db.exec(MIGRATION_V13);
+    if (current < 14) {
+      const columns = db.pragma("table_info(telegram_alerts)") as Array<{ name: string }>;
+      if (!columns.some((column) => column.name === "delivery_uncertain")) db.exec(MIGRATION_V14);
+      db.exec(MIGRATION_V14_BACKFILL);
+    }
+    if (current < 15) db.exec(MIGRATION_V15);
+    if (current < 16) db.exec(MIGRATION_V16);
+    if (current < 17) db.exec(MIGRATION_V17);
+    if (current < 18) db.exec(MIGRATION_V18);
+    if (current < 19) db.exec(MIGRATION_V19);
+    if (current < 20) db.exec(MIGRATION_V20);
+    if (current < 21) db.exec(MIGRATION_V21);
+    if (current < 22) db.exec(MIGRATION_V22);
+    if (current < 23) db.exec(MIGRATION_V23);
+    db.pragma(`user_version = ${VERSION}`);
+  })();
 }
 
 // Schema migrations are split into versioned blocks so an existing db
@@ -346,6 +363,251 @@ const MIGRATION_V12 = `
     create index if not exists idx_wpos_ts on wallet_positions(ts);
   `;
 
+// V13 — append-only Telegram alert delivery and outcome ledger. This is
+// deliberately separate from event_history and trades: every send attempt
+// is durable, while terminal outcome updates are guarded and idempotent.
+const MIGRATION_V13 = `
+    create table if not exists telegram_alerts (
+      id                  integer primary key autoincrement,
+      created_at          integer not null,
+      delivery_status     text not null check (delivery_status in ('pending', 'delivered', 'failed')),
+      delivered_at        integer,
+      delivery_error      text,
+      telegram_message_id text,
+      symbol              text not null,
+      sector              text,
+      direction           text not null check (direction in ('long', 'short')),
+      entry_price         real,
+      stop_price          real,
+      target_price        real,
+      size                real,
+      risk_usd            real,
+      conviction_score    real,
+      conviction_json     text,
+      signal_json         text,
+      family_json         text,
+      expires_at          integer not null,
+      outcome_status      text not null default 'open' check (outcome_status in ('open', 'target', 'stop', 'expired', 'ambiguous', 'untrackable')),
+      outcome_at          integer,
+      outcome_price       real,
+      pnl_r               real,
+      evaluated_through   integer,
+      outcome_note        text,
+      outcome_provenance  text
+    );
+    create index if not exists idx_telegram_alerts_delivery
+      on telegram_alerts(delivery_status, created_at desc);
+    create index if not exists idx_telegram_alerts_outcome
+      on telegram_alerts(outcome_status, expires_at, created_at desc);
+    create index if not exists idx_telegram_alerts_symbol_created
+      on telegram_alerts(symbol, created_at desc);
+    create unique index if not exists uq_telegram_alerts_message_id
+      on telegram_alerts(telegram_message_id) where telegram_message_id is not null;
+  `;
+
+// V14 — preserve the difference between a definite Telegram rejection and
+// an acknowledgement whose result is unknowable after a timeout/crash.
+const MIGRATION_V14 = `
+    alter table telegram_alerts
+      add column delivery_uncertain integer not null default 0
+      check (delivery_uncertain in (0, 1));
+  `;
+
+const MIGRATION_V14_BACKFILL = `
+    update telegram_alerts
+      set expires_at = delivered_at + ${48 * 60 * 60 * 1_000}
+      where delivery_status = 'delivered' and delivered_at is not null
+        and outcome_status = 'open';
+  `;
+
+const MIGRATION_V15 = `
+    create table if not exists signal_states (
+      symbol      text not null,
+      type        text not null,
+      timeframe   text not null,
+      active      integer not null check (active in (0, 1)),
+      direction   text check (direction in ('bullish', 'bearish')),
+      value       real,
+      updated_at  integer not null,
+      primary key (symbol, type, timeframe)
+    );
+  `;
+
+const MIGRATION_V16 = `
+    create table if not exists alert_candidates (
+      id                  integer primary key autoincrement,
+      evaluated_at        integer not null,
+      decision_candle_at  integer,
+      strategy_version    text not null,
+      symbol              text not null,
+      direction           text not null check (direction in ('long', 'short')),
+      conviction_score    real not null,
+      vol_regime          text not null,
+      decision            text not null check (decision in ('rejected', 'suppressed', 'eligible')),
+      decision_reason     text not null,
+      conviction_json     text not null,
+      signal_json         text not null,
+      family_json         text not null,
+      feature_json        text not null,
+      telegram_attempted  integer not null default 0 check (telegram_attempted in (0, 1))
+    );
+    create unique index if not exists uq_alert_candidates_scan
+      on alert_candidates(strategy_version, evaluated_at, symbol, direction);
+    create index if not exists idx_alert_candidates_version_time
+      on alert_candidates(strategy_version, evaluated_at desc);
+    create index if not exists idx_alert_candidates_decision_time
+      on alert_candidates(decision, decision_reason, evaluated_at desc);
+  `;
+
+const MIGRATION_V17 = `
+    create index if not exists idx_alert_candidates_symbol_evaluated
+      on alert_candidates(symbol, evaluated_at desc);
+    create index if not exists idx_alert_candidates_version_symbol_evaluated
+      on alert_candidates(strategy_version, symbol, evaluated_at desc);
+  `;
+
+const MIGRATION_V18 = `
+    alter table alert_candidates add column shadow_policy_json text;
+  `;
+
+const MIGRATION_V19 = `
+    create table if not exists telegram_alert_counterfactuals (
+      id                  integer primary key autoincrement,
+      alert_id            integer not null references telegram_alerts(id),
+      policy_version      text not null,
+      target_r            real not null,
+      target_price        real,
+      expires_at          integer not null,
+      outcome_status      text not null check (outcome_status in ('open', 'target', 'stop', 'expired', 'ambiguous', 'untrackable')),
+      outcome_at          integer,
+      outcome_price       real,
+      pnl_r               real,
+      evaluated_through   integer,
+      outcome_note        text,
+      outcome_provenance  text,
+      created_at          integer not null,
+      updated_at          integer not null,
+      unique(alert_id, policy_version)
+    );
+    create index if not exists idx_alert_counterfactuals_status_expiry
+      on telegram_alert_counterfactuals(policy_version, outcome_status, expires_at);
+  `;
+
+const MIGRATION_V20 = `
+    alter table telegram_alerts add column candidate_id integer references alert_candidates(id);
+    create index if not exists idx_telegram_alerts_candidate
+      on telegram_alerts(candidate_id) where candidate_id is not null;
+  `;
+
+const MIGRATION_V21 = `
+    alter table telegram_alerts add column candidate_attribution text not null default 'legacy'
+      check (candidate_attribution in ('legacy', 'linked', 'failed'));
+    create index if not exists idx_telegram_alerts_candidate_attribution
+      on telegram_alerts(candidate_attribution, delivery_status, created_at);
+  `;
+
+const MIGRATION_V22 = `
+    create unique index if not exists uq_telegram_alerts_candidate
+      on telegram_alerts(candidate_id) where candidate_id is not null;
+  `;
+
+// V23 — durable market-open OI positioning briefings. Reports and their
+// immutable inputs are separate from trade alerts so descriptive positioning
+// analytics can never contaminate directional trade-card outcomes.
+const MIGRATION_V23 = `
+    create table if not exists market_open_oi_reports (
+      id                    integer primary key autoincrement,
+      report_key            text not null unique,
+      region                text not null check (region in ('asia', 'europe', 'us')),
+      local_date            text not null,
+      report_at             integer not null,
+      open_at               integer not null,
+      generated_at          integer not null,
+      lookback_ms           integer not null check (lookback_ms > 0),
+      calendar_covered      integer not null check (calendar_covered in (0, 1)),
+      selection_config_json text not null,
+      message_body          text not null check (length(message_body) between 1 and 4096),
+      delivery_status       text not null default 'pending'
+        check (delivery_status in ('shadow', 'pending', 'delivered', 'failed', 'unknown', 'expired')),
+      delivery_attempted_at integer,
+      delivered_at          integer,
+      delivery_error        text,
+      telegram_message_id   text,
+      created_at            integer not null,
+      updated_at            integer not null,
+      check (
+        (delivery_status = 'pending' and delivered_at is null and delivery_error is null and telegram_message_id is null)
+        or (delivery_status = 'shadow' and delivery_attempted_at is null and delivered_at is null and delivery_error is null and telegram_message_id is null)
+        or (delivery_status = 'delivered' and delivery_attempted_at is not null and delivered_at is not null and delivery_error is null and telegram_message_id is not null)
+        or (delivery_status in ('failed', 'unknown') and delivery_attempted_at is not null and delivered_at is null and delivery_error is not null and telegram_message_id is null)
+        or (delivery_status = 'expired' and delivery_attempted_at is null and delivered_at is null and delivery_error is not null and telegram_message_id is null)
+      )
+    );
+    create unique index if not exists uq_market_open_oi_message_id
+      on market_open_oi_reports(telegram_message_id) where telegram_message_id is not null;
+    create index if not exists idx_market_open_oi_reports_delivery
+      on market_open_oi_reports(delivery_status, generated_at desc);
+    create index if not exists idx_market_open_oi_reports_open
+      on market_open_oi_reports(open_at desc);
+
+    create table if not exists market_open_oi_items (
+      id                       integer primary key autoincrement,
+      report_id                integer not null references market_open_oi_reports(id) on delete cascade,
+      rank                     integer not null check (rank > 0),
+      symbol                   text not null,
+      sector                   text not null,
+      universe                 text not null check (universe in ('crypto', 'equity')),
+      current_ts               integer not null,
+      prior_ts                 integer not null,
+      current_mark             real not null check (current_mark > 0),
+      prior_mark               real not null check (prior_mark > 0),
+      current_oi_coins         real not null check (current_oi_coins >= 0),
+      prior_oi_coins           real not null check (prior_oi_coins > 0),
+      current_oi_usd           real not null check (current_oi_usd >= 0),
+      prior_oi_usd             real not null check (prior_oi_usd > 0),
+      oi_quantity_delta_usd    real not null,
+      oi_usd_delta             real not null,
+      oi_coins_change_pct      real not null,
+      price_change_pct         real not null,
+      funding_hourly           real,
+      funding_apr              real,
+      volume_24h               real not null check (volume_24h >= 0),
+      quadrant                 text not null check (quadrant in (
+        'expanding_up', 'expanding_down', 'contracting_up', 'contracting_down',
+        'expanding_flat', 'contracting_flat'
+      )),
+      smart_flow_delta_usd     real,
+      smart_flow_alignment     text not null check (smart_flow_alignment in (
+        'aligned', 'opposed', 'not_directional', 'unknown'
+      )),
+      unique(report_id, universe, rank),
+      unique(report_id, symbol)
+    );
+    create index if not exists idx_market_open_oi_items_report
+      on market_open_oi_items(report_id, universe, rank);
+    create index if not exists idx_market_open_oi_items_symbol
+      on market_open_oi_items(symbol, report_id desc);
+
+    create table if not exists market_open_oi_outcomes (
+      item_id         integer not null references market_open_oi_items(id) on delete cascade,
+      horizon         text not null check (horizon in ('open', '1h', '4h', '24h')),
+      target_at       integer not null,
+      status          text not null check (status in ('observed', 'missing', 'untrackable')),
+      snapshot_at     integer,
+      mark            real,
+      return_pct      real,
+      observed_at     integer not null,
+      note            text,
+      primary key (item_id, horizon),
+      check (
+        (status = 'observed' and snapshot_at is not null and mark is not null and mark > 0)
+        or (status in ('missing', 'untrackable') and snapshot_at is null and mark is null and return_pct is null)
+      )
+    );
+    create index if not exists idx_market_open_oi_outcomes_target
+      on market_open_oi_outcomes(horizon, target_at);
+  `;
+
 const MIGRATION_V11 = `
     create table if not exists wallet_registry (
       address        text primary key,
@@ -523,6 +785,7 @@ export interface SnapshotPointFull {
   mark: number;
   oi: number | null;
   funding: number | null;
+  volume: number | null;
   ts: number;
 }
 
@@ -537,13 +800,13 @@ export function snapshotFullAtBounded(
   // Same bounded-seek shape as snapshotAtBounded — see the perf note there
   // before changing it.
   const stmt = db.prepare(
-    `select mark, oi, funding, ts from price_snapshots
+    `select mark, oi, funding, volume, ts from price_snapshots
       where symbol = ? and ts <= ? and ts >= ?
       order by ts desc limit 1`
   );
   for (const sym of list) {
     const row = stmt.get(sym, targetTs, targetTs - maxAgeMs) as
-      | { mark: number; oi: number | null; funding: number | null; ts: number }
+      | SnapshotPointFull
       | undefined;
     if (row) out.set(sym, row);
   }
@@ -577,6 +840,26 @@ export function avgFundingSince(sinceTs: number, symbols?: string[]): Map<string
     if (row?.f != null && Number.isFinite(row.f)) out.set(sym, row.f);
   }
   return out;
+}
+
+export interface PriceObservationRow {
+  ts: number;
+  mark: number;
+}
+
+// Bounded indexed evidence read for alert outcome evaluation. Callers pass
+// one symbol and a narrow time window; never scan the snapshot table whole.
+export function priceSnapshotsInRange(
+  symbol: string,
+  fromTs: number,
+  toTs: number,
+  limit = 5_000,
+): PriceObservationRow[] {
+  return getDb().prepare(`
+    select ts, mark from price_snapshots
+    where symbol = ? and ts >= ? and ts <= ?
+    order by ts asc limit ?
+  `).all(symbol, fromTs, toTs, Math.max(1, Math.min(limit, 10_000))) as PriceObservationRow[];
 }
 
 // 30-day retention prune. Called by a periodic job so the table doesn't
@@ -633,6 +916,21 @@ export function getCandlesFromCache(
      limit ?`
   ).all(symbol, interval, count) as CandleRow[];
   return rows.reverse();
+}
+
+export function candlesInRange(
+  symbol: string,
+  interval: string,
+  fromTs: number,
+  toTs: number,
+  limit = 1_000,
+): CandleRow[] {
+  return getDb().prepare(`
+    select symbol, interval, t, o, h, l, c, v
+    from candles_cache
+    where symbol = ? and interval = ? and t >= ? and t <= ?
+    order by t asc limit ?
+  `).all(symbol, interval, fromTs, toTs, Math.max(1, Math.min(limit, 5_000))) as CandleRow[];
 }
 
 // Bulk variant — fetches the latest `count` candles per symbol for the
@@ -732,6 +1030,39 @@ export function recordEventFire(
      values (?, ?, ?, ?)
      on conflict(symbol, type, timeframe) do update set last_fired_at = excluded.last_fired_at`
   ).run(symbol, type, tf, firedAt);
+}
+
+export interface SignalStateRow {
+  symbol: string;
+  type: string;
+  timeframe: string;
+  active: 0 | 1;
+  direction: "bullish" | "bearish" | null;
+  value: number | null;
+  updated_at: number;
+}
+
+export function signalStateKey(symbol: string, type: string, timeframe?: string | null): string {
+  return `${symbol}:${type}:${timeframe ?? "_"}`;
+}
+
+export function loadSignalStates(): Map<string, SignalStateRow> {
+  const rows = getDb().prepare(
+    `select symbol, type, timeframe, active, direction, value, updated_at from signal_states`,
+  ).all() as SignalStateRow[];
+  return new Map(rows.map((row) => [signalStateKey(row.symbol, row.type, row.timeframe), row]));
+}
+
+export function upsertSignalState(row: SignalStateRow): void {
+  getDb().prepare(
+    `insert into signal_states (symbol, type, timeframe, active, direction, value, updated_at)
+     values (@symbol, @type, @timeframe, @active, @direction, @value, @updated_at)
+     on conflict(symbol, type, timeframe) do update set
+       active = excluded.active,
+       direction = excluded.direction,
+       value = excluded.value,
+       updated_at = excluded.updated_at`,
+  ).run(row);
 }
 
 // ── social_snapshots (time-window-aware in v5) ──────────────────────────
@@ -1107,9 +1438,10 @@ export function startPruneJob(): void {
       const fe = pruneFeedEvents();
       const dv = pruneDerivsSnapshots();
       const wp = pruneWalletPositions();
-      if (sp > 0 || cp > 0 || ss > 0 || hp > 0 || bb > 0 || fe > 0 || dv > 0 || wp > 0) {
+      const ac = pruneAlertCandidates();
+      if (sp > 0 || cp > 0 || ss > 0 || hp > 0 || bb > 0 || fe > 0 || dv > 0 || wp > 0 || ac > 0) {
         console.info(
-          `[db] pruned ${sp} price, ${cp} candle, ${ss} social, ${hp} hype-pressure, ${bb} btc-binary, ${fe} feed, ${dv} derivs, ${wp} wallet-position snapshots`
+          `[db] pruned ${sp} price, ${cp} candle, ${ss} social, ${hp} hype-pressure, ${bb} btc-binary, ${fe} feed, ${dv} derivs, ${wp} wallet-position snapshots, ${ac} alert candidates`
         );
       }
     } catch (err) {
@@ -1248,6 +1580,18 @@ export function latestSnapshotTs(): number | null {
 export function latestFeedTs(): number | null {
   const db = getDb();
   const r = db.prepare(`select max(ts) ts from feed_events`).get() as { ts: number | null };
+  return r?.ts ?? null;
+}
+
+export function latestSocialSnapshotTs(): number | null {
+  const db = getDb();
+  const r = db.prepare(`select max(ts) ts from social_snapshots`).get() as { ts: number | null };
+  return r?.ts ?? null;
+}
+
+export function latestWalletPositionTs(): number | null {
+  const db = getDb();
+  const r = db.prepare(`select max(ts) ts from wallet_positions`).get() as { ts: number | null };
   return r?.ts ?? null;
 }
 
@@ -1527,4 +1871,874 @@ export function pruneWalletPositions(maxAgeMs: number = 30 * 86_400_000): number
   const db = getDb();
   const cutoff = Date.now() - maxAgeMs;
   return db.prepare(`delete from wallet_positions where ts < ?`).run(cutoff).changes;
+}
+
+export type AlertCandidateDecision = "rejected" | "suppressed" | "eligible";
+
+export interface AlertCandidateRow {
+  id: number;
+  evaluated_at: number;
+  decision_candle_at: number | null;
+  strategy_version: string;
+  symbol: string;
+  direction: "long" | "short";
+  conviction_score: number;
+  vol_regime: string;
+  decision: AlertCandidateDecision;
+  decision_reason: string;
+  conviction_json: string;
+  signal_json: string;
+  family_json: string;
+  feature_json: string;
+  shadow_policy_json: string | null;
+  telegram_attempted: 0 | 1;
+}
+
+export type NewAlertCandidate = Omit<AlertCandidateRow, "id" | "shadow_policy_json"> & {
+  shadow_policy_json?: string | null;
+};
+
+export function insertAlertCandidate(row: NewAlertCandidate): number {
+  const db = getDb();
+  const result = db.prepare(`
+    insert into alert_candidates (
+      evaluated_at, decision_candle_at, strategy_version, symbol, direction,
+      conviction_score, vol_regime, decision, decision_reason,
+      conviction_json, signal_json, family_json, feature_json, shadow_policy_json, telegram_attempted
+    ) values (
+      @evaluated_at, @decision_candle_at, @strategy_version, @symbol, @direction,
+      @conviction_score, @vol_regime, @decision, @decision_reason,
+      @conviction_json, @signal_json, @family_json, @feature_json, @shadow_policy_json, @telegram_attempted
+    )
+    on conflict(strategy_version, evaluated_at, symbol, direction) do update set
+      decision_candle_at = excluded.decision_candle_at,
+      conviction_score = excluded.conviction_score,
+      vol_regime = excluded.vol_regime,
+      decision = excluded.decision,
+      decision_reason = excluded.decision_reason,
+      conviction_json = excluded.conviction_json,
+      signal_json = excluded.signal_json,
+      family_json = excluded.family_json,
+      feature_json = excluded.feature_json,
+      shadow_policy_json = excluded.shadow_policy_json,
+      telegram_attempted = max(alert_candidates.telegram_attempted, excluded.telegram_attempted)
+    returning id
+  `).get({ ...row, shadow_policy_json: row.shadow_policy_json ?? null }) as { id: number };
+  return result.id;
+}
+
+export function markAlertCandidateTelegramAttempted(id: number): boolean {
+  return getDb().prepare(`
+    update alert_candidates
+    set telegram_attempted = 1
+    where id = ? and telegram_attempted = 0
+  `).run(id).changes === 1;
+}
+
+export function pruneAlertCandidates(maxAgeMs: number = 90 * 86_400_000): number {
+  const cutoff = Date.now() - maxAgeMs;
+  return getDb().prepare(`delete from alert_candidates where evaluated_at < ?`).run(cutoff).changes;
+}
+
+export function listAlertCandidates(options: {
+  symbol?: string;
+  strategy_version?: string;
+  decision?: AlertCandidateDecision;
+  from?: number;
+  limit?: number;
+} = {}): AlertCandidateRow[] {
+  const clauses: string[] = [];
+  const params: unknown[] = [];
+  if (options.symbol) { clauses.push("symbol = ?"); params.push(options.symbol); }
+  if (options.strategy_version) { clauses.push("strategy_version = ?"); params.push(options.strategy_version); }
+  if (options.decision) { clauses.push("decision = ?"); params.push(options.decision); }
+  if (options.from !== undefined) { clauses.push("evaluated_at >= ?"); params.push(options.from); }
+  const where = clauses.length ? `where ${clauses.join(" and ")}` : "";
+  const limit = Math.max(1, Math.min(options.limit ?? 100, 5_000));
+  return getDb().prepare(
+    `select * from alert_candidates ${where} order by evaluated_at desc, id desc limit ?`,
+  ).all(...params, limit) as AlertCandidateRow[];
+}
+
+// ── telegram_alerts (durable delivery/outcome ledger, v13) ──────────────
+
+export type TelegramDeliveryStatus = "pending" | "delivered" | "failed";
+export type TelegramOutcomeStatus = "open" | "target" | "stop" | "expired" | "ambiguous" | "untrackable";
+export type TelegramCandidateAttribution = "legacy" | "linked" | "failed";
+
+export interface TelegramAlertRow {
+  id: number;
+  created_at: number;
+  delivery_status: TelegramDeliveryStatus;
+  delivered_at: number | null;
+  delivery_error: string | null;
+  delivery_uncertain: 0 | 1;
+  telegram_message_id: string | null;
+  symbol: string;
+  sector: string | null;
+  direction: "long" | "short";
+  entry_price: number | null;
+  stop_price: number | null;
+  target_price: number | null;
+  size: number | null;
+  risk_usd: number | null;
+  conviction_score: number | null;
+  conviction_json: string | null;
+  signal_json: string | null;
+  family_json: string | null;
+  expires_at: number;
+  outcome_status: TelegramOutcomeStatus;
+  outcome_at: number | null;
+  outcome_price: number | null;
+  pnl_r: number | null;
+  evaluated_through: number | null;
+  outcome_note: string | null;
+  outcome_provenance: string | null;
+  candidate_id?: number | null;
+  candidate_attribution?: TelegramCandidateAttribution;
+}
+
+export type NewTelegramAlert = Omit<TelegramAlertRow,
+  "id" | "delivered_at" | "delivery_uncertain"> & { delivered_at?: number | null };
+
+export interface TelegramOutcomeUpdate {
+  outcome_status: Exclude<TelegramOutcomeStatus, "open">;
+  outcome_at: number;
+  outcome_price: number | null;
+  pnl_r: number | null;
+  evaluated_through: number;
+  outcome_note: string | null;
+  outcome_provenance: string;
+}
+
+function validateNewTelegramAlert(row: NewTelegramAlert): void {
+  const candidateAttribution = row.candidate_attribution
+    ?? (row.candidate_id != null ? "linked" : "legacy");
+  if (candidateAttribution === "linked" && row.candidate_id == null) {
+    throw new Error("Linked Telegram alert requires candidate_id");
+  }
+  if (candidateAttribution !== "linked" && row.candidate_id != null) {
+    throw new Error(`${candidateAttribution} Telegram attribution cannot have candidate_id`);
+  }
+  const deliveredAt = row.delivered_at ?? null;
+  if (row.delivery_status === "delivered") {
+    if (deliveredAt === null) throw new Error("Delivered Telegram alert requires delivered_at");
+    if (!row.telegram_message_id) throw new Error("Delivered Telegram alert requires telegram_message_id");
+    if (row.delivery_error !== null) throw new Error("Delivered Telegram alert cannot have delivery_error");
+    return;
+  }
+
+  if (deliveredAt !== null) throw new Error(`${row.delivery_status} Telegram alert cannot have delivered_at`);
+  if (row.delivery_status === "pending") {
+    if (row.telegram_message_id !== null || row.delivery_error !== null || row.outcome_status !== "open") {
+      throw new Error("Pending Telegram alert must have an open, unacknowledged delivery state");
+    }
+    return;
+  }
+
+  if (row.telegram_message_id !== null || row.outcome_status !== "untrackable") {
+    throw new Error("Failed Telegram alert must be untrackable and have no message id");
+  }
+}
+
+export function insertTelegramAlert(row: NewTelegramAlert): number {
+  validateNewTelegramAlert(row);
+  const db = getDb();
+  const result = db.prepare(`
+    insert into telegram_alerts (
+      created_at, delivery_status, delivered_at, delivery_error, telegram_message_id,
+      symbol, sector, direction, entry_price, stop_price, target_price, size, risk_usd,
+      conviction_score, conviction_json, signal_json, family_json, expires_at,
+      outcome_status, outcome_at, outcome_price, pnl_r, evaluated_through, outcome_note, outcome_provenance,
+      candidate_id, candidate_attribution
+    ) values (
+      @created_at, @delivery_status, @delivered_at, @delivery_error, @telegram_message_id,
+      @symbol, @sector, @direction, @entry_price, @stop_price, @target_price, @size, @risk_usd,
+      @conviction_score, @conviction_json, @signal_json, @family_json, @expires_at,
+      @outcome_status, @outcome_at, @outcome_price, @pnl_r, @evaluated_through, @outcome_note, @outcome_provenance,
+      @candidate_id, @candidate_attribution
+    )`).run({
+      ...row,
+      delivered_at: row.delivered_at ?? null,
+      candidate_id: row.candidate_id ?? null,
+      candidate_attribution: row.candidate_attribution
+        ?? (row.candidate_id != null ? "linked" : "legacy"),
+    });
+  return Number(result.lastInsertRowid);
+}
+
+export type TelegramAlertReservation =
+  | { kind: "inserted"; id: number }
+  | { kind: "blocked"; reason: "active_thesis" };
+
+export function reserveTelegramAlert(row: NewTelegramAlert): TelegramAlertReservation {
+  validateNewTelegramAlert(row);
+  const db = getDb();
+  const reserve = db.transaction((): TelegramAlertReservation => {
+    const active = db.prepare(`
+      select 1 from telegram_alerts
+      where symbol = ? and direction = ? and (
+        delivery_status = 'pending'
+        or (delivery_uncertain = 1 and expires_at > ?)
+        or (
+          delivery_status = 'delivered' and (
+            outcome_status = 'open'
+            or (outcome_status = 'untrackable' and expires_at > ?)
+          )
+        )
+      )
+      limit 1
+    `).get(row.symbol, row.direction, row.created_at, row.created_at);
+    if (active != null) return { kind: "blocked", reason: "active_thesis" };
+    return { kind: "inserted", id: insertTelegramAlert(row) };
+  });
+  return reserve.immediate();
+}
+
+export function markTelegramAlertDelivered(id: number, messageId: string, deliveredAt = Date.now()): boolean {
+  const db = getDb();
+  return db.transaction(() => db.prepare(`
+    update telegram_alerts set delivery_status = 'delivered', delivered_at = ?,
+      telegram_message_id = ?, delivery_error = null, delivery_uncertain = 0,
+      expires_at = ?
+    where id = ? and delivery_status = 'pending'
+  `).run(deliveredAt, messageId, deliveredAt + 48 * 60 * 60 * 1_000, id).changes === 1)();
+}
+
+export function markTelegramAlertFailed(id: number, error: string, failedAt = Date.now()): boolean {
+  const db = getDb();
+  return db.transaction(() => db.prepare(`
+    update telegram_alerts set delivery_status = 'failed', delivered_at = null, delivery_error = ?, delivery_uncertain = 0,
+      outcome_status = 'untrackable', outcome_at = ?, evaluated_through = ?,
+      outcome_note = 'Telegram delivery failed', outcome_provenance = 'delivery'
+    where id = ? and delivery_status = 'pending'
+  `).run(error.slice(0, 1000), failedAt, failedAt, id).changes === 1)();
+}
+
+export function markTelegramAlertDeliveryUnknown(id: number, error: string, observedAt = Date.now()): boolean {
+  const db = getDb();
+  return db.transaction(() => db.prepare(`
+    update telegram_alerts set delivery_status = 'failed', delivered_at = null,
+      delivery_error = ?, delivery_uncertain = 1,
+      outcome_status = 'untrackable', outcome_at = ?, evaluated_through = ?,
+      outcome_note = 'Telegram delivery acknowledgement unknown', outcome_provenance = 'delivery'
+    where id = ? and delivery_status = 'pending'
+  `).run(error.slice(0, 1000), observedAt, observedAt, id).changes === 1)();
+}
+
+export function reconcileStalePendingTelegramAlerts(cutoff: number, observedAt = Date.now()): number {
+  const db = getDb();
+  return db.transaction(() => db.prepare(`
+    update telegram_alerts set delivery_status = 'failed', delivered_at = null,
+      delivery_error = 'Process ended before Telegram acknowledgement was persisted', delivery_uncertain = 1,
+      outcome_status = 'untrackable', outcome_at = ?, evaluated_through = ?,
+      outcome_note = 'Telegram delivery acknowledgement unknown after stale pending attempt',
+      outcome_provenance = 'delivery_reconciliation'
+    where delivery_status = 'pending' and created_at <= ?
+  `).run(observedAt, observedAt, cutoff).changes)();
+}
+
+export function hasActiveTelegramThesis(
+  symbol: string,
+  direction: "long" | "short",
+  now = Date.now(),
+): boolean {
+  const row = getDb().prepare(`
+    select 1 from telegram_alerts
+    where symbol = ? and direction = ? and (
+      delivery_status = 'pending'
+      or (delivery_uncertain = 1 and expires_at > ?)
+      or (
+        delivery_status = 'delivered' and (
+          outcome_status = 'open'
+          or (outcome_status = 'untrackable' and expires_at > ?)
+        )
+      )
+    )
+    limit 1
+  `).get(symbol, direction, now, now);
+  return row != null;
+}
+
+export function listOpenTelegramAlerts(now = Date.now(), limit = 500): TelegramAlertRow[] {
+  const db = getDb();
+  return db.prepare(`
+    select * from telegram_alerts
+    where delivery_status = 'delivered' and outcome_status = 'open'
+      and created_at <= ?
+    order by created_at asc limit ?
+  `).all(now, Math.max(1, Math.min(limit, 5000))) as TelegramAlertRow[];
+}
+
+export function updateTelegramAlertOutcome(id: number, update: TelegramOutcomeUpdate): boolean {
+  const db = getDb();
+  return db.transaction(() => db.prepare(`
+    update telegram_alerts set outcome_status = @outcome_status, outcome_at = @outcome_at,
+      outcome_price = @outcome_price, pnl_r = @pnl_r, evaluated_through = @evaluated_through,
+      outcome_note = @outcome_note, outcome_provenance = @outcome_provenance
+    where id = @id and outcome_status = 'open'
+  `).run({ ...update, id }).changes === 1)();
+}
+
+export const TARGET_COUNTERFACTUAL_POLICY_VERSION = "target-1_5r-v1";
+
+export interface TargetCounterfactualRow {
+  id: number;
+  alert_id: number;
+  policy_version: string;
+  target_r: number;
+  target_price: number | null;
+  expires_at: number;
+  outcome_status: TelegramOutcomeStatus;
+  outcome_at: number | null;
+  outcome_price: number | null;
+  pnl_r: number | null;
+  evaluated_through: number | null;
+  outcome_note: string | null;
+  outcome_provenance: string | null;
+  created_at: number;
+  updated_at: number;
+}
+
+export interface OpenTargetCounterfactualRow extends TargetCounterfactualRow {
+  symbol: string;
+  direction: "long" | "short";
+  entry_price: number;
+  stop_price: number;
+  delivered_at: number;
+}
+
+export type TargetCounterfactualOutcomeUpdate = TelegramOutcomeUpdate;
+
+export function ensureTargetCounterfactuals(now = Date.now()): number {
+  const targetR = 1.5;
+  return getDb().prepare(`
+    insert into telegram_alert_counterfactuals (
+      alert_id, policy_version, target_r, target_price, expires_at,
+      outcome_status, outcome_at, outcome_price, pnl_r, evaluated_through,
+      outcome_note, outcome_provenance, created_at, updated_at
+    )
+    select
+      alert.id,
+      @policy_version,
+      @target_r,
+      case
+        when alert.delivered_at is not null
+          and alert.entry_price > 0 and alert.stop_price > 0
+          and ((alert.direction = 'long' and alert.stop_price < alert.entry_price)
+            or (alert.direction = 'short' and alert.stop_price > alert.entry_price))
+        then case alert.direction
+          when 'long' then alert.entry_price + @target_r * abs(alert.entry_price - alert.stop_price)
+          else alert.entry_price - @target_r * abs(alert.entry_price - alert.stop_price)
+        end
+        else null
+      end,
+      alert.expires_at,
+      case
+        when alert.delivered_at is not null
+          and alert.entry_price > 0 and alert.stop_price > 0
+          and ((alert.direction = 'long' and alert.stop_price < alert.entry_price)
+            or (alert.direction = 'short' and alert.stop_price > alert.entry_price))
+        then 'open'
+        else 'untrackable'
+      end,
+      case
+        when alert.delivered_at is not null
+          and alert.entry_price > 0 and alert.stop_price > 0
+          and ((alert.direction = 'long' and alert.stop_price < alert.entry_price)
+            or (alert.direction = 'short' and alert.stop_price > alert.entry_price))
+        then null else @now
+      end,
+      null,
+      null,
+      case
+        when alert.delivered_at is not null
+          and alert.entry_price > 0 and alert.stop_price > 0
+          and ((alert.direction = 'long' and alert.stop_price < alert.entry_price)
+            or (alert.direction = 'short' and alert.stop_price > alert.entry_price))
+        then null else @now
+      end,
+      case
+        when alert.delivered_at is not null
+          and alert.entry_price > 0 and alert.stop_price > 0
+          and ((alert.direction = 'long' and alert.stop_price < alert.entry_price)
+            or (alert.direction = 'short' and alert.stop_price > alert.entry_price))
+        then null
+        when alert.delivered_at is null then 'Confirmed delivery timestamp unavailable'
+        else 'Trade geometry unavailable'
+      end,
+      case
+        when alert.delivered_at is not null
+          and alert.entry_price > 0 and alert.stop_price > 0
+          and ((alert.direction = 'long' and alert.stop_price < alert.entry_price)
+            or (alert.direction = 'short' and alert.stop_price > alert.entry_price))
+        then null else 'counterfactual_seed'
+      end,
+      @now,
+      @now
+    from telegram_alerts alert
+    where alert.delivery_status = 'delivered'
+      and alert.delivery_uncertain = 0
+      and not exists (
+        select 1 from telegram_alert_counterfactuals existing
+        where existing.alert_id = alert.id and existing.policy_version = @policy_version
+      )
+  `).run({
+    policy_version: TARGET_COUNTERFACTUAL_POLICY_VERSION,
+    target_r: targetR,
+    now,
+  }).changes;
+}
+
+export function listOpenTargetCounterfactuals(now = Date.now(), limit = 500): OpenTargetCounterfactualRow[] {
+  return getDb().prepare(`
+    select counterfactual.*, alert.symbol, alert.direction, alert.entry_price,
+      alert.stop_price, alert.delivered_at
+    from telegram_alert_counterfactuals counterfactual
+    join telegram_alerts alert on alert.id = counterfactual.alert_id
+    where counterfactual.policy_version = ?
+      and counterfactual.outcome_status = 'open'
+      and alert.delivery_status = 'delivered'
+      and alert.delivery_uncertain = 0
+      and alert.delivered_at is not null
+      and alert.delivered_at <= ?
+    order by alert.delivered_at asc
+    limit ?
+  `).all(
+    TARGET_COUNTERFACTUAL_POLICY_VERSION,
+    now,
+    Math.max(1, Math.min(limit, 5_000)),
+  ) as OpenTargetCounterfactualRow[];
+}
+
+export function updateTargetCounterfactualOutcome(
+  id: number,
+  update: TargetCounterfactualOutcomeUpdate,
+): boolean {
+  return getDb().transaction(() => getDb().prepare(`
+    update telegram_alert_counterfactuals
+    set outcome_status = @outcome_status,
+      outcome_at = @outcome_at,
+      outcome_price = @outcome_price,
+      pnl_r = @pnl_r,
+      evaluated_through = @evaluated_through,
+      outcome_note = @outcome_note,
+      outcome_provenance = @outcome_provenance,
+      updated_at = @updated_at
+    where id = @id and outcome_status = 'open'
+  `).run({ ...update, id, updated_at: update.evaluated_through }).changes === 1)();
+}
+
+export function listTargetCounterfactuals(options: {
+  alert_id?: number;
+  outcome_status?: TelegramOutcomeStatus;
+  limit?: number;
+} = {}): TargetCounterfactualRow[] {
+  const clauses = ["policy_version = ?"];
+  const params: unknown[] = [TARGET_COUNTERFACTUAL_POLICY_VERSION];
+  if (options.alert_id !== undefined) { clauses.push("alert_id = ?"); params.push(options.alert_id); }
+  if (options.outcome_status) { clauses.push("outcome_status = ?"); params.push(options.outcome_status); }
+  const limit = Math.max(1, Math.min(options.limit ?? 100, 5_000));
+  return getDb().prepare(`
+    select * from telegram_alert_counterfactuals
+    where ${clauses.join(" and ")}
+    order by id desc limit ?
+  `).all(...params, limit) as TargetCounterfactualRow[];
+}
+
+export interface ListTelegramAlertsOptions {
+  symbol?: string;
+  delivery_status?: TelegramDeliveryStatus;
+  outcome_status?: TelegramOutcomeStatus;
+  from?: number;
+  to?: number;
+  limit?: number;
+}
+
+export function listTelegramAlerts(options: ListTelegramAlertsOptions = {}): TelegramAlertRow[] {
+  const clauses: string[] = [];
+  const params: unknown[] = [];
+  if (options.symbol) { clauses.push("symbol = ?"); params.push(options.symbol); }
+  if (options.delivery_status) { clauses.push("delivery_status = ?"); params.push(options.delivery_status); }
+  if (options.outcome_status) { clauses.push("outcome_status = ?"); params.push(options.outcome_status); }
+  if (options.from !== undefined) { clauses.push("created_at >= ?"); params.push(options.from); }
+  if (options.to !== undefined) { clauses.push("created_at <= ?"); params.push(options.to); }
+  const limit = Math.max(1, Math.min(options.limit ?? 100, 5000));
+  const where = clauses.length ? `where ${clauses.join(" and ")}` : "";
+  return getDb().prepare(`select * from telegram_alerts ${where} order by created_at desc limit ?`).all(...params, limit) as TelegramAlertRow[];
+}
+
+export type TelegramAlertSummary = Record<TelegramOutcomeStatus | TelegramDeliveryStatus, number> & {
+  total: number;
+  unknown_delivery: number;
+};
+
+export function summarizeTelegramAlerts(options: Omit<ListTelegramAlertsOptions, "limit" | "delivery_status" | "outcome_status"> = {}): TelegramAlertSummary {
+  const clauses: string[] = [];
+  const params: unknown[] = [];
+  if (options.symbol) { clauses.push("symbol = ?"); params.push(options.symbol); }
+  if (options.from !== undefined) { clauses.push("created_at >= ?"); params.push(options.from); }
+  if (options.to !== undefined) { clauses.push("created_at <= ?"); params.push(options.to); }
+  const where = clauses.length ? `where ${clauses.join(" and ")}` : "";
+  const rows = getDb().prepare(`
+    select delivery_status, outcome_status, delivery_uncertain, count(*) as count
+    from telegram_alerts ${where}
+    group by delivery_status, outcome_status, delivery_uncertain
+  `).all(...params) as Array<{
+    delivery_status: TelegramDeliveryStatus;
+    outcome_status: TelegramOutcomeStatus;
+    delivery_uncertain: 0 | 1;
+    count: number;
+  }>;
+  const summary = {
+    total: 0, pending: 0, delivered: 0, failed: 0, unknown_delivery: 0,
+    open: 0, target: 0, stop: 0, expired: 0, ambiguous: 0, untrackable: 0,
+  } as TelegramAlertSummary;
+  for (const row of rows) {
+    summary.total += row.count;
+    summary[row.delivery_status] += row.count;
+    if (row.delivery_uncertain) summary.unknown_delivery += row.count;
+    summary[row.outcome_status] += row.count;
+  }
+  return summary;
+}
+
+// ── market-open OI positioning briefings ────────────────────────────────
+
+export type MarketOpenOiDeliveryStatus = "shadow" | "pending" | "delivered" | "failed" | "unknown" | "expired";
+export type MarketOpenOiRegion = "asia" | "europe" | "us";
+export type MarketOpenOiUniverse = "crypto" | "equity";
+export type MarketOpenOiOutcomeHorizon = "open" | "1h" | "4h" | "24h";
+
+export interface MarketOpenOiReportRow {
+  id: number;
+  report_key: string;
+  region: MarketOpenOiRegion;
+  local_date: string;
+  report_at: number;
+  open_at: number;
+  generated_at: number;
+  lookback_ms: number;
+  calendar_covered: 0 | 1;
+  selection_config_json: string;
+  message_body: string;
+  delivery_status: MarketOpenOiDeliveryStatus;
+  delivery_attempted_at: number | null;
+  delivered_at: number | null;
+  delivery_error: string | null;
+  telegram_message_id: string | null;
+  created_at: number;
+  updated_at: number;
+}
+
+export type NewMarketOpenOiReport = Pick<MarketOpenOiReportRow,
+  | "report_key"
+  | "region"
+  | "local_date"
+  | "report_at"
+  | "open_at"
+  | "generated_at"
+  | "lookback_ms"
+  | "calendar_covered"
+  | "selection_config_json"
+  | "message_body"
+>;
+
+export interface MarketOpenOiItemRow {
+  id: number;
+  report_id: number;
+  rank: number;
+  symbol: string;
+  sector: string;
+  universe: MarketOpenOiUniverse;
+  current_ts: number;
+  prior_ts: number;
+  current_mark: number;
+  prior_mark: number;
+  current_oi_coins: number;
+  prior_oi_coins: number;
+  current_oi_usd: number;
+  prior_oi_usd: number;
+  oi_quantity_delta_usd: number;
+  oi_usd_delta: number;
+  oi_coins_change_pct: number;
+  price_change_pct: number;
+  funding_hourly: number | null;
+  funding_apr: number | null;
+  volume_24h: number;
+  quadrant: "expanding_up" | "expanding_down" | "contracting_up" | "contracting_down" | "expanding_flat" | "contracting_flat";
+  smart_flow_delta_usd: number | null;
+  smart_flow_alignment: "aligned" | "opposed" | "not_directional" | "unknown";
+}
+
+export type NewMarketOpenOiItem = Omit<MarketOpenOiItemRow, "id" | "report_id">;
+
+export type MarketOpenOiReservation =
+  | { kind: "inserted"; id: number }
+  | { kind: "duplicate"; id: number };
+
+function validateMarketOpenOiReservation(
+  report: NewMarketOpenOiReport,
+  items: NewMarketOpenOiItem[],
+): void {
+  if (!/^(asia|europe|us):\d{4}-\d{2}-\d{2}$/.test(report.report_key)) {
+    throw new Error("Market-open OI report requires a stable region:local-date key");
+  }
+  if (!report.message_body || report.message_body.length > 4_096) {
+    throw new Error("Market-open OI report requires a Telegram-safe message body");
+  }
+  if (items.length < 2) throw new Error("Market-open OI report requires at least two items");
+  const symbols = new Set<string>();
+  const ranks = new Set<string>();
+  for (const item of items) {
+    if (!item.symbol || symbols.has(item.symbol)) throw new Error("Market-open OI report item symbols must be unique");
+    symbols.add(item.symbol);
+    const rankKey = `${item.universe}:${item.rank}`;
+    if (!Number.isInteger(item.rank) || item.rank <= 0 || ranks.has(rankKey)) {
+      throw new Error("Market-open OI report ranks must be positive and unique per universe");
+    }
+    ranks.add(rankKey);
+  }
+}
+
+export function reserveMarketOpenOiReport(
+  report: NewMarketOpenOiReport,
+  items: NewMarketOpenOiItem[],
+  deliveryStatus: "pending" | "shadow" = "pending",
+): MarketOpenOiReservation {
+  validateMarketOpenOiReservation(report, items);
+  const db = getDb();
+  const reserve = db.transaction((): MarketOpenOiReservation => {
+    const existing = db.prepare(`select id from market_open_oi_reports where report_key = ?`)
+      .get(report.report_key) as { id: number } | undefined;
+    if (existing) return { kind: "duplicate", id: existing.id };
+
+    const inserted = db.prepare(`
+      insert into market_open_oi_reports (
+        report_key, region, local_date, report_at, open_at, generated_at,
+        lookback_ms, calendar_covered, selection_config_json, message_body, delivery_status,
+        delivery_attempted_at, delivered_at, delivery_error, telegram_message_id,
+        created_at, updated_at
+      ) values (
+        @report_key, @region, @local_date, @report_at, @open_at, @generated_at,
+        @lookback_ms, @calendar_covered, @selection_config_json, @message_body, @delivery_status,
+        null, null, null, null, @generated_at, @generated_at
+      )
+    `).run({ ...report, delivery_status: deliveryStatus });
+    const reportId = Number(inserted.lastInsertRowid);
+    const insertItem = db.prepare(`
+      insert into market_open_oi_items (
+        report_id, rank, symbol, sector, universe, current_ts, prior_ts,
+        current_mark, prior_mark, current_oi_coins, prior_oi_coins,
+        current_oi_usd, prior_oi_usd, oi_quantity_delta_usd, oi_usd_delta,
+        oi_coins_change_pct, price_change_pct, funding_hourly, funding_apr,
+        volume_24h, quadrant, smart_flow_delta_usd, smart_flow_alignment
+      ) values (
+        @report_id, @rank, @symbol, @sector, @universe, @current_ts, @prior_ts,
+        @current_mark, @prior_mark, @current_oi_coins, @prior_oi_coins,
+        @current_oi_usd, @prior_oi_usd, @oi_quantity_delta_usd, @oi_usd_delta,
+        @oi_coins_change_pct, @price_change_pct, @funding_hourly, @funding_apr,
+        @volume_24h, @quadrant, @smart_flow_delta_usd, @smart_flow_alignment
+      )
+    `);
+    for (const item of items) insertItem.run({ report_id: reportId, ...item });
+    return { kind: "inserted", id: reportId };
+  });
+  return reserve.immediate();
+}
+
+export function listMarketOpenOiReports(
+  options: { key?: string; limit?: number } = {},
+): MarketOpenOiReportRow[] {
+  const limit = Math.max(1, Math.min(options.limit ?? 100, 1_000));
+  if (options.key) {
+    return getDb().prepare(`
+      select * from market_open_oi_reports where report_key = ?
+      order by generated_at desc limit ?
+    `).all(options.key, limit) as MarketOpenOiReportRow[];
+  }
+  return getDb().prepare(`
+    select * from market_open_oi_reports order by generated_at desc limit ?
+  `).all(limit) as MarketOpenOiReportRow[];
+}
+
+export function listPendingMarketOpenOiReports(limit = 100): MarketOpenOiReportRow[] {
+  return getDb().prepare(`
+    select * from market_open_oi_reports
+    where delivery_status = 'pending'
+    order by generated_at asc, id asc limit ?
+  `).all(Math.max(1, Math.min(1_000, limit))) as MarketOpenOiReportRow[];
+}
+
+export function reconcileStaleAttemptedMarketOpenOiReports(
+  attemptedBefore: number,
+  observedAt = Date.now(),
+): number {
+  return getDb().prepare(`
+    update market_open_oi_reports
+    set delivery_status = 'unknown',
+      delivery_error = 'Process ended after delivery attempt; acknowledgement is unknown',
+      updated_at = @observedAt
+    where delivery_status = 'pending'
+      and delivery_attempted_at is not null
+      and delivery_attempted_at < @attemptedBefore
+  `).run({ attemptedBefore, observedAt }).changes;
+}
+
+export function listMarketOpenOiItems(reportId: number): MarketOpenOiItemRow[] {
+  return getDb().prepare(`
+    select * from market_open_oi_items where report_id = ?
+    order by case universe when 'crypto' then 0 else 1 end, rank asc
+  `).all(reportId) as MarketOpenOiItemRow[];
+}
+
+export function markMarketOpenOiDeliveryAttempted(id: number, attemptedAt = Date.now()): boolean {
+  return getDb().prepare(`
+    update market_open_oi_reports
+    set delivery_attempted_at = ?, updated_at = ?
+    where id = ? and delivery_status = 'pending' and delivery_attempted_at is null
+  `).run(attemptedAt, attemptedAt, id).changes === 1;
+}
+
+export function markMarketOpenOiDelivered(
+  id: number,
+  messageId: string,
+  deliveredAt = Date.now(),
+): boolean {
+  if (!messageId) return false;
+  return getDb().prepare(`
+    update market_open_oi_reports
+    set delivery_status = 'delivered', delivered_at = ?, delivery_error = null,
+      telegram_message_id = ?, updated_at = ?
+    where id = ? and delivery_status = 'pending' and delivery_attempted_at is not null
+  `).run(deliveredAt, messageId, deliveredAt, id).changes === 1;
+}
+
+export function markMarketOpenOiFailed(
+  id: number,
+  error: string,
+  failedAt = Date.now(),
+): boolean {
+  return getDb().prepare(`
+    update market_open_oi_reports
+    set delivery_status = 'failed', delivery_error = ?, updated_at = ?
+    where id = ? and delivery_status = 'pending' and delivery_attempted_at is not null
+  `).run(error.slice(0, 1_000), failedAt, id).changes === 1;
+}
+
+export function markMarketOpenOiUnknown(
+  id: number,
+  error: string,
+  observedAt = Date.now(),
+): boolean {
+  return getDb().prepare(`
+    update market_open_oi_reports
+    set delivery_status = 'unknown', delivery_error = ?, updated_at = ?
+    where id = ? and delivery_status = 'pending' and delivery_attempted_at is not null
+  `).run(error.slice(0, 1_000), observedAt, id).changes === 1;
+}
+
+export function markMarketOpenOiExpired(
+  id: number,
+  error: string,
+  observedAt = Date.now(),
+): boolean {
+  return getDb().prepare(`
+    update market_open_oi_reports
+    set delivery_status = 'expired', delivery_error = ?, updated_at = ?
+    where id = ? and delivery_status = 'pending' and delivery_attempted_at is null
+  `).run(error.slice(0, 1_000), observedAt, id).changes === 1;
+}
+
+export interface MarketOpenOiReportSummary {
+  total: number;
+  shadow: number;
+  pending: number;
+  delivered: number;
+  failed: number;
+  unknown: number;
+  expired: number;
+}
+
+export function summarizeMarketOpenOiReports(): MarketOpenOiReportSummary {
+  const rows = getDb().prepare(`
+    select delivery_status, count(*) as count
+    from market_open_oi_reports group by delivery_status
+  `).all() as Array<{ delivery_status: MarketOpenOiDeliveryStatus; count: number }>;
+  const summary: MarketOpenOiReportSummary = {
+    total: 0,
+    shadow: 0,
+    pending: 0,
+    delivered: 0,
+    failed: 0,
+    unknown: 0,
+    expired: 0,
+  };
+  for (const row of rows) {
+    summary.total += row.count;
+    summary[row.delivery_status] += row.count;
+  }
+  return summary;
+}
+
+export interface MarketOpenOiOutcomeRow {
+  item_id: number;
+  horizon: MarketOpenOiOutcomeHorizon;
+  target_at: number;
+  status: "observed" | "missing" | "untrackable";
+  snapshot_at: number | null;
+  mark: number | null;
+  return_pct: number | null;
+  observed_at: number;
+  note: string | null;
+}
+
+export function upsertMarketOpenOiOutcome(row: MarketOpenOiOutcomeRow): boolean {
+  return getDb().prepare(`
+    insert into market_open_oi_outcomes (
+      item_id, horizon, target_at, status, snapshot_at, mark, return_pct, observed_at, note
+    ) values (
+      @item_id, @horizon, @target_at, @status, @snapshot_at, @mark, @return_pct, @observed_at, @note
+    ) on conflict(item_id, horizon) do nothing
+  `).run(row).changes === 1;
+}
+
+export function listMarketOpenOiOutcomes(itemId: number): MarketOpenOiOutcomeRow[] {
+  return getDb().prepare(`
+    select * from market_open_oi_outcomes where item_id = ?
+    order by case horizon when 'open' then 0 when '1h' then 1 when '4h' then 2 else 3 end
+  `).all(itemId) as MarketOpenOiOutcomeRow[];
+}
+
+export interface PendingMarketOpenOiOutcomeItem {
+  itemId: number;
+  symbol: string;
+  openAt: number;
+}
+
+export function listPendingMarketOpenOiOutcomeItems(
+  now: number,
+  limit = 500,
+): PendingMarketOpenOiOutcomeItem[] {
+  const settledThrough = now - 10 * 60_000;
+  return getDb().prepare(`
+    select i.id as itemId, i.symbol, r.open_at as openAt
+    from market_open_oi_items i
+    join market_open_oi_reports r on r.id = i.report_id
+    where
+      (r.open_at <= @settledThrough and not exists (
+        select 1 from market_open_oi_outcomes o where o.item_id = i.id and o.horizon = 'open'
+      ))
+      or (r.open_at + 3600000 <= @settledThrough and not exists (
+        select 1 from market_open_oi_outcomes o where o.item_id = i.id and o.horizon = '1h'
+      ))
+      or (r.open_at + 14400000 <= @settledThrough and not exists (
+        select 1 from market_open_oi_outcomes o where o.item_id = i.id and o.horizon = '4h'
+      ))
+      or (r.open_at + 86400000 <= @settledThrough and not exists (
+        select 1 from market_open_oi_outcomes o where o.item_id = i.id and o.horizon = '24h'
+      ))
+    order by r.open_at asc, i.id asc
+    limit @limit
+  `).all({ settledThrough, limit: Math.max(1, Math.min(5_000, limit)) }) as PendingMarketOpenOiOutcomeItem[];
 }
