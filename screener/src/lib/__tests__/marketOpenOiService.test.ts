@@ -156,6 +156,13 @@ test("smart-flow deltas preserve unknown-history versus known zero-position sema
     ["ETH", -100],
     ["SOL", -50],
   ]);
+
+  const fullyClosed = computeMarketOpenOiSmartFlowDeltas(
+    new Map(),
+    new Map([["SOL", point(50)]]),
+    true,
+  );
+  assert.deepEqual([...fullyClosed.entries()], [["SOL", -50]]);
 });
 
 test("delivery reserves durably before the external send and persists acknowledgement", async () => {

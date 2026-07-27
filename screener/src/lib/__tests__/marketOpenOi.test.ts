@@ -122,6 +122,19 @@ test("selects independent top-five crypto and session-relevant equity moves by O
   assert.deepEqual(selected.equity.map((item) => item.symbol), ["SMSN"]);
 });
 
+test("quantity-effect ties use deterministic code-unit symbol ordering", () => {
+  const selected = selectMarketOpenOiItems(
+    [oiItem("a", "majors", 100, 101), oiItem("Z", "majors", 100, 101)],
+    "us",
+    {
+      crypto: { minCurrentOiUsd: 0, minVolume24h: 0, minAbsOiPct: 0, minAbsQuantityDeltaUsd: 0 },
+      equity: { minCurrentOiUsd: 0, minVolume24h: 0, minAbsOiPct: 0, minAbsQuantityDeltaUsd: 0 },
+      maxPerUniverse: 5,
+    },
+  );
+  assert.deepEqual(selected.crypto.map((item) => item.symbol), ["Z", "a"]);
+});
+
 test("materiality gates reject price-only OI USD changes and tiny illiquid bases", () => {
   const priceOnly = oiItem("BTC", "majors", 10_000, 10_020, {
     priorMark: 100,

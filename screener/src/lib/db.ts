@@ -1807,11 +1807,18 @@ export interface SmartFlowPoint {
 // demoted wallets whose rows haven't aged out, a set that only grows —
 // measured at ~600ms of blocked event loop per route call at projected
 // scale, vs ~14ms when scoped to the tracked registry.
-export function smartFlowAt(
+export interface SmartFlowSnapshot {
+  points: Map<string, SmartFlowPoint>;
+  requestedWallets: number;
+  observedWallets: number;
+  complete: boolean;
+}
+
+export function smartFlowSnapshotAt(
   targetTs: number,
   maxAgeMs: number,
   addresses?: string[],
-): Map<string, SmartFlowPoint> {
+): SmartFlowSnapshot {
   const out = new Map<string, SmartFlowPoint>();
   const walletsByCoin = new Map<string, Set<string>>();
   const db = getDb();
@@ -1827,11 +1834,13 @@ export function smartFlowAt(
   );
 
   const walletList = addresses ?? distinctWalletAddresses();
+  let observedWallets = 0;
   for (const address of walletList) {
     const latest = latestTsStmt.get(address, targetTs, targetTs - maxAgeMs) as
       | { ts: number }
       | undefined;
     if (!latest) continue; // no row for this wallet in the window
+    observedWallets += 1; // a flat-wallet heartbeat is complete evidence too
 
     const batch = rowsAtTsStmt.all(address, latest.ts) as Array<{
       coin: string;
@@ -1863,7 +1872,20 @@ export function smartFlowAt(
     if (point) point.wallets = wset.size;
   }
 
-  return out;
+  return {
+    points: out,
+    requestedWallets: walletList.length,
+    observedWallets,
+    complete: walletList.length > 0 && observedWallets === walletList.length,
+  };
+}
+
+export function smartFlowAt(
+  targetTs: number,
+  maxAgeMs: number,
+  addresses?: string[],
+): Map<string, SmartFlowPoint> {
+  return smartFlowSnapshotAt(targetTs, maxAgeMs, addresses).points;
 }
 
 // 30-day retention prune, same cadence as the other time-series tables.

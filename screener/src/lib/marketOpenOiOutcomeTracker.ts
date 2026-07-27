@@ -41,6 +41,7 @@ export interface MarketOpenOiOutcomeEvaluation {
   scanned: number;
   inserted: number;
   missing: number;
+  untrackable: number;
   errors: number;
 }
 
@@ -62,6 +63,7 @@ export function evaluateMarketOpenOiOutcomes(
     scanned: subjects.length,
     inserted: 0,
     missing: 0,
+    untrackable: 0,
     errors: 0,
   };
 
@@ -146,7 +148,8 @@ export function evaluateMarketOpenOiOutcomes(
 
         if (deps.insert(outcome)) {
           report.inserted += 1;
-          if (outcome.status !== "observed") report.missing += 1;
+          if (outcome.status === "missing") report.missing += 1;
+          else if (outcome.status === "untrackable") report.untrackable += 1;
           existing.set(definition.horizon, outcome);
         }
       }

@@ -15,7 +15,7 @@ import {
   listPendingMarketOpenOiReports,
   reconcileStaleAttemptedMarketOpenOiReports,
   reserveMarketOpenOiReport,
-  smartFlowAt,
+  smartFlowSnapshotAt,
   snapshotFullAtBounded,
   trackedWallets,
 } from "./db";
@@ -59,8 +59,12 @@ export interface MarketOpenOiBuildDeps {
 export function computeMarketOpenOiSmartFlowDeltas(
   current: Map<string, SmartFlowPoint>,
   prior: Map<string, SmartFlowPoint>,
+  historyComplete = false,
 ): Map<string, number> {
-  if (current.size === 0 || prior.size === 0) return new Map();
+  // With complete same-cohort wallet coverage, an absent symbol is a
+  // heartbeat-proven zero position, so full closes remain measurable. Without
+  // explicit coverage proof, an empty side is missing history and stays null.
+  if (!historyComplete && (current.size === 0 || prior.size === 0)) return new Map();
   const symbols = new Set([...current.keys(), ...prior.keys()]);
   const deltas = new Map<string, number>();
   for (const symbol of symbols) {
@@ -91,9 +95,10 @@ export const defaultMarketOpenOiBuildDeps: MarketOpenOiBuildDeps = {
   smartFlowDeltas: (at, lookbackMs) => {
     const cohort = trackedWallets().map((wallet) => wallet.address);
     if (cohort.length === 0) return new Map();
-    const current = smartFlowAt(at, 20 * 60_000, cohort);
-    const prior = smartFlowAt(at - lookbackMs, 20 * 60_000, cohort);
-    return computeMarketOpenOiSmartFlowDeltas(current, prior);
+    const current = smartFlowSnapshotAt(at, 20 * 60_000, cohort);
+    const prior = smartFlowSnapshotAt(at - lookbackMs, 20 * 60_000, cohort);
+    if (!current.complete || !prior.complete) return new Map();
+    return computeMarketOpenOiSmartFlowDeltas(current.points, prior.points, true);
   },
 };
 

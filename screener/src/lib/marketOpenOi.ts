@@ -145,7 +145,7 @@ export function selectMarketOpenOiItems(
 ): MarketOpenOiSelection {
   const rank = (left: MarketOpenOiItem, right: MarketOpenOiItem) =>
     Math.abs(right.oiQuantityDeltaUsd) - Math.abs(left.oiQuantityDeltaUsd)
-    || left.symbol.localeCompare(right.symbol);
+    || (left.symbol < right.symbol ? -1 : left.symbol > right.symbol ? 1 : 0);
   const limit = Math.max(0, Math.floor(config.maxPerUniverse));
   const crypto = items
     .filter((item) => item.universe === "crypto" && passesGate(item, config.crypto))

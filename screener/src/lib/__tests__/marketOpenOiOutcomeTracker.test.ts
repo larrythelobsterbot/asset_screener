@@ -28,7 +28,7 @@ test("records open and due forward marks with returns anchored to the cash open"
   assert.deepEqual(writes.map((row) => row.status), ["observed", "observed"]);
   assert.equal(writes[0].return_pct, null);
   assert.ok(Math.abs((writes[1].return_pct ?? 0) - 10) < 1e-9);
-  assert.deepEqual(result, { scanned: 1, inserted: 2, missing: 0, errors: 0 });
+  assert.deepEqual(result, { scanned: 1, inserted: 2, missing: 0, untrackable: 0, errors: 0 });
 });
 
 test("records missing open evidence and makes later returns explicitly untrackable", () => {
@@ -49,5 +49,6 @@ test("records missing open evidence and makes later returns explicitly untrackab
     { horizon: "open", status: "missing" },
     { horizon: "1h", status: "untrackable" },
   ]);
-  assert.equal(result.missing, 2);
+  assert.equal(result.missing, 1);
+  assert.equal(result.untrackable, 1);
 });

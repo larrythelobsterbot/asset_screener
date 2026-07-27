@@ -32,11 +32,40 @@
 // The pings repeat every 60s, which doubles as the keepalive that keeps
 // snapshots flowing with zero visitors.
 
+export function resolveScreenerSelfOrigin(
+  env: Record<string, string | undefined> = process.env,
+): string {
+  const raw = env.SCREENER_SELF_ORIGIN ?? "http://127.0.0.1:3003";
+  let parsed: URL;
+  try {
+    parsed = new URL(raw);
+  } catch {
+    throw new Error("SCREENER_SELF_ORIGIN must be a loopback HTTP(S) origin");
+  }
+  const hostname = parsed.hostname.toLowerCase();
+  const loopback = hostname === "127.0.0.1"
+    || hostname === "localhost"
+    || hostname === "[::1]"
+    || hostname === "::1";
+  if (
+    !loopback
+    || (parsed.protocol !== "http:" && parsed.protocol !== "https:")
+    || parsed.username !== ""
+    || parsed.password !== ""
+    || parsed.pathname !== "/"
+    || parsed.search !== ""
+    || parsed.hash !== ""
+  ) {
+    throw new Error("SCREENER_SELF_ORIGIN must be a loopback HTTP(S) origin");
+  }
+  return parsed.origin;
+}
+
 export async function register() {
   if (process.env.NEXT_RUNTIME !== "nodejs") return;
   if (process.env.NEXT_PHASE === "phase-production-build") return;
 
-  const origin = process.env.SCREENER_SELF_ORIGIN ?? "http://127.0.0.1:3003";
+  const origin = resolveScreenerSelfOrigin();
   const capabilityGlobal = globalThis as typeof globalThis & {
     __assetScreenerAlertOutcomeCapability?: string;
   };

@@ -69,7 +69,7 @@ const defaultDeps: MarketOpenOiSchedulerDeps = {
 export type MarketOpenOiSchedulerMode = "disabled" | "shadow" | "delivery";
 
 export interface MarketOpenOiTickResult {
-  status: "ok" | "shadow" | "disabled" | "blocked";
+  status: "ok" | "shadow" | "disabled" | "blocked" | "degraded";
   at: number;
   due: number;
   ready: number;
@@ -139,7 +139,7 @@ export async function runMarketOpenOiTick(
     outcomes = deps.evaluate();
   } catch (error) {
     outcomeError = `outcome evaluation: ${errorMessage(error)}`;
-    outcomes = { scanned: 0, inserted: 0, missing: 0, errors: 1 };
+    outcomes = { scanned: 0, inserted: 0, missing: 0, untrackable: 0, errors: 1 };
   }
   const base: MarketOpenOiTickResult = {
     status: "ok",
@@ -205,7 +205,12 @@ export async function runMarketOpenOiTick(
     }
   }
 
-  base.status = deliveryEnabled ? "ok" : "shadow";
+  if (deliveryEnabled && (base.failed > 0 || base.unknown > 0)) {
+    base.errors.push(
+      `delivery failed=${base.failed} unknown=${base.unknown}; unknown acknowledgements require manual reconciliation`,
+    );
+  }
+  base.status = base.errors.length > 0 ? "degraded" : deliveryEnabled ? "ok" : "shadow";
   return finishTick(base);
 }
 

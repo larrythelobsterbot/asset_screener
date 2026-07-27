@@ -11,6 +11,7 @@ import {
   trackedWallets,
   insertWalletPositions,
   smartFlowAt,
+  smartFlowSnapshotAt,
   pruneWalletPositions,
   type WalletRegistryRow,
   type WalletPositionRow,
@@ -121,6 +122,25 @@ test("smartFlowAt: heartbeat row for one wallet doesn't suppress a genuinely-ope
   assert.ok(sol);
   assert.equal(sol!.longUsd, 15000);
   assert.equal(sol!.wallets, 1);
+});
+
+test("smartFlowSnapshotAt distinguishes complete heartbeats from missing wallet history", () => {
+  const ts = Date.now() + 3_500_000;
+  insertWalletPositions([
+    { address: "0xCOVERED", ts, coin: "BTC", szi: 1, entry_px: 60_000, position_value: 60_000, unrealized_pnl: 0, leverage: 1, account_value: 100_000 },
+    { address: "0xFLAT", ts, coin: "", szi: 0, entry_px: null, position_value: null, unrealized_pnl: null, leverage: null, account_value: 50_000 },
+  ]);
+
+  const complete = smartFlowSnapshotAt(ts, 60_000, ["0xCOVERED", "0xFLAT"]);
+  assert.equal(complete.complete, true);
+  assert.equal(complete.observedWallets, 2);
+  assert.equal(complete.requestedWallets, 2);
+  assert.equal(complete.points.get("BTC")?.netUsd, 60_000);
+
+  const incomplete = smartFlowSnapshotAt(ts, 60_000, ["0xCOVERED", "0xFLAT", "0xMISSING"]);
+  assert.equal(incomplete.complete, false);
+  assert.equal(incomplete.observedWallets, 2);
+  assert.equal(incomplete.requestedWallets, 3);
 });
 
 test("smartFlowAt: rows outside the window are excluded (staleness bound)", () => {

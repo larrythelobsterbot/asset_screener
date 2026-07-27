@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 
 import { marketOpenScheduleForDate } from "../marketOpenOiCalendar";
 import {
+  getMarketOpenOiSchedulerHealth,
   isMarketOpenOiEnabled,
   isMarketOpenOiShadowEnabled,
   runMarketOpenOiTick,
@@ -10,7 +11,7 @@ import {
   type MarketOpenOiSchedulerDeps,
 } from "../marketOpenOiScheduler";
 
-const outcome = { scanned: 0, inserted: 0, missing: 0, errors: 0 };
+const outcome = { scanned: 0, inserted: 0, missing: 0, untrackable: 0, errors: 0 };
 
 function deps(overrides: Partial<MarketOpenOiSchedulerDeps> = {}): MarketOpenOiSchedulerDeps {
   return {
@@ -124,6 +125,32 @@ test("outcome evaluator failures remain visible in tick health", async () => {
   }));
   assert.equal(result.outcomes.errors, 1);
   assert.match(result.errors.join(" "), /outcome db unavailable/);
+});
+
+test("failed or unknown delivery work degrades scheduler health", async () => {
+  const schedule = marketOpenScheduleForDate("us", "2026-07-27");
+  const before = getMarketOpenOiSchedulerHealth().lastSuccessfulAt;
+  const result = await runMarketOpenOiTick(deps({
+    enabled: () => true,
+    dueSessions: () => [schedule],
+    build: () => ({
+      status: "ready",
+      report: {
+        report_key: schedule.key, region: "us", local_date: schedule.localDate,
+        report_at: schedule.reportAt, open_at: schedule.openAt, generated_at: schedule.reportAt,
+        lookback_ms: 4 * 60 * 60_000, calendar_covered: 1,
+        selection_config_json: "{}", message_body: "body",
+      },
+      items: [], selection: { crypto: [], equity: [] }, body: "body",
+    }),
+    deliver: async () => "unknown",
+  }));
+
+  assert.equal(result.status, "degraded");
+  assert.equal(result.unknown, 1);
+  assert.equal(getMarketOpenOiSchedulerHealth().lastSuccessfulAt, before);
+  assert.match(getMarketOpenOiSchedulerHealth().lastError ?? "", /unknown=1/);
+  assert.match(getMarketOpenOiSchedulerHealth().lastError ?? "", /manual reconciliation/);
 });
 
 test("tick starter coalesces overlapping requests", async () => {
