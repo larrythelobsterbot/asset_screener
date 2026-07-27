@@ -2592,6 +2592,24 @@ export function listMarketOpenOiItems(reportId: number): MarketOpenOiItemRow[] {
   `).all(reportId) as MarketOpenOiItemRow[];
 }
 
+function boundedPositiveIds(ids: number[], maximum: number): number[] {
+  const normalized = [...new Set(ids.filter((id) => Number.isInteger(id) && id > 0))];
+  if (normalized.length > maximum) throw new Error(`Too many ids requested; maximum is ${maximum}`);
+  return normalized;
+}
+
+export function listMarketOpenOiItemsForReports(reportIds: number[]): MarketOpenOiItemRow[] {
+  const ids = boundedPositiveIds(reportIds, 20);
+  if (ids.length === 0) return [];
+  const placeholders = ids.map(() => "?").join(", ");
+  return getDb().prepare(`
+    select * from market_open_oi_items
+    where report_id in (${placeholders})
+    order by report_id desc, universe asc, rank asc
+    limit 200
+  `).all(...ids) as MarketOpenOiItemRow[];
+}
+
 export function markMarketOpenOiDeliveryAttempted(id: number, attemptedAt = Date.now()): boolean {
   return getDb().prepare(`
     update market_open_oi_reports
@@ -2708,6 +2726,19 @@ export function listMarketOpenOiOutcomes(itemId: number): MarketOpenOiOutcomeRow
     select * from market_open_oi_outcomes where item_id = ?
     order by case horizon when 'open' then 0 when '1h' then 1 when '4h' then 2 else 3 end
   `).all(itemId) as MarketOpenOiOutcomeRow[];
+}
+
+export function listMarketOpenOiOutcomesForItems(itemIds: number[]): MarketOpenOiOutcomeRow[] {
+  const ids = boundedPositiveIds(itemIds, 200);
+  if (ids.length === 0) return [];
+  const placeholders = ids.map(() => "?").join(", ");
+  return getDb().prepare(`
+    select * from market_open_oi_outcomes
+    where item_id in (${placeholders})
+    order by item_id asc,
+      case horizon when 'open' then 0 when '1h' then 1 when '4h' then 2 else 3 end
+    limit 800
+  `).all(...ids) as MarketOpenOiOutcomeRow[];
 }
 
 export interface PendingMarketOpenOiOutcomeItem {

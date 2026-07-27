@@ -59,8 +59,10 @@ import {
   listOpenTargetCounterfactuals,
   updateTargetCounterfactualOutcome,
   listMarketOpenOiItems,
+  listMarketOpenOiItemsForReports,
   listMarketOpenOiReports,
   listMarketOpenOiOutcomes,
+  listMarketOpenOiOutcomesForItems,
   listPendingMarketOpenOiOutcomeItems,
   listPendingMarketOpenOiReports,
   markMarketOpenOiDeliveryAttempted,
@@ -1206,12 +1208,17 @@ test("market-open OI evidence accepts a complete unwind to zero current OI", () 
     message_body: "complete unwind",
   }, [{
     ...evidence,
+    rank: 1,
     symbol: "UNWIND",
     current_oi_coins: 0,
     current_oi_usd: 0,
     oi_quantity_delta_usd: -evidence.prior_oi_usd,
     oi_usd_delta: -evidence.prior_oi_usd,
     oi_coins_change_pct: -100,
+  }, {
+    ...evidence,
+    rank: 2,
+    symbol: "UNWIND-CONTROL",
   }], "shadow");
   assert.equal(reservation.kind, "inserted");
 });
@@ -1241,7 +1248,15 @@ test("market-open OI outcome observations are append-once per item and horizon",
     observed_at: report.open_at + 2_000,
     note: "late overwrite",
   }), false);
-  assert.equal(listMarketOpenOiOutcomes(item.id)[0].mark, 111);
+  const persistedOutcomes = listMarketOpenOiOutcomes(item.id);
+  assert.equal(persistedOutcomes.length, 1);
+  assert.equal(persistedOutcomes[0].mark, 111);
+  assert.ok(listMarketOpenOiItemsForReports([report.id]).some((row) => row.id === item.id));
+  assert.equal(listMarketOpenOiOutcomesForItems([item.id]).length, 1);
+  assert.throws(
+    () => listMarketOpenOiItemsForReports(Array.from({ length: 21 }, (_, index) => index + 1)),
+    /maximum is 20/,
+  );
   assert.deepEqual(
     listPendingMarketOpenOiOutcomeItems(report.open_at + 11 * 60_000, 10).map((row) => row.symbol),
     ["SMSN"],
