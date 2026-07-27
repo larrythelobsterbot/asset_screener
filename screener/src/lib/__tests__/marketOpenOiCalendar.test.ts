@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 
 import {
   dueMarketOpenSessions,
+  marketOpenCalendarCoverageAt,
   marketOpenScheduleForDate,
   recentMarketOpenSchedules,
 } from "../marketOpenOiCalendar";
@@ -51,6 +52,17 @@ test("future uncovered holiday years remain weekday-operable but disclose missin
   const schedule = marketOpenScheduleForDate("us", "2028-07-03");
   assert.equal(schedule.isTradingDay, true);
   assert.equal(schedule.calendarCovered, false);
+});
+
+test("calendar health exposes region-local coverage years", () => {
+  const covered = marketOpenCalendarCoverageAt(Date.parse("2026-12-31T23:30:00Z"));
+  assert.deepEqual(covered.asia, { localYear: 2027, covered: true });
+  assert.deepEqual(covered.europe, { localYear: 2026, covered: true });
+
+  const uncovered = marketOpenCalendarCoverageAt(Date.parse("2028-06-01T12:00:00Z"));
+  assert.equal(uncovered.asia.covered, false);
+  assert.equal(uncovered.europe.covered, false);
+  assert.equal(uncovered.us.covered, false);
 });
 
 test("historical windows return exactly N mature trading days per region", () => {

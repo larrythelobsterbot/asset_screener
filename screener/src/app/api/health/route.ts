@@ -18,6 +18,7 @@ import { getWalletPollerStats } from "@/lib/walletPoller";
 import { getTelegramStats } from "@/lib/telegram";
 import { getAlertOutcomeTrackerHealth } from "@/lib/alertOutcomeTracker";
 import { getMarketOpenOiSchedulerHealth } from "@/lib/marketOpenOiScheduler";
+import { marketOpenCalendarCoverageAt } from "@/lib/marketOpenOiCalendar";
 
 // Data-freshness probe for the terminal status bar. A terminal that can
 // silently serve stale data is worse than none — this makes staleness
@@ -50,6 +51,7 @@ export interface HealthResponse {
   marketOpenOi: {
     scheduler: ReturnType<typeof getMarketOpenOiSchedulerHealth>;
     ledger: ReturnType<typeof summarizeMarketOpenOiReports>;
+    calendarCoverage: ReturnType<typeof marketOpenCalendarCoverageAt>;
   };
 }
 
@@ -98,6 +100,7 @@ export async function GET() {
     marketOpenOi: {
       scheduler: marketOpenOiScheduler,
       ledger: summarizeMarketOpenOiReports(),
+      calendarCoverage: marketOpenCalendarCoverageAt(now),
     },
   };
   return NextResponse.json(body, {

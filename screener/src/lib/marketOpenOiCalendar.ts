@@ -55,6 +55,27 @@ export interface MarketOpenSchedule {
   calendarCovered: boolean;
 }
 
+export interface MarketOpenCalendarCoverage {
+  localYear: number;
+  covered: boolean;
+}
+
+function calendarYearCovered(year: number): boolean {
+  return year === 2026 || year === 2027;
+}
+
+export function marketOpenCalendarCoverageAt(
+  now: number,
+): Record<MarketOpenRegion, MarketOpenCalendarCoverage> {
+  if (!Number.isFinite(now)) throw new Error("Calendar coverage requires a finite timestamp");
+  return Object.fromEntries(
+    (Object.keys(SESSION_DEFINITIONS) as MarketOpenRegion[]).map((region) => {
+      const localYear = zonedParts(now, SESSION_DEFINITIONS[region].timeZone).year;
+      return [region, { localYear, covered: calendarYearCovered(localYear) }];
+    }),
+  ) as Record<MarketOpenRegion, MarketOpenCalendarCoverage>;
+}
+
 function parseLocalDate(localDate: string): { year: number; month: number; day: number } {
   const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(localDate);
   if (!match) throw new Error(`Invalid local market date: ${localDate}`);
@@ -138,7 +159,7 @@ export function marketOpenScheduleForDate(
   const { year, month, day } = parseLocalDate(localDate);
   const weekday = new Date(Date.UTC(year, month - 1, day)).getUTCDay();
   const weekend = weekday === 0 || weekday === 6;
-  const calendarCovered = year === 2026 || year === 2027;
+  const calendarCovered = calendarYearCovered(year);
   const holiday = calendarCovered && EXCHANGE_HOLIDAYS[region].has(localDate);
   const openAt = zonedDateTimeToEpoch(
     localDate,
