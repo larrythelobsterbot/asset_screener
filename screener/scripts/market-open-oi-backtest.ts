@@ -21,6 +21,7 @@ import {
 } from "../src/lib/marketOpenOiBacktest";
 import {
   buildMarketOpenOiPreview,
+  type MarketOpenOiSuppressionDiagnostics,
   type MarketOpenOiSourceAsset,
 } from "../src/lib/marketOpenOiService";
 
@@ -124,6 +125,13 @@ async function main() {
   const now = Date.now();
   const observations: MarketOpenOiBacktestObservation[] = [];
   const sampleBodies: Array<{ cohort: string; key: string; body: string }> = [];
+  const suppressedCohortDetails: Array<{
+    cohort: MarketOpenOiBacktestCohort;
+    key: string;
+    region: MarketOpenRegion;
+    reason: "insufficient_assets" | "insufficient_snapshots";
+    diagnostics: MarketOpenOiSuppressionDiagnostics | null;
+  }> = [];
   let evaluatedCohorts = 0;
   let suppressedCohorts = 0;
   let requestedObservations = 0;
@@ -198,6 +206,13 @@ async function main() {
       const preview = buildMarketOpenOiPreview(schedule, schedule.reportAt, selection, buildDeps);
       if (preview.status !== "ready") {
         suppressedCohorts += 1;
+        suppressedCohortDetails.push({
+          cohort,
+          key: base.key,
+          region: base.region,
+          reason: preview.reason,
+          diagnostics: preview.diagnostics ?? null,
+        });
         continue;
       }
       evaluatedCohorts += 1;
@@ -218,13 +233,20 @@ async function main() {
     generatedAt: new Date(now).toISOString(),
     requestedDays: days,
     policy: "descriptive shadow analysis; SQLite reads only; no API routes, writes, or Telegram sends",
+    cohortDefinitions: {
+      "selected-open": "top-ranked assets selected at the scheduled pre-open report time",
+      "eligible-open": "all same-session eligible assets before the top-rank cap",
+      "selected-control+2h": "independently reselected two hours later; descriptive time-shifted control, not a matched placebo",
+    },
     source: "price_snapshots and static sector/display-scale configuration",
     assets: assets.length,
     minimumGroupSize: MINIMUM_GROUP_SIZE,
     tradingSessionsByRegion,
     eligibleTradingSessions: schedules.length,
+    requestedCohorts: schedules.length * 3,
     evaluatedCohorts,
     suppressedCohorts,
+    suppressedCohortDetails,
     requestedObservations,
     missingObservations,
     observations: requestedObservations - missingObservations,

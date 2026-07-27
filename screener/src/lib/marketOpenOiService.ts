@@ -97,8 +97,24 @@ export const defaultMarketOpenOiBuildDeps: MarketOpenOiBuildDeps = {
   },
 };
 
+export interface MarketOpenOiSuppressionDiagnostics {
+  stage: "source_assets" | "snapshots" | "selection";
+  requestedAssets: number;
+  currentSnapshots: number;
+  priorSnapshots: number;
+  pairedSnapshots: number;
+  missingCurrent: number;
+  missingPrior: number;
+  derivedAssets: number;
+  selectedAssets: number;
+}
+
 export type MarketOpenOiPreview =
-  | { status: "suppressed"; reason: "insufficient_assets" | "insufficient_snapshots" }
+  | {
+      status: "suppressed";
+      reason: "insufficient_assets" | "insufficient_snapshots";
+      diagnostics?: MarketOpenOiSuppressionDiagnostics;
+    }
   | {
       status: "ready";
       report: NewMarketOpenOiReport;
@@ -143,13 +159,46 @@ export function buildMarketOpenOiPreview(
   deps: MarketOpenOiBuildDeps,
 ): MarketOpenOiPreview {
   const assets = deps.assets();
-  if (assets.length < 2) return { status: "suppressed", reason: "insufficient_assets" };
+  if (assets.length < 2) {
+    return {
+      status: "suppressed",
+      reason: "insufficient_assets",
+      diagnostics: {
+        stage: "source_assets",
+        requestedAssets: assets.length,
+        currentSnapshots: 0,
+        priorSnapshots: 0,
+        pairedSnapshots: 0,
+        missingCurrent: assets.length,
+        missingPrior: assets.length,
+        derivedAssets: 0,
+        selectedAssets: 0,
+      },
+    };
+  }
   const symbols = assets.map((asset) => asset.symbol);
   const current = deps.snapshots(generatedAt, MARKET_OPEN_OI_SNAPSHOT_TOLERANCE_MS, symbols);
   const priorAt = generatedAt - MARKET_OPEN_OI_LOOKBACK_MS;
   const prior = deps.snapshots(priorAt, MARKET_OPEN_OI_SNAPSHOT_TOLERANCE_MS, symbols);
+  const currentSnapshots = symbols.filter((symbol) => current.has(symbol)).length;
+  const priorSnapshots = symbols.filter((symbol) => prior.has(symbol)).length;
+  const pairedSnapshots = symbols.filter((symbol) => current.has(symbol) && prior.has(symbol)).length;
   if (current.size < 2 || prior.size < 2) {
-    return { status: "suppressed", reason: "insufficient_snapshots" };
+    return {
+      status: "suppressed",
+      reason: "insufficient_snapshots",
+      diagnostics: {
+        stage: "snapshots",
+        requestedAssets: assets.length,
+        currentSnapshots,
+        priorSnapshots,
+        pairedSnapshots,
+        missingCurrent: assets.length - currentSnapshots,
+        missingPrior: assets.length - priorSnapshots,
+        derivedAssets: 0,
+        selectedAssets: 0,
+      },
+    };
   }
   const flow = deps.smartFlowDeltas(generatedAt, MARKET_OPEN_OI_LOOKBACK_MS);
   const derived = assets.flatMap((asset) => {
@@ -167,6 +216,7 @@ export function buildMarketOpenOiPreview(
     return item ? [item] : [];
   });
   const selection = selectMarketOpenOiItems(derived, schedule.region, selectionConfig);
+  const selectedAssets = selection.crypto.length + selection.equity.length;
   const body = formatMarketOpenOiTelegram({
     region: schedule.region,
     sessionLabel: schedule.label,
@@ -178,7 +228,23 @@ export function buildMarketOpenOiPreview(
     calendarCovered: schedule.calendarCovered,
     selection,
   });
-  if (!body) return { status: "suppressed", reason: "insufficient_assets" };
+  if (!body) {
+    return {
+      status: "suppressed",
+      reason: "insufficient_assets",
+      diagnostics: {
+        stage: "selection",
+        requestedAssets: assets.length,
+        currentSnapshots,
+        priorSnapshots,
+        pairedSnapshots,
+        missingCurrent: assets.length - currentSnapshots,
+        missingPrior: assets.length - priorSnapshots,
+        derivedAssets: derived.length,
+        selectedAssets,
+      },
+    };
+  }
   const report: NewMarketOpenOiReport = {
     report_key: schedule.key,
     region: schedule.region,

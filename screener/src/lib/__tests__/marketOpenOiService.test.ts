@@ -67,6 +67,77 @@ test("builds a report from bounded same-row current and four-hour snapshots", ()
   assert.equal(preview.report.report_key, "us:2026-07-27");
 });
 
+test("suppressed preview discloses snapshot-stage denominators", () => {
+  const schedule = marketOpenScheduleForDate("us", "2026-07-27");
+  const priorAt = schedule.reportAt - 4 * 60 * 60_000;
+  const point = { ts: schedule.reportAt, mark: 100, oi: 100, funding: 0, volume: 10_000_000 };
+  const preview = buildMarketOpenOiPreview(schedule, schedule.reportAt, zeroGates, {
+    assets: () => [
+      { symbol: "BTC", sector: "majors", displayScale: 1 },
+      { symbol: "ETH", sector: "majors", displayScale: 1 },
+      { symbol: "SOL", sector: "majors", displayScale: 1 },
+    ],
+    snapshots: (target) => target === schedule.reportAt
+      ? new Map([
+        ["BTC", point],
+        ["ETH", point],
+      ])
+      : new Map([
+        ["BTC", { ...point, ts: priorAt }],
+        ["SOL", { ...point, ts: priorAt }],
+      ]),
+    smartFlowDeltas: () => new Map(),
+  });
+
+  assert.deepEqual(preview, {
+    status: "suppressed",
+    reason: "insufficient_snapshots",
+    diagnostics: {
+      stage: "snapshots",
+      requestedAssets: 3,
+      currentSnapshots: 2,
+      priorSnapshots: 2,
+      pairedSnapshots: 1,
+      missingCurrent: 1,
+      missingPrior: 1,
+      derivedAssets: 0,
+      selectedAssets: 0,
+    },
+  });
+});
+
+test("selection suppression distinguishes valid snapshots from derived eligibility", () => {
+  const schedule = marketOpenScheduleForDate("us", "2026-07-27");
+  const point = { ts: schedule.reportAt, mark: 100, oi: 100, funding: 0, volume: 10_000_000 };
+  const preview = buildMarketOpenOiPreview(schedule, schedule.reportAt, zeroGates, {
+    assets: () => [
+      { symbol: "BTC", sector: "majors", displayScale: 1 },
+      { symbol: "ETH", sector: "majors", displayScale: 1 },
+    ],
+    snapshots: (target) => new Map([
+      ["BTC", { ...point, ts: target, oi: target === schedule.reportAt ? 110 : 100 }],
+      ["ETH", { ...point, ts: target, oi: target === schedule.reportAt ? -1 : 100 }],
+    ]),
+    smartFlowDeltas: () => new Map(),
+  });
+
+  assert.deepEqual(preview, {
+    status: "suppressed",
+    reason: "insufficient_assets",
+    diagnostics: {
+      stage: "selection",
+      requestedAssets: 2,
+      currentSnapshots: 2,
+      priorSnapshots: 2,
+      pairedSnapshots: 2,
+      missingCurrent: 0,
+      missingPrior: 0,
+      derivedAssets: 1,
+      selectedAssets: 1,
+    },
+  });
+});
+
 test("smart-flow deltas preserve unknown-history versus known zero-position semantics", () => {
   const point = (netUsd: number) => ({
     longUsd: Math.max(netUsd, 0),
