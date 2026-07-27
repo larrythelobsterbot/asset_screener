@@ -183,7 +183,7 @@ export function buildMarketOpenOiPreview(
   const currentSnapshots = symbols.filter((symbol) => current.has(symbol)).length;
   const priorSnapshots = symbols.filter((symbol) => prior.has(symbol)).length;
   const pairedSnapshots = symbols.filter((symbol) => current.has(symbol) && prior.has(symbol)).length;
-  if (current.size < 2 || prior.size < 2) {
+  if (pairedSnapshots < 2) {
     return {
       status: "suppressed",
       reason: "insufficient_snapshots",
