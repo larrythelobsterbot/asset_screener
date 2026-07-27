@@ -51,25 +51,23 @@ function shiftedSchedule(schedule: MarketOpenSchedule, offsetMs: number): Market
   };
 }
 
-interface LatestOiSnapshot {
+interface HistoricalOiSymbol {
   symbol: string;
-  oi: number | null;
 }
 
-function latestOiSnapshots(db: Database.Database): LatestOiSnapshot[] {
+function historicalOiSymbols(db: Database.Database): HistoricalOiSymbol[] {
   return db.prepare(`
-    select p.symbol, p.oi
-    from price_snapshots p
-    join (select symbol, max(ts) as max_ts from price_snapshots group by symbol) latest
-      on p.symbol = latest.symbol and p.ts = latest.max_ts
-  `).all() as LatestOiSnapshot[];
+    select distinct symbol
+    from price_snapshots
+    where oi is not null
+    order by symbol asc
+  `).all() as HistoricalOiSymbol[];
 }
 
-function historicalSourceAssets(rows: LatestOiSnapshot[]): MarketOpenOiSourceAsset[] {
+function historicalSourceAssets(rows: HistoricalOiSymbol[]): MarketOpenOiSourceAsset[] {
   const assets: MarketOpenOiSourceAsset[] = [];
   const seen = new Set<string>();
   for (const row of rows) {
-    if (row.oi === null || !Number.isFinite(row.oi) || row.oi < 0) continue;
     if (seen.has(row.symbol)) continue;
     seen.add(row.symbol);
     const sector = sectorOf(row.symbol);
@@ -109,7 +107,7 @@ async function main() {
     }
     return rows;
   };
-  const assets = historicalSourceAssets(latestOiSnapshots(db));
+  const assets = historicalSourceAssets(historicalOiSymbols(db));
   const deps = {
     assets: () => assets,
     snapshots,
