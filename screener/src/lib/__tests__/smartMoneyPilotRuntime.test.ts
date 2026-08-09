@@ -11,6 +11,7 @@ import {
   digestArtifactIdentity,
   ensureBeforeDeadline,
   ensureNoCohortRetrievalFailures,
+  verifyContentAddressedSourceArchive,
   verifyImmutableArtifact,
   verifyImmutableArtifactHash,
   writeContentAddressedSourceArchive,
@@ -78,9 +79,19 @@ test("immutable artifacts reject stale content and source archives verify their 
     const archived = writeContentAddressedSourceArchive(directory, "vaults", sha256, raw);
     assert.match(archived, new RegExp(`${sha256}\\.json\\.gz$`));
     assert.equal(writeContentAddressedSourceArchive(directory, "vaults", sha256, raw), archived);
+    assert.doesNotThrow(() => verifyContentAddressedSourceArchive(
+      archived,
+      sha256,
+      Buffer.byteLength(raw),
+    ));
     assert.throws(
       () => writeContentAddressedSourceArchive(directory, "vaults", "0".repeat(64), raw),
       /hash mismatch/,
+    );
+    writeFileSync(archived, "corrupted");
+    assert.throws(
+      () => verifyContentAddressedSourceArchive(archived, sha256, Buffer.byteLength(raw)),
+      /archive/i,
     );
   } finally {
     rmSync(directory, { recursive: true, force: true });

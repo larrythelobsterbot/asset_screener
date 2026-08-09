@@ -152,6 +152,29 @@ export function writeImmutableArtifact(path: string, content: string | Buffer): 
   }
 }
 
+export function verifyContentAddressedSourceArchive(
+  path: string,
+  expectedSha256: string,
+  expectedBytes: number,
+): void {
+  if (!path.endsWith(`/${expectedSha256}.json.gz`)) {
+    throw new Error(`source archive path identity mismatch at ${path}`);
+  }
+  if (!existsSync(path)) throw new Error(`source archive missing at ${path}`);
+  try {
+    const raw = gunzipSync(readFileSync(path));
+    if (raw.byteLength !== expectedBytes) {
+      throw new Error(`byte length ${raw.byteLength} != ${expectedBytes}`);
+    }
+    const actualSha256 = createHash("sha256").update(raw).digest("hex");
+    if (actualSha256 !== expectedSha256) {
+      throw new Error(`hash ${actualSha256} != ${expectedSha256}`);
+    }
+  } catch (error) {
+    throw new Error(`source archive verification failed at ${path}: ${String(error)}`);
+  }
+}
+
 export function writeContentAddressedSourceArchive(
   root: string,
   source: string,
@@ -162,14 +185,11 @@ export function writeContentAddressedSourceArchive(
   if (actualHash !== sha256) throw new Error(`${source} source hash mismatch: ${sha256} != ${actualHash}`);
   const path = join(root, "sources", source, `${sha256}.json.gz`);
   if (existsSync(path)) {
-    const archived = gunzipSync(readFileSync(path));
-    const archivedHash = createHash("sha256").update(archived).digest("hex");
-    if (archivedHash !== sha256) throw new Error(`archived ${source} source hash mismatch at ${path}`);
+    verifyContentAddressedSourceArchive(path, sha256, Buffer.byteLength(rawText));
     return path;
   }
   writeImmutableArtifact(path, gzipSync(rawText, { level: 9 }));
-  const archivedHash = createHash("sha256").update(gunzipSync(readFileSync(path))).digest("hex");
-  if (archivedHash !== sha256) throw new Error(`archived ${source} source verification failed at ${path}`);
+  verifyContentAddressedSourceArchive(path, sha256, Buffer.byteLength(rawText));
   return path;
 }
 

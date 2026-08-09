@@ -553,7 +553,7 @@ test("telegram alert ledger persists lifecycle, outcomes, reads, and indexed mig
   assert.equal(summarizeTelegramAlerts({ symbol: "LEDGERSYM" }).target, 1);
   const indexes = getDb().prepare(`select name from sqlite_master where type = 'index'`).all() as Array<{ name: string }>;
   const names = new Set(indexes.map((row) => row.name));
-  assert.equal(getDb().pragma("user_version", { simple: true }), 24);
+  assert.equal(getDb().pragma("user_version", { simple: true }), 25);
   assert.ok(names.has("idx_telegram_alerts_delivery"));
   assert.ok(names.has("idx_telegram_alerts_outcome"));
   assert.ok(names.has("idx_telegram_alerts_symbol_created"));

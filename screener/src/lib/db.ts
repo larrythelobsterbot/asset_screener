@@ -34,7 +34,7 @@ export function getDb(): Database.Database {
 // Versioned via PRAGMA user_version so we can add schema changes without
 // blowing away the local file. Bump VERSION and add a step.
 
-const VERSION = 24;
+const VERSION = 25;
 
 function migrate(db: Database.Database): void {
   const current = db.pragma("user_version", { simple: true }) as number;
@@ -69,6 +69,7 @@ function migrate(db: Database.Database): void {
     if (current < 22) db.exec(MIGRATION_V22);
     if (current < 23) db.exec(MIGRATION_V23);
     if (current < 24) db.exec(MIGRATION_V24);
+    if (current < 25) db.exec(MIGRATION_V25);
     db.pragma(`user_version = ${VERSION}`);
   })();
 }
@@ -797,6 +798,88 @@ const MIGRATION_V24 = `
       review_status      text not null default 'draft'
         check (review_status in ('draft', 'approved', 'rejected', 'expired'))
     );
+  `;
+
+// V25 — separately paced, shadow-only Hyperliquid userFunding evidence.
+// Funding completeness is independent from wallet/vault collection, and the
+// durable payment identity does not rely on Hyperliquid's sometimes-zero hash.
+const MIGRATION_V25 = `
+    create table if not exists smart_money_funding_runs (
+      id                    integer primary key autoincrement,
+      run_key               text not null unique,
+      collection_run_id     integer not null references smart_money_collection_runs(id),
+      policy_version        text not null,
+      attempt_no            integer not null check (attempt_no >= 1),
+      start_at              integer not null,
+      end_at                integer not null,
+      started_at            integer not null,
+      completed_at          integer,
+      status                text not null check (status in ('running', 'complete', 'partial', 'failed', 'invalid')),
+      wallet_expected       integer not null check (wallet_expected >= 0),
+      wallet_succeeded      integer not null default 0 check (wallet_succeeded >= 0),
+      window_count          integer not null default 0 check (window_count >= 0),
+      payment_count         integer not null default 0 check (payment_count >= 0),
+      source_manifest_json  text not null check (json_valid(source_manifest_json)),
+      error                 text,
+      created_at            integer not null,
+      updated_at            integer not null,
+      unique (collection_run_id, policy_version, attempt_no),
+      check (end_at >= start_at),
+      check (wallet_succeeded <= wallet_expected),
+      check ((status = 'running' and completed_at is null)
+        or (status != 'running' and completed_at is not null)),
+      check ((status = 'complete' and wallet_succeeded = wallet_expected and error is null)
+        or status != 'complete')
+    );
+    create index if not exists idx_smart_money_funding_runs_status
+      on smart_money_funding_runs(status, end_at desc);
+
+    create table if not exists smart_money_funding_windows (
+      funding_run_id        integer not null references smart_money_funding_runs(id) on delete cascade,
+      address               text not null,
+      start_at              integer not null,
+      end_at                integer not null,
+      status                text not null check (status in ('complete', 'saturated')),
+      response_count        integer not null check (response_count >= 0 and response_count <= 500),
+      source_sha256         text not null check (length(source_sha256) = 64),
+      source_bytes          integer not null check (source_bytes >= 2),
+      source_archive_path   text not null check (length(source_archive_path) > 0),
+      primary key (funding_run_id, address, start_at, end_at),
+      check (end_at >= start_at)
+    );
+    create index if not exists idx_smart_money_funding_windows_address
+      on smart_money_funding_windows(address, end_at desc);
+
+    create table if not exists smart_money_funding_payments (
+      address               text not null,
+      settlement_at         integer not null,
+      coin                  text not null check (length(coin) between 1 and 128),
+      usdc                  real not null,
+      szi                   real not null,
+      funding_rate          real not null,
+      n_samples             integer check (n_samples is null or n_samples >= 0),
+      source_hash           text not null check (length(source_hash) = 66),
+      first_funding_run_id  integer not null references smart_money_funding_runs(id),
+      source_url            text not null,
+      created_at            integer not null,
+      primary key (address, settlement_at, coin)
+    );
+    create index if not exists idx_smart_money_funding_payments_time
+      on smart_money_funding_payments(settlement_at desc);
+    create index if not exists idx_smart_money_funding_payments_coin
+      on smart_money_funding_payments(coin, settlement_at desc);
+
+    create table if not exists smart_money_funding_run_payments (
+      funding_run_id        integer not null references smart_money_funding_runs(id) on delete cascade,
+      address               text not null,
+      settlement_at         integer not null,
+      coin                  text not null,
+      primary key (funding_run_id, address, settlement_at, coin),
+      foreign key (address, settlement_at, coin)
+        references smart_money_funding_payments(address, settlement_at, coin)
+    );
+    create index if not exists idx_smart_money_funding_run_payments_identity
+      on smart_money_funding_run_payments(address, settlement_at, coin, funding_run_id);
   `;
 
 const MIGRATION_V11 = `
