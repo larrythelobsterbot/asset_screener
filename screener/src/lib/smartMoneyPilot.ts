@@ -628,6 +628,16 @@ export interface DailySmartMoneyDigest {
   chartSvg: string;
 }
 
+export interface CohortTransitionContext {
+  currentVersionKey: string;
+  previousVersionKey: string | null;
+  currentMembers: number;
+  previousMembers: number;
+  entries: number;
+  stays: number;
+  exits: number;
+}
+
 function escapeXml(value: string): string {
   return value
     .replaceAll("&", "&amp;")
@@ -692,6 +702,7 @@ export function formatDailySmartMoneyDigest(input: {
   currentWallets: WalletPositionSnapshot[];
   events: SmartMoneyEventCandidate[];
   funding: FundingContext[];
+  cohortContext?: CohortTransitionContext;
   policy?: SmartMoneyEventPolicy;
 }): DailySmartMoneyDigest {
   const policy = input.policy ?? PILOT_EVENT_POLICY_V3;
@@ -715,6 +726,61 @@ export function formatDailySmartMoneyDigest(input: {
       return `- **${symbol}:** ${(rateHourly * 100).toFixed(4)}% hourly (${annualized.toFixed(1)}% simple annualized). [Source](${sourceUrl})`;
     })
     : ["- Funding context unavailable; no value inferred."];
+  const interpretationGuards: string[] = [];
+  if (input.cohortContext) {
+    const cohort = input.cohortContext;
+    if ([
+      cohort.currentMembers,
+      cohort.previousMembers,
+      cohort.entries,
+      cohort.stays,
+      cohort.exits,
+    ].some((value) => !Number.isInteger(value) || value < 0)) {
+      throw new Error("cohort transition counts must be non-negative integers");
+    }
+    if (cohort.entries + cohort.stays !== cohort.currentMembers
+      || cohort.exits + cohort.stays !== cohort.previousMembers) {
+      throw new Error("cohort transition counts are inconsistent");
+    }
+    if (cohort.entries > 0 || cohort.exits > 0) {
+      const carryover = cohort.currentMembers > 0
+        ? (cohort.stays / cohort.currentMembers) * 100
+        : 0;
+      interpretationGuards.push(
+        `- **Cohort turnover:** ${cohort.entries} entries, ${cohort.stays} retained, and ${cohort.exits} exits; ${carryover.toFixed(1)}% of current members carried over. Current positioning is not directly comparable with the previous cohort.`,
+      );
+    }
+    const eventCohorts = [...new Set(input.events
+      .map((event) => event.evidence.cohortVersionKey)
+      .filter((value): value is string => typeof value === "string" && value !== cohort.currentVersionKey))]
+      .sort();
+    if (eventCohorts.length > 0) {
+      interpretationGuards.push(
+        `- **Cohort boundary:** ${input.events.filter((event) => eventCohorts.includes(String(event.evidence.cohortVersionKey))).length} evidence event(s) use a different cohort (${eventCohorts.join(", ")}) from current positioning (${cohort.currentVersionKey}); do not attribute those changes to the current cohort.`,
+      );
+    }
+  }
+  for (const symbol of policy.majorAssets) {
+    const byWallet = input.currentWallets.map((wallet) => ({
+      address: wallet.address,
+      grossUsd: wallet.positions
+        .filter((position) => position.coin === symbol)
+        .reduce((sum, position) => sum + Math.abs(position.positionValue), 0),
+    })).filter(({ grossUsd }) => grossUsd > 0)
+      .sort((a, b) => b.grossUsd - a.grossUsd || a.address.localeCompare(b.address));
+    const grossUsd = byWallet.reduce((sum, wallet) => sum + wallet.grossUsd, 0);
+    if (grossUsd <= 0) continue;
+    const topOneShare = byWallet[0].grossUsd / grossUsd;
+    const topTwoShare = (byWallet[0].grossUsd + (byWallet[1]?.grossUsd ?? 0)) / grossUsd;
+    if (topOneShare >= 0.5 || topTwoShare >= 0.75) {
+      interpretationGuards.push(
+        `- **${symbol} concentration:** the largest wallet is ${(topOneShare * 100).toFixed(1)}% of gross exposure and the top two are ${(topTwoShare * 100).toFixed(1)}%; aggregate net exposure is not broad cohort consensus.`,
+      );
+    }
+  }
+  const interpretationSection = interpretationGuards.length > 0
+    ? ["", "## Interpretation guards", ...interpretationGuards]
+    : [];
 
   const markdown = [
     `# Smart Money Daily — ${input.dateUtc}`,
@@ -723,6 +789,7 @@ export function formatDailySmartMoneyDigest(input: {
     "",
     "## Cohort positioning",
     ...positioningLines,
+    ...interpretationSection,
     "",
     "## Cohort verification",
     ...cohortVerificationLines,

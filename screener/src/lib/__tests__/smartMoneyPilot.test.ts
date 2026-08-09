@@ -579,6 +579,95 @@ test("daily digest includes positioning, evidence, funding context, and one SVG 
   assert.equal((digest.chartSvg.match(/data-symbol=/g) ?? []).length, 4);
 });
 
+test("daily digest discloses cohort turnover, mixed-cohort events, and concentrated exposure", () => {
+  const observedAt = Date.UTC(2026, 7, 8, 20);
+  const wallets = [
+    positionSnapshot("0x1111111111111111111111111111111111111111", observedAt, "BTC", 8_000_000),
+    positionSnapshot("0x2222222222222222222222222222222222222222", observedAt, "BTC", 1_000_000),
+    positionSnapshot("0x3333333333333333333333333333333333333333", observedAt, "BTC", -500_000),
+    positionSnapshot("0x4444444444444444444444444444444444444444", observedAt, "ETH", 500_000),
+  ];
+  const priorCohortEvent: SmartMoneyEventCandidate = {
+    fingerprint: "prior-cohort-event",
+    type: "unusual_position_change",
+    observedAt,
+    symbol: "BTC",
+    address: wallets[0].address,
+    vaultAddress: null,
+    verificationUrls: [],
+    evidence: {
+      cohortVersionKey: "cohort-v2",
+      detectorVersionKey: PILOT_EVENT_POLICY_V1.version,
+      tradeChangeKind: "open_long",
+      inferenceConfidence: "medium",
+      reasonCodes: ["snapshot_net_size_change", "flat_to_long_size"],
+      previousSzi: 0,
+      currentSzi: 8,
+      deltaSzi: 8,
+      referenceMarkPrice: 1_000_000,
+      deltaUsd: 8_000_000,
+    },
+  };
+
+  const digest = formatDailySmartMoneyDigest({
+    dateUtc: "2026-08-08",
+    generatedAt: observedAt,
+    currentWallets: wallets,
+    events: [priorCohortEvent],
+    funding: [],
+    cohortContext: {
+      currentVersionKey: "cohort-v3",
+      previousVersionKey: "cohort-v2",
+      currentMembers: 4,
+      previousMembers: 6,
+      entries: 3,
+      stays: 1,
+      exits: 5,
+    },
+    policy: PILOT_EVENT_POLICY_V1,
+  });
+
+  assert.match(digest.markdown, /## Interpretation guards/);
+  assert.match(digest.markdown, /3 entries, 1 retained, and 5 exits/i);
+  assert.match(digest.markdown, /25\.0% of current members carried over/i);
+  assert.match(digest.markdown, /not directly comparable/i);
+  assert.match(digest.markdown, /cohort-v2/);
+  assert.match(digest.markdown, /cohort-v3/);
+  assert.match(digest.markdown, /BTC[^\n]*84\.2%[^\n]*94\.7%/i);
+  assert.match(digest.markdown, /not broad cohort consensus/i);
+});
+
+test("daily digest omits interpretation warnings for a stable diversified cohort", () => {
+  const observedAt = Date.UTC(2026, 7, 8, 20);
+  const wallets = [1, 2, 3, 4].map((index) => positionSnapshot(
+    `0x${String(index).repeat(40)}`,
+    observedAt,
+    "BTC",
+    index % 2 === 0 ? -1_000_000 : 1_000_000,
+  ));
+  const digest = formatDailySmartMoneyDigest({
+    dateUtc: "2026-08-08",
+    generatedAt: observedAt,
+    currentWallets: wallets,
+    events: [],
+    funding: [],
+    cohortContext: {
+      currentVersionKey: "cohort-v3",
+      previousVersionKey: "cohort-v2",
+      currentMembers: 4,
+      previousMembers: 4,
+      entries: 0,
+      stays: 4,
+      exits: 0,
+    },
+    policy: PILOT_EVENT_POLICY_V1,
+  });
+
+  assert.doesNotMatch(digest.markdown, /not directly comparable/i);
+  assert.doesNotMatch(digest.markdown, /not broad cohort consensus/i);
+  assert.doesNotMatch(digest.markdown, /evidence event.*different cohort/i);
+});
+
 test("daily digest does not relabel historical V2 coordinated exposure events as size changes", () => {
   const observedAt = Date.UTC(2026, 6, 31, 20);
   const legacyEvent: SmartMoneyEventCandidate = {

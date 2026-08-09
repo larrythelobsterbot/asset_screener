@@ -42,11 +42,20 @@ import {
   digestArtifactIdentity,
   ensureBeforeDeadline,
   ensureNoCohortRetrievalFailures,
+  verifyContentAddressedSourceArchive,
   verifyImmutableArtifact,
   verifyImmutableArtifactHash,
   writeContentAddressedSourceArchive,
   writeImmutableArtifact,
 } from "../src/lib/smartMoneyPilotRuntime";
+import {
+  FUNDING_POLICY_V1,
+  fetchUserFundingSource,
+} from "../src/lib/smartMoneyFunding";
+import {
+  collectCohortFundingEvidence,
+  runFundingStageIsolated,
+} from "../src/lib/smartMoneyFundingRuntime";
 
 const SCRIPT_DIR = dirname(fileURLToPath(import.meta.url));
 const ROOT_DIR = join(SCRIPT_DIR, "..");
@@ -482,6 +491,34 @@ async function collect(now = Date.now()): Promise<number | null> {
   return run.id;
 }
 
+async function collectFundingForRun(collectionRunId: number): Promise<void> {
+  const run = store.collectionRun(collectionRunId);
+  if (!run || run.status !== "complete") {
+    log(`funding skipped for collection ${collectionRunId}: core evidence is not complete`);
+    return;
+  }
+  const addresses = store.activeAddressesForCohort(run.cohortVersionId);
+  if (addresses.length !== run.walletExpected) {
+    throw new Error(`funding cohort membership is incomplete for collection ${collectionRunId}`);
+  }
+  const result = await collectCohortFundingEvidence({
+    collectionRunId,
+    scheduledFor: run.scheduledFor,
+    addresses,
+    parentCollection: run,
+    store,
+    fetchWindow: fetchUserFundingSource,
+    archiveSource: (source) => writeContentAddressedSourceArchive(
+      SOURCE_ARCHIVE_ROOT,
+      "funding",
+      source.sha256,
+      source.rawText,
+    ),
+    verifyArchive: verifyContentAddressedSourceArchive,
+  });
+  log(`funding run ${result.id} ${result.status}: ${result.walletSucceeded}/${result.walletExpected} wallets, ${result.requestCount} requests, ${result.windowCount} windows, ${result.paymentCount} normalized payments (${FUNDING_POLICY_V1.version})`);
+}
+
 function dailyFundingContext(startAt: number, endAt: number): FundingContext[] {
   const db = getDb();
   const statement = db.prepare(`
@@ -530,12 +567,14 @@ function generateDailyDigest(
   const wallets = store.loadWalletSnapshots(run.id);
   const events = store.listEvents(startAt, endAt);
   const funding = dailyFundingContext(startAt, Math.min(endAt, now));
+  const cohortContext = store.cohortTransitionContext(run.cohortVersionId);
   const digest = formatDailySmartMoneyDigest({
     dateUtc: periodDate,
     generatedAt: now,
     currentWallets: wallets,
     events,
     funding,
+    cohortContext,
     policy: PILOT_EVENT_POLICY_V3,
   });
   const markdown = kind === "baseline"
@@ -560,6 +599,7 @@ function generateDailyDigest(
         markdownSha256: contentSha256(markdown),
         chartSha256: contentSha256(digest.chartSvg),
         eventFingerprints: events.map(({ fingerprint }) => fingerprint),
+        cohortContext,
         fundingWindow: { startAt, endAt: Math.min(endAt, now) },
       },
     });
@@ -680,7 +720,13 @@ async function runScheduled(now = Date.now(), bootstrapDigest = false): Promise<
   if (!cohort
     || cohort.policyVersion !== PILOT_COHORT_POLICY_V1.version
     || now - cohort.computedAt >= 7 * DAY_MS) await recomputeCohort(now);
-  await collect(now);
+  const collectionRunId = await collect(now);
+  if (collectionRunId !== null) {
+    await runFundingStageIsolated(
+      () => collectFundingForRun(collectionRunId),
+      (message) => log(`funding stage failed after core run ${collectionRunId}; continuing: ${message}`),
+    );
+  }
   processOutcomes(now);
   const previousDate = dateKey(utcDayStart(now) - DAY_MS);
   generateDailyDigest(previousDate, now);
@@ -705,6 +751,11 @@ async function main(): Promise<void> {
     else if (command === "collect") await collect();
     else if (command === "digest") generateDailyDigest(arg ?? dateKey(utcDayStart(Date.now()) - DAY_MS));
     else if (command === "outcomes") processOutcomes();
+    else if (command === "funding") {
+      const latest = store.latestCompleteCollectionRunAtOrBefore(Date.now());
+      if (!latest) throw new Error("no complete smart-money collection for funding");
+      await collectFundingForRun(latest.id);
+    }
     else if (command === "weekly") generateWeeklyReport(arg ?? dateKey(utcWeekStart(Date.now()) - 7 * DAY_MS));
     else if (command === "funding-probe") {
       const funding = await fetchFundingContext(MAJOR_ASSETS);
