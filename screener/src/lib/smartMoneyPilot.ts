@@ -85,8 +85,8 @@ export interface SmartMoneyEventPolicy {
 
 // Shadow-only pilot thresholds. They create review drafts and are deliberately
 // not wired to Telegram delivery. Promote or tune only after the seven-day audit.
-export const PILOT_EVENT_POLICY_V1: SmartMoneyEventPolicy = Object.freeze({
-  version: "smart-money-pilot-events-v2-shadow",
+export const PILOT_EVENT_POLICY_V3: SmartMoneyEventPolicy = Object.freeze({
+  version: "smart-money-trade-change-v3-shadow",
   majorAssets: Object.freeze(["BTC", "ETH", "SOL", "HYPE"]),
   aggregateFlipMinEndpointUsd: 1_000_000,
   aggregateFlipMinDeltaUsd: 2_000_000,
@@ -106,16 +106,64 @@ export type SmartMoneyEventType =
   | "coordinated_position_change"
   | "vault_flow_anomaly";
 
+export type SmartMoneyTradeChangeKind =
+  | "open_long"
+  | "open_short"
+  | "close_long"
+  | "close_short"
+  | "add_long"
+  | "add_short"
+  | "reduce_long"
+  | "reduce_short"
+  | "flip_long_to_short"
+  | "flip_short_to_long";
+
+export type SmartMoneyTradeChangeReasonCode =
+  | "snapshot_net_size_change"
+  | "flat_to_long_size"
+  | "flat_to_short_size"
+  | "long_to_flat_size"
+  | "short_to_flat_size"
+  | "long_size_increased"
+  | "long_size_decreased"
+  | "short_size_increased"
+  | "short_size_decreased"
+  | "long_to_short_size"
+  | "short_to_long_size";
+
+export interface SmartMoneyWalletTradeChangeEvidence {
+  address: string;
+  tradeChangeKind: SmartMoneyTradeChangeKind;
+  inferenceConfidence: "medium";
+  reasonCodes: readonly SmartMoneyTradeChangeReasonCode[];
+  previousSzi: number;
+  currentSzi: number;
+  deltaSzi: number;
+  referenceMarkPrice: number;
+  previousPositionUsd: number;
+  currentPositionUsd: number;
+  deltaUsd: number;
+}
+
 export interface SmartMoneyEventEvidence {
   cohortVersionKey: string;
+  detectorVersionKey?: string;
   previousNetUsd?: number;
   currentNetUsd?: number;
   deltaUsd?: number;
   previousPositionUsd?: number;
   currentPositionUsd?: number;
+  previousSzi?: number;
+  currentSzi?: number;
+  deltaSzi?: number;
+  referenceMarkPrice?: number;
+  tradeChangeKind?: SmartMoneyTradeChangeKind;
+  inferenceConfidence?: "medium";
+  reasonCodes?: readonly SmartMoneyTradeChangeReasonCode[];
   accountValueUsd?: number;
   walletCount?: number;
   wallets?: string[];
+  tradeChanges?: SmartMoneyWalletTradeChangeEvidence[];
   previousTvlUsd?: number;
   currentTvlUsd?: number;
   pnlChangeUsd?: number;
@@ -178,19 +226,65 @@ function netPositionByCoin(snapshots: WalletPositionSnapshot[]): Map<string, num
 interface WalletPositionChange {
   address: string;
   symbol: string;
+  tradeChangeKind: SmartMoneyTradeChangeKind;
+  inferenceConfidence: "medium";
+  reasonCodes: readonly SmartMoneyTradeChangeReasonCode[];
+  previousSzi: number;
+  currentSzi: number;
+  deltaSzi: number;
+  referenceMarkPrice: number;
   previousPositionUsd: number;
   currentPositionUsd: number;
   deltaUsd: number;
   accountValueUsd: number;
 }
 
-function positionMap(snapshot: WalletPositionSnapshot): Map<string, number> {
-  const result = new Map<string, number>();
+interface WalletPositionState {
+  szi: number;
+  signedPositionUsd: number;
+}
+
+function positionMap(snapshot: WalletPositionSnapshot): Map<string, WalletPositionState> {
+  const result = new Map<string, WalletPositionState>();
   for (const position of snapshot.positions) {
     const coin = position.coin.includes(":") ? position.coin : position.coin.toUpperCase();
-    result.set(coin, (result.get(coin) ?? 0) + signedPositionValue(position));
+    const existing = result.get(coin) ?? { szi: 0, signedPositionUsd: 0 };
+    result.set(coin, {
+      szi: existing.szi + position.szi,
+      signedPositionUsd: existing.signedPositionUsd + signedPositionValue(position),
+    });
   }
   return result;
+}
+
+function impliedMarkPrice(state: WalletPositionState | undefined): number | null {
+  if (!state || state.szi === 0) return null;
+  const markPrice = Math.abs(state.signedPositionUsd / state.szi);
+  return Number.isFinite(markPrice) && markPrice > 0 ? markPrice : null;
+}
+
+function classifyTradeChange(
+  previousSzi: number,
+  currentSzi: number,
+): { kind: SmartMoneyTradeChangeKind; reasonCode: SmartMoneyTradeChangeReasonCode } {
+  if (previousSzi === 0) return currentSzi > 0
+    ? { kind: "open_long", reasonCode: "flat_to_long_size" }
+    : { kind: "open_short", reasonCode: "flat_to_short_size" };
+  if (currentSzi === 0) return previousSzi > 0
+    ? { kind: "close_long", reasonCode: "long_to_flat_size" }
+    : { kind: "close_short", reasonCode: "short_to_flat_size" };
+  if (previousSzi > 0 && currentSzi < 0) {
+    return { kind: "flip_long_to_short", reasonCode: "long_to_short_size" };
+  }
+  if (previousSzi < 0 && currentSzi > 0) {
+    return { kind: "flip_short_to_long", reasonCode: "short_to_long_size" };
+  }
+  if (previousSzi > 0) return currentSzi > previousSzi
+    ? { kind: "add_long", reasonCode: "long_size_increased" }
+    : { kind: "reduce_long", reasonCode: "long_size_decreased" };
+  return currentSzi < previousSzi
+    ? { kind: "add_short", reasonCode: "short_size_increased" }
+    : { kind: "reduce_short", reasonCode: "short_size_decreased" };
 }
 
 function deriveWalletPositionChanges(
@@ -208,13 +302,30 @@ function deriveWalletPositionChanges(
     const currentPositions = positionMap(currentSnapshot);
     const symbols = new Set([...previousPositions.keys(), ...currentPositions.keys()]);
     for (const symbol of symbols) {
-      const previousPositionUsd = previousPositions.get(symbol) ?? 0;
-      const currentPositionUsd = currentPositions.get(symbol) ?? 0;
-      const deltaUsd = currentPositionUsd - previousPositionUsd;
-      if (deltaUsd === 0) continue;
+      const previousPosition = previousPositions.get(symbol);
+      const currentPosition = currentPositions.get(symbol);
+      const previousSzi = previousPosition?.szi ?? 0;
+      const currentSzi = currentPosition?.szi ?? 0;
+      const deltaSzi = currentSzi - previousSzi;
+      if (deltaSzi === 0) continue;
+      const referenceMarkPrice = currentSzi === 0
+        ? impliedMarkPrice(previousPosition)
+        : impliedMarkPrice(currentPosition);
+      if (referenceMarkPrice === null) continue;
+      const previousPositionUsd = previousSzi * referenceMarkPrice;
+      const currentPositionUsd = currentSzi * referenceMarkPrice;
+      const deltaUsd = deltaSzi * referenceMarkPrice;
+      const inference = classifyTradeChange(previousSzi, currentSzi);
       changes.push({
         address,
         symbol,
+        tradeChangeKind: inference.kind,
+        inferenceConfidence: "medium",
+        reasonCodes: ["snapshot_net_size_change", inference.reasonCode],
+        previousSzi,
+        currentSzi,
+        deltaSzi,
+        referenceMarkPrice,
         previousPositionUsd,
         currentPositionUsd,
         deltaUsd,
@@ -238,7 +349,7 @@ export function detectSmartMoneyEvents(input: {
   currentVaults: VaultSnapshot[];
   policy?: SmartMoneyEventPolicy;
 }): SmartMoneyEventCandidate[] {
-  const policy = input.policy ?? PILOT_EVENT_POLICY_V1;
+  const policy = input.policy ?? PILOT_EVENT_POLICY_V3;
   if (input.cohortVersionKey.trim().length === 0) throw new Error("cohortVersionKey is required");
   const events: SmartMoneyEventCandidate[] = [];
   const bucket = Math.floor(input.observedAt / (4 * 3_600_000));
@@ -275,6 +386,7 @@ export function detectSmartMoneyEvents(input: {
           verificationUrls: cohortVerificationUrls,
           evidence: {
             cohortVersionKey: input.cohortVersionKey,
+            detectorVersionKey: policy.version,
             previousNetUsd,
             currentNetUsd,
             deltaUsd,
@@ -301,6 +413,14 @@ export function detectSmartMoneyEvents(input: {
         verificationUrls: [walletVerificationUrl(change.address)],
         evidence: {
           cohortVersionKey: input.cohortVersionKey,
+          detectorVersionKey: policy.version,
+          tradeChangeKind: change.tradeChangeKind,
+          inferenceConfidence: change.inferenceConfidence,
+          reasonCodes: change.reasonCodes,
+          previousSzi: change.previousSzi,
+          currentSzi: change.currentSzi,
+          deltaSzi: change.deltaSzi,
+          referenceMarkPrice: change.referenceMarkPrice,
           previousPositionUsd: change.previousPositionUsd,
           currentPositionUsd: change.currentPositionUsd,
           deltaUsd: change.deltaUsd,
@@ -329,8 +449,9 @@ export function detectSmartMoneyEvents(input: {
     }
     for (const { symbol, direction, changes: group } of coordinatedGroups.values()) {
       if (group.length < policy.coordinatedMinWallets) continue;
-      const wallets = group.map((change) => change.address).sort();
-      const deltaUsd = group.reduce((total, change) => total + change.deltaUsd, 0);
+      const sortedChanges = [...group].sort((a, b) => a.address.localeCompare(b.address));
+      const wallets = sortedChanges.map((change) => change.address);
+      const deltaUsd = sortedChanges.reduce((total, change) => total + change.deltaUsd, 0);
       events.push({
         fingerprint: `${policy.version}:${input.cohortVersionKey}:coordinated_position_change:${symbol}:${direction}:${bucket}`,
         type: "coordinated_position_change",
@@ -341,8 +462,22 @@ export function detectSmartMoneyEvents(input: {
         verificationUrls: wallets.map(walletVerificationUrl),
         evidence: {
           cohortVersionKey: input.cohortVersionKey,
+          detectorVersionKey: policy.version,
           walletCount: wallets.length,
           wallets,
+          tradeChanges: sortedChanges.map((change) => ({
+            address: change.address,
+            tradeChangeKind: change.tradeChangeKind,
+            inferenceConfidence: change.inferenceConfidence,
+            reasonCodes: change.reasonCodes,
+            previousSzi: change.previousSzi,
+            currentSzi: change.currentSzi,
+            deltaSzi: change.deltaSzi,
+            referenceMarkPrice: change.referenceMarkPrice,
+            previousPositionUsd: change.previousPositionUsd,
+            currentPositionUsd: change.currentPositionUsd,
+            deltaUsd: change.deltaUsd,
+          })),
           deltaUsd,
           intervalHours: walletIntervalHours,
         },
@@ -379,6 +514,7 @@ export function detectSmartMoneyEvents(input: {
       verificationUrls: [current.verificationUrl],
       evidence: {
         cohortVersionKey: input.cohortVersionKey,
+        detectorVersionKey: policy.version,
         previousTvlUsd: previous.tvl,
         currentTvlUsd: current.tvl,
         pnlChangeUsd,
@@ -410,6 +546,22 @@ function positionLabel(value: number): string {
   return "flat";
 }
 
+function tradeChangeAction(kind: SmartMoneyTradeChangeKind | undefined): string | null {
+  switch (kind) {
+    case "open_long": return "likely opened a long between snapshots";
+    case "open_short": return "likely opened a short between snapshots";
+    case "close_long": return "likely closed a long between snapshots";
+    case "close_short": return "likely closed a short between snapshots";
+    case "add_long": return "likely added to a long between snapshots";
+    case "add_short": return "likely added to a short between snapshots";
+    case "reduce_long": return "likely reduced a long between snapshots";
+    case "reduce_short": return "likely reduced a short between snapshots";
+    case "flip_long_to_short": return "likely flipped from long to short between snapshots";
+    case "flip_short_to_long": return "likely flipped from short to long between snapshots";
+    default: return null;
+  }
+}
+
 export function formatSmartMoneyAlertDraft(
   event: SmartMoneyEventCandidate,
   performance?: WalletPerformanceEvidence,
@@ -426,8 +578,11 @@ export function formatSmartMoneyAlertDraft(
     );
   } else if (event.type === "unusual_position_change") {
     const address = event.address ?? "unknown";
+    const action = tradeChangeAction(event.evidence.tradeChangeKind);
     lines.push(
-      `${shortAddress(address)} changed ${event.symbol} net exposure by ${formatUsd(event.evidence.deltaUsd ?? 0)}.`,
+      action
+        ? `${shortAddress(address)} ${action} in ${event.symbol}; estimated signed exposure change ${formatUsd(event.evidence.deltaUsd ?? 0)} at one reference mark.`
+        : `${shortAddress(address)} changed ${event.symbol} net exposure by ${formatUsd(event.evidence.deltaUsd ?? 0)}.`,
       `Position: ${positionLabel(event.evidence.previousPositionUsd ?? 0)} → ${positionLabel(event.evidence.currentPositionUsd ?? 0)}.`,
     );
     if (performance) {
@@ -516,10 +671,17 @@ function digestEventLine(event: SmartMoneyEventCandidate): string {
     return `- **${event.symbol}:** cohort net positioning changed from ${positionLabel(event.evidence.previousNetUsd ?? 0)} to ${positionLabel(event.evidence.currentNetUsd ?? 0)}.${verify}`;
   }
   if (event.type === "unusual_position_change") {
-    return `- **${event.symbol}:** ${shortAddress(event.address ?? "unknown")} changed net exposure by ${formatUsd(event.evidence.deltaUsd ?? 0)}.${verify}`;
+    const action = tradeChangeAction(event.evidence.tradeChangeKind);
+    return action
+      ? `- **${event.symbol}:** ${shortAddress(event.address ?? "unknown")} ${action}; estimated signed exposure change ${formatUsd(event.evidence.deltaUsd ?? 0)} at one reference mark.${verify}`
+      : `- **${event.symbol}:** ${shortAddress(event.address ?? "unknown")} changed net exposure by ${formatUsd(event.evidence.deltaUsd ?? 0)}.${verify}`;
   }
   if (event.type === "coordinated_position_change") {
-    return `- **${event.symbol}:** ${event.evidence.walletCount ?? 0} cohort wallets changed exposure in the same direction; combined change ${formatUsd(event.evidence.deltaUsd ?? 0)}.${verify}`;
+    const hasV3SizeEvidence = event.evidence.detectorVersionKey === PILOT_EVENT_POLICY_V3.version
+      && Array.isArray(event.evidence.tradeChanges);
+    return hasV3SizeEvidence
+      ? `- **${event.symbol}:** ${event.evidence.walletCount ?? 0} cohort wallets changed actual position sizes in the same signed-exposure direction; combined quantity change valued at ${formatUsd(event.evidence.deltaUsd ?? 0)}.${verify}`
+      : `- **${event.symbol}:** ${event.evidence.walletCount ?? 0} cohort wallets changed exposure in the same direction; combined change ${formatUsd(event.evidence.deltaUsd ?? 0)}.${verify}`;
   }
   return `- **Vault ${event.vaultAddress ? shortAddress(event.vaultAddress) : "unknown"}:** estimated net depositor-flow proxy ${formatUsd(event.evidence.estimatedNetDepositorFlowUsd ?? 0)} (TVL change minus PnL change).${verify}`;
 }
@@ -532,7 +694,7 @@ export function formatDailySmartMoneyDigest(input: {
   funding: FundingContext[];
   policy?: SmartMoneyEventPolicy;
 }): DailySmartMoneyDigest {
-  const policy = input.policy ?? PILOT_EVENT_POLICY_V1;
+  const policy = input.policy ?? PILOT_EVENT_POLICY_V3;
   const net = netPositionByCoin(input.currentWallets);
   const positioning = policy.majorAssets.map((symbol) => ({
     symbol,

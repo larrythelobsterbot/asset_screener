@@ -5,7 +5,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   PILOT_COHORT_POLICY_V1,
-  PILOT_EVENT_POLICY_V1,
+  PILOT_EVENT_POLICY_V3,
   deriveWalletPerformanceEvidence,
   detectSmartMoneyEvents,
   evaluateWalletForSmartCohort,
@@ -64,7 +64,7 @@ const COHORT_RETRIEVAL_ATTEMPTS = 5;
 const VAULT_LIMIT = 50;
 const REQUEST_SPACING_MS = 350;
 const COHORT_MAX_RUNTIME_MS = 90 * 60_000;
-const MAJOR_ASSETS = [...PILOT_EVENT_POLICY_V1.majorAssets];
+const MAJOR_ASSETS = [...PILOT_EVENT_POLICY_V3.majorAssets];
 const store = createSmartMoneyPilotStore(getDb());
 
 function log(message: string): void {
@@ -333,7 +333,7 @@ async function collect(now = Date.now()): Promise<number | null> {
   const cohort = store.latestCohortVersion();
   if (!cohort || cohort.activeAddresses.length === 0) throw new Error("no active smart-money cohort");
   const scheduledFor = collectionBucket(now);
-  const runKey = collectionRunKey(scheduledFor, cohort.id);
+  const runKey = collectionRunKey(scheduledFor, cohort.id, PILOT_EVENT_POLICY_V3.version);
 
   let vaultSource: Awaited<ReturnType<typeof fetchVaultSource>>;
   let vaultArchivePath: string | null = null;
@@ -368,6 +368,7 @@ async function collect(now = Date.now()): Promise<number | null> {
       sourceManifest: {
         vaultsUrl: HYPERLIQUID_VAULTS_URL,
         vaultArchivePath,
+        eventPolicy: PILOT_EVENT_POLICY_V3.version,
         error: errorText(error),
       },
     });
@@ -399,7 +400,7 @@ async function collect(now = Date.now()): Promise<number | null> {
       vaultEligibleRows: vaultSource.eligibleRowCount,
       vaultArchivePath: vaultSource.sourceArchivePath,
       followerDetailsSucceeded,
-      eventPolicy: PILOT_EVENT_POLICY_V1.version,
+      eventPolicy: PILOT_EVENT_POLICY_V3.version,
     },
   });
   if (!run.created) {
@@ -465,7 +466,7 @@ async function collect(now = Date.now()): Promise<number | null> {
     currentWallets,
     previousVaults,
     currentVaults,
-    policy: PILOT_EVENT_POLICY_V1,
+    policy: PILOT_EVENT_POLICY_V3,
   });
   let inserted = 0;
   for (const candidate of candidates) {
@@ -535,7 +536,7 @@ function generateDailyDigest(
     currentWallets: wallets,
     events,
     funding,
-    policy: PILOT_EVENT_POLICY_V1,
+    policy: PILOT_EVENT_POLICY_V3,
   });
   const markdown = kind === "baseline"
     ? digest.markdown

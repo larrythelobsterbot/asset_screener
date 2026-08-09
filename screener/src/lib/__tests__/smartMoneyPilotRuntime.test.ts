@@ -114,9 +114,15 @@ test("bootstrap baseline cannot consume the complete daily digest identity", () 
   assert.match(daily.markdownPath, /daily\.md$/);
 });
 
-test("collection idempotency is scoped to the cohort policy version", () => {
+test("collection idempotency is scoped to the cohort and detector policy versions", () => {
   const scheduledFor = Date.UTC(2026, 6, 31, 12);
-  assert.notEqual(collectionRunKey(scheduledFor, 1), collectionRunKey(scheduledFor, 2));
-  assert.equal(collectionRunKey(scheduledFor, 2), "smart-money-collection:2026-07-31T12:cohort-2");
+  const v2 = "smart-money-pilot-events-v2-shadow";
+  const v3 = "smart-money-trade-change-v3-shadow";
+  assert.notEqual(collectionRunKey(scheduledFor, 1, v3), collectionRunKey(scheduledFor, 2, v3));
+  assert.notEqual(collectionRunKey(scheduledFor, 2, v2), collectionRunKey(scheduledFor, 2, v3));
+  assert.equal(
+    collectionRunKey(scheduledFor, 2, v3),
+    "smart-money-collection:2026-07-31T12:cohort-2:event-policy-smart-money-trade-change-v3-shadow",
+  );
   assert.notEqual(cohortEvidenceRunKey(scheduledFor, 1), cohortEvidenceRunKey(scheduledFor, 2));
 });

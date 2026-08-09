@@ -34,16 +34,16 @@ A wallet is eligible only when all evidence is present:
 
 The top 32 eligible wallets by deterministic consistency/size score become the weekly cohort. Every weekly version stores entries, stays, exits, exclusions, source hash, source evidence, and suspected gaming reasons. Zero-volume positive-PnL, extreme-turnover, and extreme-ROI rows are recorded as suspected vanity/wash candidates and are not admitted. The 32-wallet cap keeps every aggregate alert below Telegram's message limit while retaining a direct official explorer link for every constituent wallet.
 
-## Shadow event policy: `smart-money-pilot-events-v2-shadow`
+## V3 shadow trade-change policy: `smart-money-trade-change-v3-shadow`
 
 These thresholds create drafts only:
 
 - **Cohort net flip:** BTC, ETH, SOL, or HYPE changes sign with at least $1M absolute notional at both endpoints and a $2M aggregate change.
-- **Unusual wallet change:** absolute position delta is at least the larger of $1M or 10% of live account value.
-- **Coordinated change:** three or more cohort wallets move the same asset in the same delta direction; each wallet crosses the larger of $250,000 or 5% of account value.
+- **Unusual wallet trade change:** actual Hyperliquid position size (`szi`) changes, and the quantity delta valued at one reference mark is at least the larger of $1M or 10% of live account value. V3 classifies the snapshot transition as a likely long/short open, close, addition, reduction, or direction flip with medium inference confidence and structural reason codes; it does not claim an exact fill sequence.
+- **Coordinated trade change:** three or more cohort wallets change actual `szi` for the same DEX-qualified market in the same signed-exposure direction; each quantity delta valued at one reference mark crosses the larger of $250,000 or 5% of account value.
 - **Vault anomaly:** prior TVL is at least $1M and estimated net depositor-flow proxy crosses the larger of $500,000 or 10% of prior TVL.
 
-Wallet events require complete paired cohort coverage and an actual observation interval no longer than six hours. A partial, stale, cadence-misaligned, malformed, duplicate-identity, or suspiciously truncated collection writes failure evidence and suppresses event generation. HIP-3 positions retain the full DEX-qualified market key (for example, `xyz:SKHX`) throughout storage, deltas, and fingerprints. Event fingerprints make retries idempotent and are scoped to both the event policy and exact cohort version.
+Wallet events require complete paired cohort coverage and an actual observation interval no longer than six hours. V3 ignores USD notional changes caused only by mark-price movement: trade-change USD values are `deltaSzi × referenceMarkPrice`, using the current implied mark or the previous implied mark for a full close. Coordinated evidence retains each participating wallet's prior/current size, size delta, qualified classification, confidence, reason codes, reference mark, and valued delta; unchanged wallets are excluded. A partial, stale, cadence-misaligned, malformed, duplicate-identity, or suspiciously truncated collection writes failure evidence and suppresses event generation. HIP-3 positions retain the full DEX-qualified market key (for example, `xyz:SKHX`) throughout storage, deltas, and fingerprints. Event fingerprints make retries idempotent and are scoped to the V3 detector policy and exact cohort version. Collection run keys are also scoped to scheduled bucket, cohort version, and detector policy version, so a historical V2 reservation cannot suppress V3 detection in the same bucket.
 
 ## Durable evidence and review gate
 

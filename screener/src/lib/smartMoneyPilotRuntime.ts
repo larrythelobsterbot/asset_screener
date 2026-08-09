@@ -205,9 +205,13 @@ export function digestArtifactIdentity(
     };
 }
 
-export function collectionRunKey(scheduledFor: number, cohortVersionId: number): string {
+export function collectionRunKey(
+  scheduledFor: number,
+  cohortVersionId: number,
+  eventPolicyVersion: string,
+): string {
   const bucket = new Date(scheduledFor).toISOString().slice(0, 13);
-  return `smart-money-collection:${bucket}:cohort-${cohortVersionId}`;
+  return `smart-money-collection:${bucket}:cohort-${cohortVersionId}:event-policy-${eventPolicyVersion}`;
 }
 
 export function cohortEvidenceRunKey(weekStart: number, cohortVersionId: number): string {

@@ -124,7 +124,18 @@ test("pilot store is idempotent and keeps unapproved drafts out of delivery", ()
     address: "0x1111111111111111111111111111111111111111",
     vaultAddress: null,
     verificationUrls: ["https://app.hyperliquid.xyz/explorer/address/0x1111111111111111111111111111111111111111"],
-    evidence: { cohortVersionKey: "2026-W31", deltaUsd: 500_000 },
+    evidence: {
+      cohortVersionKey: "2026-W31",
+      detectorVersionKey: "smart-money-trade-change-v3-shadow",
+      tradeChangeKind: "reduce_short" as const,
+      inferenceConfidence: "medium" as const,
+      reasonCodes: ["snapshot_net_size_change", "short_size_decreased"] as const,
+      previousSzi: -10,
+      currentSzi: -8,
+      deltaSzi: 2,
+      referenceMarkPrice: 250_000,
+      deltaUsd: 500_000,
+    },
   };
   const event = store.insertEventDraft(first.id, candidate, "DRAFT — HUMAN REVIEW REQUIRED");
   const eventDuplicate = store.insertEventDraft(first.id, candidate, "different text must not overwrite");
@@ -132,13 +143,18 @@ test("pilot store is idempotent and keeps unapproved drafts out of delivery", ()
   assert.equal(eventDuplicate.created, false);
   assert.equal(eventDuplicate.id, event.id);
 
-  const row = db.prepare("select review_status, delivery_status, draft_text from smart_money_events where id = ?")
-    .get(event.id) as { review_status: string; delivery_status: string; draft_text: string };
-  assert.deepEqual(row, {
+  const row = db.prepare("select review_status, delivery_status, draft_text, evidence_json from smart_money_events where id = ?")
+    .get(event.id) as { review_status: string; delivery_status: string; draft_text: string; evidence_json: string };
+  assert.deepEqual({
+    review_status: row.review_status,
+    delivery_status: row.delivery_status,
+    draft_text: row.draft_text,
+  }, {
     review_status: "draft",
     delivery_status: "shadow",
     draft_text: "DRAFT — HUMAN REVIEW REQUIRED",
   });
+  assert.deepEqual(JSON.parse(row.evidence_json), candidate.evidence);
   assert.throws(() => db.prepare(
     "update smart_money_events set delivery_status = 'pending' where id = ?",
   ).run(event.id), /CHECK constraint failed/);
