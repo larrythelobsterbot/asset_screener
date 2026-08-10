@@ -1,6 +1,7 @@
 import type Database from "better-sqlite3";
 import { getDb } from "./db";
 import type {
+  CohortTransitionContext,
   SmartMoneyEventCandidate,
   SmartMoneyEventOutcome,
   VaultSnapshot,
@@ -8,6 +9,11 @@ import type {
   WalletPosition,
   WalletPositionSnapshot,
 } from "./smartMoneyPilot";
+import {
+  HYPERLIQUID_INFO_URL,
+  type UserFundingPayment,
+  type UserFundingRangeResult,
+} from "./smartMoneyFunding";
 
 export type CohortMembershipChange = "entry" | "stay" | "exit" | "ineligible";
 
@@ -83,6 +89,42 @@ export interface CollectionRunRecord {
   vaultSucceeded: number;
 }
 
+export interface FundingRunRecord {
+  id: number;
+  runKey: string;
+  collectionRunId: number;
+  policyVersion: string;
+  attemptNo: number;
+  startAt: number;
+  endAt: number;
+  startedAt: number;
+  completedAt: number | null;
+  status: "running" | "complete" | "partial" | "failed" | "invalid";
+  walletExpected: number;
+  walletSucceeded: number;
+  windowCount: number;
+  paymentCount: number;
+  sourceManifest: unknown;
+  error: string | null;
+}
+
+export interface FundingWindowRecord {
+  address: string;
+  startAt: number;
+  endAt: number;
+  status: "complete" | "saturated";
+  responseCount: number;
+  sourceSha256: string;
+  sourceBytes: number;
+  sourceArchivePath: string;
+}
+
+export interface FundingAggregationScope {
+  cohortVersionId: number;
+  policyVersion: string;
+  lookbackMs: number;
+}
+
 export interface StoredSmartMoneyEvent extends SmartMoneyEventCandidate {
   id: number;
 }
@@ -96,6 +138,84 @@ function lower(address: string): string {
 }
 
 export function createSmartMoneyPilotStore(db: Database.Database = getDb()) {
+  function validateFundingAggregationScope(scope: FundingAggregationScope): void {
+    if (!Number.isInteger(scope.cohortVersionId) || scope.cohortVersionId <= 0
+      || !scope.policyVersion.trim()
+      || !Number.isInteger(scope.lookbackMs) || scope.lookbackMs <= 0) {
+      throw new Error("funding aggregation scope is invalid");
+    }
+  }
+
+  function ensureFundingTerminalWindowCoverage(
+    fundingRunId: number,
+    run: FundingRunRecord,
+    expectedWallets: number,
+  ): void {
+    const rows = db.prepare(`
+      select address, start_at, end_at
+      from smart_money_funding_windows
+      where funding_run_id = ? and status = 'complete'
+      order by address, start_at, end_at
+    `).all(fundingRunId) as Array<{ address: string; start_at: number; end_at: number }>;
+    const byAddress = new Map<string, Array<{ startAt: number; endAt: number }>>();
+    for (const row of rows) {
+      const windows = byAddress.get(row.address) ?? [];
+      windows.push({ startAt: row.start_at, endAt: row.end_at });
+      byAddress.set(row.address, windows);
+    }
+    if (byAddress.size !== expectedWallets) {
+      throw new Error(
+        `funding run ${fundingRunId} terminal window coverage has ${byAddress.size} wallets != ${expectedWallets}`,
+      );
+    }
+    for (const [address, windows] of byAddress) {
+      if (windows[0]?.startAt !== run.startAt) {
+        throw new Error(`funding run ${fundingRunId} terminal window coverage for ${address} has no range start`);
+      }
+      let coveredEnd = run.startAt;
+      for (const window of windows) {
+        if (window.startAt < run.startAt || window.endAt > run.endAt
+          || window.endAt <= window.startAt || window.startAt !== coveredEnd) {
+          throw new Error(`funding run ${fundingRunId} terminal window coverage for ${address} has a gap or overlap`);
+        }
+        coveredEnd = Math.max(coveredEnd, window.endAt);
+      }
+      if (coveredEnd !== run.endAt) {
+        throw new Error(`funding run ${fundingRunId} terminal window coverage for ${address} has no range end`);
+      }
+    }
+  }
+
+  function ensureFundingTerminalWalletSet(
+    fundingRunId: number,
+    cohortVersionId: number,
+  ): void {
+    const mismatch = db.prepare(`
+      select address from (
+        select expected.address
+        from smart_money_cohort_members expected
+        where expected.cohort_version_id = @cohortVersionId and expected.is_member = 1
+          and not exists (
+            select 1 from smart_money_funding_windows observed
+            where observed.funding_run_id = @fundingRunId and observed.status = 'complete'
+              and observed.address = expected.address
+          )
+        union all
+        select observed.address
+        from smart_money_funding_windows observed
+        where observed.funding_run_id = @fundingRunId and observed.status = 'complete'
+          and not exists (
+            select 1 from smart_money_cohort_members expected
+            where expected.cohort_version_id = @cohortVersionId and expected.is_member = 1
+              and expected.address = observed.address
+          )
+      ) limit 1
+    `).get({ fundingRunId, cohortVersionId }) as { address: string } | undefined;
+    if (mismatch) {
+      throw new Error(`funding run ${fundingRunId} terminal wallet set does not match active cohort members`);
+    }
+  }
+
   function saveCohortVersion(input: SaveCohortVersionInput): { id: number; created: boolean } {
     return db.transaction(() => {
       const insert = db.prepare(`
@@ -149,18 +269,21 @@ export function createSmartMoneyPilotStore(db: Database.Database = getDb()) {
       computed_at: number;
     } | undefined;
     if (!version) return null;
-    const addresses = db.prepare(`
-      select address from smart_money_cohort_members
-      where cohort_version_id = ? and is_member = 1
-      order by score desc, address asc
-    `).all(version.id) as Array<{ address: string }>;
     return {
       id: version.id,
       versionKey: version.version_key,
       policyVersion: version.policy_version,
       computedAt: version.computed_at,
-      activeAddresses: addresses.map(({ address }) => address),
+      activeAddresses: activeAddressesForCohort(version.id),
     };
+  }
+
+  function activeAddressesForCohort(cohortVersionId: number): string[] {
+    return (db.prepare(`
+      select address from smart_money_cohort_members
+      where cohort_version_id = ? and is_member = 1
+      order by score desc, address asc
+    `).all(cohortVersionId) as Array<{ address: string }>).map(({ address }) => address);
   }
 
   function previousActiveAddresses(): Set<string> {
@@ -173,6 +296,44 @@ export function createSmartMoneyPilotStore(db: Database.Database = getDb()) {
       select address from smart_money_cohort_members
       where cohort_version_id = ? and is_member = 1
     `).all(previous.id) as Array<{ address: string }>).map(({ address }) => address));
+  }
+
+  function cohortTransitionContext(cohortVersionId: number): CohortTransitionContext {
+    const current = db.prepare(`
+      select id, version_key, computed_at from smart_money_cohort_versions where id = ?
+    `).get(cohortVersionId) as {
+      id: number;
+      version_key: string;
+      computed_at: number;
+    } | undefined;
+    if (!current) throw new Error(`unknown cohort version ${cohortVersionId}`);
+    const previous = db.prepare(`
+      select id, version_key from smart_money_cohort_versions
+      where computed_at < @computedAt or (computed_at = @computedAt and id < @id)
+      order by computed_at desc, id desc limit 1
+    `).get({ computedAt: current.computed_at, id: current.id }) as {
+      id: number;
+      version_key: string;
+    } | undefined;
+    const activeAddresses = (versionId: number): Set<string> => new Set((db.prepare(`
+      select address from smart_money_cohort_members
+      where cohort_version_id = ? and is_member = 1
+    `).all(versionId) as Array<{ address: string }>).map(({ address }) => address));
+    const currentAddresses = activeAddresses(current.id);
+    const previousAddresses = previous ? activeAddresses(previous.id) : new Set<string>();
+    let stays = 0;
+    for (const address of currentAddresses) {
+      if (previousAddresses.has(address)) stays += 1;
+    }
+    return {
+      currentVersionKey: current.version_key,
+      previousVersionKey: previous?.version_key ?? null,
+      currentMembers: currentAddresses.size,
+      previousMembers: previousAddresses.size,
+      entries: currentAddresses.size - stays,
+      stays,
+      exits: previousAddresses.size - stays,
+    };
   }
 
   function reserveCollectionRun(input: ReserveCollectionRunInput): { id: number; created: boolean } {
@@ -214,6 +375,459 @@ export function createSmartMoneyPilotStore(db: Database.Database = getDb()) {
         error = @error, updated_at = @completedAt
       where id = @id and status = 'running'
     `).run({ id, ...input, error: input.error?.slice(0, 2_000) ?? null }).changes === 1;
+  }
+
+  function reserveFundingRun(input: {
+    runKey: string;
+    attemptNo: number;
+    collectionRunId: number;
+    policyVersion: string;
+    startAt: number;
+    endAt: number;
+    startedAt: number;
+    walletExpected: number;
+    sourceManifest: unknown;
+  }): { id: number; created: boolean } {
+    const insert = db.prepare(`
+      insert into smart_money_funding_runs (
+        run_key, collection_run_id, policy_version, attempt_no, start_at, end_at,
+        started_at, status, wallet_expected, source_manifest_json, created_at, updated_at
+      ) values (
+        @runKey, @collectionRunId, @policyVersion, @attemptNo, @startAt, @endAt,
+        @startedAt, 'running', @walletExpected, @sourceManifestJson, @startedAt, @startedAt
+      ) on conflict do nothing
+    `).run({ ...input, sourceManifestJson: json(input.sourceManifest) });
+    const row = db.prepare(
+      "select id from smart_money_funding_runs where run_key = ?",
+    ).get(input.runKey) as { id: number };
+    const existing = fundingRun(row.id);
+    if (!existing
+      || existing.collectionRunId !== input.collectionRunId
+      || existing.policyVersion !== input.policyVersion
+      || existing.attemptNo !== input.attemptNo
+      || existing.startAt !== input.startAt
+      || existing.endAt !== input.endAt
+      || existing.walletExpected !== input.walletExpected) {
+      throw new Error(`funding run key collision for ${input.runKey}`);
+    }
+    return { id: row.id, created: insert.changes === 1 };
+  }
+
+  function fundingRun(id: number): FundingRunRecord | null {
+    const row = db.prepare(`
+      select id, run_key, collection_run_id, policy_version, attempt_no, start_at, end_at,
+        started_at, completed_at, status, wallet_expected, wallet_succeeded, window_count,
+        payment_count, source_manifest_json, error
+      from smart_money_funding_runs where id = ?
+    `).get(id) as {
+      id: number; run_key: string; collection_run_id: number; policy_version: string; attempt_no: number;
+      start_at: number; end_at: number; started_at: number; completed_at: number | null;
+      status: FundingRunRecord["status"];
+      wallet_expected: number; wallet_succeeded: number; window_count: number;
+      payment_count: number; source_manifest_json: string; error: string | null;
+    } | undefined;
+    return row ? {
+      id: row.id,
+      runKey: row.run_key,
+      collectionRunId: row.collection_run_id,
+      policyVersion: row.policy_version,
+      attemptNo: row.attempt_no,
+      startAt: row.start_at,
+      endAt: row.end_at,
+      startedAt: row.started_at,
+      completedAt: row.completed_at,
+      status: row.status,
+      walletExpected: row.wallet_expected,
+      walletSucceeded: row.wallet_succeeded,
+      windowCount: row.window_count,
+      paymentCount: row.payment_count,
+      sourceManifest: JSON.parse(row.source_manifest_json),
+      error: row.error,
+    } : null;
+  }
+
+  function latestFundingRunForCollection(
+    collectionRunId: number,
+    policyVersion: string,
+  ): FundingRunRecord | null {
+    const row = db.prepare(`
+      select id from smart_money_funding_runs
+      where collection_run_id = ? and policy_version = ?
+      order by attempt_no desc limit 1
+    `).get(collectionRunId, policyVersion) as { id: number } | undefined;
+    return row ? fundingRun(row.id) : null;
+  }
+
+  function fundingRunWindows(fundingRunId: number): FundingWindowRecord[] {
+    return (db.prepare(`
+      select address, start_at, end_at, status, response_count,
+        source_sha256, source_bytes, source_archive_path
+      from smart_money_funding_windows
+      where funding_run_id = ?
+      order by address, start_at, end_at
+    `).all(fundingRunId) as Array<{
+      address: string; start_at: number; end_at: number;
+      status: FundingWindowRecord["status"]; response_count: number;
+      source_sha256: string; source_bytes: number; source_archive_path: string;
+    }>).map((row) => ({
+      address: row.address,
+      startAt: row.start_at,
+      endAt: row.end_at,
+      status: row.status,
+      responseCount: row.response_count,
+      sourceSha256: row.source_sha256,
+      sourceBytes: row.source_bytes,
+      sourceArchivePath: row.source_archive_path,
+    }));
+  }
+
+  function fundingRunPaymentAssociationCount(fundingRunId: number): number {
+    return (db.prepare(`
+      select count(*) as count from smart_money_funding_run_payments where funding_run_id = ?
+    `).get(fundingRunId) as { count: number }).count;
+  }
+
+  function invalidateFundingRun(id: number, observedAt: number, error: string): boolean {
+    return db.prepare(`
+      update smart_money_funding_runs
+      set status = 'invalid', error = @error, updated_at = @observedAt
+      where id = @id and status = 'complete'
+    `).run({ id, observedAt, error: error.slice(0, 2_000) }).changes === 1;
+  }
+
+  function markStaleFundingRunsFailed(staleBefore: number, observedAt: number): number {
+    return db.prepare(`
+      update smart_money_funding_runs
+      set status = 'failed', completed_at = @observedAt,
+        error = 'stale running funding collection recovered after process exit', updated_at = @observedAt
+      where status = 'running' and started_at < @staleBefore
+    `).run({ staleBefore, observedAt }).changes;
+  }
+
+  function recordFundingWalletResult(
+    fundingRunId: number,
+    result: UserFundingRangeResult,
+    createdAt: number,
+  ): { windowsInserted: number; paymentsInserted: number; paymentAssociationsInserted: number } {
+    return db.transaction(() => {
+      const run = fundingRun(fundingRunId);
+      if (!run || run.status !== "running") throw new Error(`funding run ${fundingRunId} is not running`);
+      const address = lower(result.address);
+      const activeMember = db.prepare(`
+        select 1
+        from smart_money_collection_runs collection
+        join smart_money_cohort_members member
+          on member.cohort_version_id = collection.cohort_version_id
+        where collection.id = ? and member.address = ? and member.is_member = 1
+      `).get(run.collectionRunId, address);
+      if (!activeMember) {
+        throw new Error(`funding wallet ${address} is not an active cohort member for run ${fundingRunId}`);
+      }
+      if (result.startTime !== run.startAt || result.endTime !== run.endAt) {
+        throw new Error(`funding wallet range does not match run ${fundingRunId}`);
+      }
+      let windowsInserted = 0;
+      for (const window of result.windows) {
+        const values = {
+          fundingRunId,
+          address,
+          startAt: window.startTime,
+          endAt: window.endTime,
+          status: window.status,
+          responseCount: window.responseCount,
+          sourceSha256: window.sourceSha256,
+          sourceBytes: window.sourceBytes,
+          sourceArchivePath: window.sourceArchivePath,
+        };
+        const existing = db.prepare(`
+          select status, response_count, source_sha256, source_bytes, source_archive_path
+          from smart_money_funding_windows
+          where funding_run_id = @fundingRunId and address = @address
+            and start_at = @startAt and end_at = @endAt
+        `).get(values) as {
+          status: string; response_count: number; source_sha256: string;
+          source_bytes: number; source_archive_path: string;
+        } | undefined;
+        if (existing) {
+          if (existing.status !== values.status
+            || existing.response_count !== values.responseCount
+            || existing.source_sha256 !== values.sourceSha256
+            || existing.source_bytes !== values.sourceBytes
+            || existing.source_archive_path !== values.sourceArchivePath) {
+            throw new Error(`conflicting funding window ${result.address}:${window.startTime}-${window.endTime}`);
+          }
+          continue;
+        }
+        windowsInserted += db.prepare(`
+          insert into smart_money_funding_windows (
+            funding_run_id, address, start_at, end_at, status, response_count,
+            source_sha256, source_bytes, source_archive_path
+          ) values (
+            @fundingRunId, @address, @startAt, @endAt, @status, @responseCount,
+            @sourceSha256, @sourceBytes, @sourceArchivePath
+          )
+        `).run(values).changes;
+      }
+      let paymentsInserted = 0;
+      let paymentAssociationsInserted = 0;
+      for (const payment of result.payments) {
+        if (lower(payment.address) !== address) {
+          throw new Error(`funding payment address ${payment.address} does not match result wallet ${address}`);
+        }
+        if (!Number.isInteger(payment.time) || payment.time < run.startAt || payment.time > run.endAt) {
+          throw new Error(`funding payment time ${payment.time} is outside funding run range`);
+        }
+        const values = {
+          address: lower(payment.address),
+          settlementAt: payment.time,
+          coin: payment.coin,
+          usdc: payment.usdc,
+          szi: payment.szi,
+          fundingRate: payment.fundingRate,
+          nSamples: payment.nSamples,
+          sourceHash: payment.hash,
+          firstFundingRunId: fundingRunId,
+          sourceUrl: HYPERLIQUID_INFO_URL,
+          createdAt,
+        };
+        const existing = db.prepare(`
+          select usdc, szi, funding_rate, n_samples, source_hash
+          from smart_money_funding_payments
+          where address = @address and settlement_at = @settlementAt and coin = @coin
+        `).get(values) as {
+          usdc: number; szi: number; funding_rate: number;
+          n_samples: number | null; source_hash: string;
+        } | undefined;
+        if (existing) {
+          if (existing.usdc !== values.usdc
+            || existing.szi !== values.szi
+            || existing.funding_rate !== values.fundingRate
+            || existing.n_samples !== values.nSamples
+            || existing.source_hash !== values.sourceHash) {
+            throw new Error(`conflicting funding payment ${values.address}:${values.settlementAt}:${values.coin}`);
+          }
+        } else {
+          paymentsInserted += db.prepare(`
+            insert into smart_money_funding_payments (
+              address, settlement_at, coin, usdc, szi, funding_rate, n_samples,
+              source_hash, first_funding_run_id, source_url, created_at
+            ) values (
+              @address, @settlementAt, @coin, @usdc, @szi, @fundingRate, @nSamples,
+              @sourceHash, @firstFundingRunId, @sourceUrl, @createdAt
+            )
+          `).run(values).changes;
+        }
+        paymentAssociationsInserted += db.prepare(`
+          insert into smart_money_funding_run_payments (
+            funding_run_id, address, settlement_at, coin
+          ) values (@fundingRunId, @address, @settlementAt, @coin)
+          on conflict(funding_run_id, address, settlement_at, coin) do nothing
+        `).run({ fundingRunId, ...values }).changes;
+      }
+      return { windowsInserted, paymentsInserted, paymentAssociationsInserted };
+    })();
+  }
+
+  function finishFundingRun(id: number, input: {
+    status: "complete" | "partial" | "failed";
+    completedAt: number;
+    walletSucceeded: number;
+    windowCount: number;
+    paymentCount: number;
+    sourceManifest: unknown;
+    error: string | null;
+  }): boolean {
+    return db.transaction(() => {
+      const run = fundingRun(id);
+      if (!run || run.status !== "running") return false;
+      if (input.status === "complete") {
+        const parent = db.prepare(`
+          select status, run_kind, scheduled_for, cohort_version_id,
+            wallet_expected, wallet_succeeded, vault_expected, vault_succeeded
+          from smart_money_collection_runs where id = ?
+        `).get(run.collectionRunId) as {
+          status: CollectionRunRecord["status"];
+          run_kind: CollectionRunRecord["runKind"];
+          scheduled_for: number;
+          cohort_version_id: number;
+          wallet_expected: number;
+          wallet_succeeded: number;
+          vault_expected: number;
+          vault_succeeded: number;
+        } | undefined;
+        if (!parent || parent.status !== "complete" || parent.run_kind !== "collection") {
+          throw new Error(`funding run ${id} parent collection is not complete`);
+        }
+        if (parent.scheduled_for !== run.endAt) {
+          throw new Error(`funding run ${id} does not end at its parent collection time`);
+        }
+        if (parent.wallet_expected !== run.walletExpected) {
+          throw new Error(`funding run ${id} wallet expectation does not match its parent collection`);
+        }
+        if (parent.wallet_succeeded !== parent.wallet_expected
+          || parent.vault_succeeded !== parent.vault_expected) {
+          throw new Error(`funding run ${id} parent collection counters are incomplete`);
+        }
+        const activeMemberCount = (db.prepare(`
+          select count(*) as count from smart_money_cohort_members
+          where cohort_version_id = ? and is_member = 1
+        `).get(parent.cohort_version_id) as { count: number }).count;
+        if (activeMemberCount !== run.walletExpected) {
+          throw new Error(`funding run ${id} wallet expectation does not match its active cohort members`);
+        }
+        ensureFundingTerminalWalletSet(id, parent.cohort_version_id);
+      }
+      const persistedWindows = fundingRunWindows(id).length;
+      if (persistedWindows !== input.windowCount) {
+        throw new Error(`funding run ${id} persisted window count ${persistedWindows} != ${input.windowCount}`);
+      }
+      const persistedPayments = fundingRunPaymentAssociationCount(id);
+      if (persistedPayments !== input.paymentCount) {
+        throw new Error(`funding run ${id} persisted payment count ${persistedPayments} != ${input.paymentCount}`);
+      }
+      const persistedWallets = (db.prepare(`
+        select count(distinct address) as count
+        from smart_money_funding_windows where funding_run_id = ? and status = 'complete'
+      `).get(id) as { count: number }).count;
+      if (persistedWallets !== input.walletSucceeded) {
+        throw new Error(`funding run ${id} persisted wallet count ${persistedWallets} != ${input.walletSucceeded}`);
+      }
+      ensureFundingTerminalWindowCoverage(id, run, input.walletSucceeded);
+      return db.prepare(`
+        update smart_money_funding_runs
+        set status = @status, completed_at = @completedAt,
+          wallet_succeeded = @walletSucceeded, window_count = @windowCount,
+          payment_count = @paymentCount, source_manifest_json = @sourceManifestJson,
+          error = @error, updated_at = @completedAt
+        where id = @id and status = 'running'
+      `).run({
+        id,
+        ...input,
+        sourceManifestJson: json(input.sourceManifest),
+        error: input.error?.slice(0, 2_000) ?? null,
+      }).changes === 1;
+    })();
+  }
+
+  function latestCompleteFundingRunAtOrBefore(
+    endAt: number,
+    scope: FundingAggregationScope,
+  ): FundingRunRecord | null {
+    validateFundingAggregationScope(scope);
+    if (!Number.isInteger(endAt)) throw new Error("funding aggregation end time is invalid");
+    const row = db.prepare(`
+      select funding.id
+      from smart_money_funding_runs funding
+      join smart_money_collection_runs collection
+        on collection.id = funding.collection_run_id
+      where funding.status = 'complete' and funding.end_at <= @endAt
+        and collection.status = 'complete' and collection.run_kind = 'collection'
+        and collection.wallet_succeeded = collection.wallet_expected
+        and collection.vault_succeeded = collection.vault_expected
+        and collection.cohort_version_id = @cohortVersionId
+        and collection.scheduled_for = funding.end_at
+        and funding.wallet_expected = collection.wallet_expected
+        and funding.wallet_expected = (
+          select count(*) from smart_money_cohort_members expected
+          where expected.cohort_version_id = collection.cohort_version_id
+            and expected.is_member = 1
+        )
+        and not exists (
+          select 1 from smart_money_funding_windows observed
+          where observed.funding_run_id = funding.id and observed.status = 'complete'
+            and not exists (
+              select 1 from smart_money_cohort_members expected
+              where expected.cohort_version_id = collection.cohort_version_id
+                and expected.is_member = 1 and expected.address = observed.address
+            )
+        )
+        and not exists (
+          select 1 from smart_money_cohort_members expected
+          where expected.cohort_version_id = collection.cohort_version_id
+            and expected.is_member = 1
+            and not exists (
+              select 1 from smart_money_funding_windows observed
+              where observed.funding_run_id = funding.id and observed.status = 'complete'
+                and observed.address = expected.address
+            )
+        )
+        and funding.policy_version = @policyVersion
+        and funding.end_at - funding.start_at = @lookbackMs
+      order by funding.end_at desc, funding.id desc limit 1
+    `).get({ endAt, ...scope }) as { id: number } | undefined;
+    return row ? fundingRun(row.id) : null;
+  }
+
+  function completeFundingPayments(
+    fundingRunId: number,
+    scope: FundingAggregationScope,
+  ): UserFundingPayment[] {
+    validateFundingAggregationScope(scope);
+    const aggregateReady = db.prepare(`
+      select funding.id
+      from smart_money_funding_runs funding
+      join smart_money_collection_runs collection
+        on collection.id = funding.collection_run_id
+      where funding.id = @fundingRunId and funding.status = 'complete'
+        and collection.status = 'complete' and collection.run_kind = 'collection'
+        and collection.wallet_succeeded = collection.wallet_expected
+        and collection.vault_succeeded = collection.vault_expected
+        and collection.cohort_version_id = @cohortVersionId
+        and collection.scheduled_for = funding.end_at
+        and funding.wallet_expected = collection.wallet_expected
+        and funding.wallet_expected = (
+          select count(*) from smart_money_cohort_members expected
+          where expected.cohort_version_id = collection.cohort_version_id
+            and expected.is_member = 1
+        )
+        and not exists (
+          select 1 from smart_money_funding_windows observed
+          where observed.funding_run_id = funding.id and observed.status = 'complete'
+            and not exists (
+              select 1 from smart_money_cohort_members expected
+              where expected.cohort_version_id = collection.cohort_version_id
+                and expected.is_member = 1 and expected.address = observed.address
+            )
+        )
+        and not exists (
+          select 1 from smart_money_cohort_members expected
+          where expected.cohort_version_id = collection.cohort_version_id
+            and expected.is_member = 1
+            and not exists (
+              select 1 from smart_money_funding_windows observed
+              where observed.funding_run_id = funding.id and observed.status = 'complete'
+                and observed.address = expected.address
+            )
+        )
+        and funding.policy_version = @policyVersion
+        and funding.end_at - funding.start_at = @lookbackMs
+    `).get({ fundingRunId, ...scope }) as { id: number } | undefined;
+    if (!aggregateReady) {
+      throw new Error(`funding run ${fundingRunId} is not aggregate-ready`);
+    }
+    return (db.prepare(`
+      select payment.address, payment.settlement_at, payment.coin, payment.usdc,
+        payment.szi, payment.funding_rate, payment.n_samples, payment.source_hash
+      from smart_money_funding_run_payments association
+      join smart_money_funding_payments payment
+        on payment.address = association.address
+        and payment.settlement_at = association.settlement_at
+        and payment.coin = association.coin
+      where association.funding_run_id = ?
+      order by payment.settlement_at, payment.coin, payment.address
+    `).all(fundingRunId) as Array<{
+      address: string; settlement_at: number; coin: string; usdc: number;
+      szi: number; funding_rate: number; n_samples: number | null; source_hash: string;
+    }>).map((row) => ({
+      address: row.address,
+      time: row.settlement_at,
+      coin: row.coin,
+      usdc: row.usdc,
+      szi: row.szi,
+      fundingRate: row.funding_rate,
+      nSamples: row.n_samples,
+      hash: row.source_hash,
+    }));
   }
 
   function recordWalletSnapshot(runId: number, snapshot: WalletSnapshotInput): boolean {
@@ -671,10 +1285,23 @@ export function createSmartMoneyPilotStore(db: Database.Database = getDb()) {
   return {
     saveCohortVersion,
     latestCohortVersion,
+    activeAddressesForCohort,
     previousActiveAddresses,
+    cohortTransitionContext,
     reserveCollectionRun,
     markStaleRunsFailed,
     finishCollectionRun,
+    reserveFundingRun,
+    fundingRun,
+    latestFundingRunForCollection,
+    fundingRunWindows,
+    fundingRunPaymentAssociationCount,
+    invalidateFundingRun,
+    markStaleFundingRunsFailed,
+    recordFundingWalletResult,
+    finishFundingRun,
+    latestCompleteFundingRunAtOrBefore,
+    completeFundingPayments,
     recordWalletSnapshot,
     recordVaultSnapshots,
     recordWalletPerformance,

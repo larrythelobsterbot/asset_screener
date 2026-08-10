@@ -11,6 +11,7 @@ import {
   digestArtifactIdentity,
   ensureBeforeDeadline,
   ensureNoCohortRetrievalFailures,
+  verifyContentAddressedSourceArchive,
   verifyImmutableArtifact,
   verifyImmutableArtifactHash,
   writeContentAddressedSourceArchive,
@@ -78,9 +79,19 @@ test("immutable artifacts reject stale content and source archives verify their 
     const archived = writeContentAddressedSourceArchive(directory, "vaults", sha256, raw);
     assert.match(archived, new RegExp(`${sha256}\\.json\\.gz$`));
     assert.equal(writeContentAddressedSourceArchive(directory, "vaults", sha256, raw), archived);
+    assert.doesNotThrow(() => verifyContentAddressedSourceArchive(
+      archived,
+      sha256,
+      Buffer.byteLength(raw),
+    ));
     assert.throws(
       () => writeContentAddressedSourceArchive(directory, "vaults", "0".repeat(64), raw),
       /hash mismatch/,
+    );
+    writeFileSync(archived, "corrupted");
+    assert.throws(
+      () => verifyContentAddressedSourceArchive(archived, sha256, Buffer.byteLength(raw)),
+      /archive/i,
     );
   } finally {
     rmSync(directory, { recursive: true, force: true });
@@ -114,9 +125,15 @@ test("bootstrap baseline cannot consume the complete daily digest identity", () 
   assert.match(daily.markdownPath, /daily\.md$/);
 });
 
-test("collection idempotency is scoped to the cohort policy version", () => {
+test("collection idempotency is scoped to the cohort and detector policy versions", () => {
   const scheduledFor = Date.UTC(2026, 6, 31, 12);
-  assert.notEqual(collectionRunKey(scheduledFor, 1), collectionRunKey(scheduledFor, 2));
-  assert.equal(collectionRunKey(scheduledFor, 2), "smart-money-collection:2026-07-31T12:cohort-2");
+  const v2 = "smart-money-pilot-events-v2-shadow";
+  const v3 = "smart-money-trade-change-v3-shadow";
+  assert.notEqual(collectionRunKey(scheduledFor, 1, v3), collectionRunKey(scheduledFor, 2, v3));
+  assert.notEqual(collectionRunKey(scheduledFor, 2, v2), collectionRunKey(scheduledFor, 2, v3));
+  assert.equal(
+    collectionRunKey(scheduledFor, 2, v3),
+    "smart-money-collection:2026-07-31T12:cohort-2:event-policy-smart-money-trade-change-v3-shadow",
+  );
   assert.notEqual(cohortEvidenceRunKey(scheduledFor, 1), cohortEvidenceRunKey(scheduledFor, 2));
 });

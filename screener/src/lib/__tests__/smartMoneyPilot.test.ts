@@ -2,7 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
   PILOT_COHORT_POLICY_V1,
-  PILOT_EVENT_POLICY_V1,
+  PILOT_EVENT_POLICY_V3 as PILOT_EVENT_POLICY_V1,
   detectSmartMoneyEvents as detectSmartMoneyEventsScoped,
   deriveWalletPerformanceEvidence,
   evaluateWalletForSmartCohort,
@@ -238,6 +238,200 @@ test("event detector separates unusual single-wallet changes from coordinated mo
   assert.equal(coordinated?.evidence.deltaUsd, 1_800_000);
 });
 
+test("trade-change detector ignores mark-price movement when wallet coin sizes are unchanged", () => {
+  const now = Date.UTC(2026, 6, 31, 18);
+  const addresses = [
+    "0x1111111111111111111111111111111111111111",
+    "0x2222222222222222222222222222222222222222",
+    "0x3333333333333333333333333333333333333333",
+  ];
+  const snapshot = (
+    address: string,
+    observedAt: number,
+    positionValue: number,
+  ): WalletPositionSnapshot => ({
+    address,
+    observedAt,
+    accountValue: 10_000_000,
+    positions: [{ coin: "HYPE", szi: -100_000, positionValue, leverage: 2 }],
+  });
+
+  const events = detectSmartMoneyEvents({
+    observedAt: now,
+    previousWallets: addresses.map((address) => snapshot(
+      address,
+      now - 4 * 3_600_000,
+      5_000_000,
+    )),
+    currentWallets: addresses.map((address) => snapshot(address, now, 6_500_000)),
+    previousVaults: [],
+    currentVaults: [],
+    policy: PILOT_EVENT_POLICY_V1,
+  });
+
+  assert.equal(
+    events.filter((event) => event.type === "unusual_position_change").length,
+    0,
+  );
+  assert.equal(
+    events.filter((event) => event.type === "coordinated_position_change").length,
+    0,
+  );
+});
+
+test("trade-change detector fails closed when a nonzero current position has no usable mark", () => {
+  const now = Date.UTC(2026, 6, 31, 18);
+  const address = "0x1111111111111111111111111111111111111111";
+  const previous: WalletPositionSnapshot = {
+    address,
+    observedAt: now - 4 * 3_600_000,
+    accountValue: 100_000,
+    positions: [{ coin: "ETH", szi: 10, positionValue: 10_000_000, leverage: 2 }],
+  };
+  const current: WalletPositionSnapshot = {
+    address,
+    observedAt: now,
+    accountValue: 100_000,
+    positions: [{ coin: "ETH", szi: 8, positionValue: 0, leverage: 2 }],
+  };
+
+  const events = detectSmartMoneyEvents({
+    observedAt: now,
+    previousWallets: [previous],
+    currentWallets: [current],
+    previousVaults: [],
+    currentVaults: [],
+    policy: PILOT_EVENT_POLICY_V1,
+  });
+
+  assert.equal(
+    events.filter((event) => event.type === "unusual_position_change").length,
+    0,
+  );
+});
+
+test("trade-change detector classifies opens, closes, adds, reductions, and flips from szi", () => {
+  const now = Date.UTC(2026, 6, 31, 19);
+  const address = "0x1111111111111111111111111111111111111111";
+  const snapshot = (
+    observedAt: number,
+    szi: number,
+    markPrice: number,
+  ): WalletPositionSnapshot => ({
+    address,
+    observedAt,
+    accountValue: 100_000,
+    positions: szi === 0
+      ? []
+      : [{ coin: "ETH", szi, positionValue: Math.abs(szi * markPrice), leverage: 2 }],
+  });
+  const cases = [
+    { previousSzi: 0, currentSzi: 2, expected: "open_long", reason: "flat_to_long_size", deltaSzi: 2 },
+    { previousSzi: 0, currentSzi: -2, expected: "open_short", reason: "flat_to_short_size", deltaSzi: -2 },
+    { previousSzi: 2, currentSzi: 0, expected: "close_long", reason: "long_to_flat_size", deltaSzi: -2 },
+    { previousSzi: -2, currentSzi: 0, expected: "close_short", reason: "short_to_flat_size", deltaSzi: 2 },
+    { previousSzi: 2, currentSzi: 4, expected: "add_long", reason: "long_size_increased", deltaSzi: 2 },
+    { previousSzi: 4, currentSzi: 2, expected: "reduce_long", reason: "long_size_decreased", deltaSzi: -2 },
+    { previousSzi: -2, currentSzi: -4, expected: "add_short", reason: "short_size_increased", deltaSzi: -2 },
+    { previousSzi: -4, currentSzi: -2, expected: "reduce_short", reason: "short_size_decreased", deltaSzi: 2 },
+    { previousSzi: 2, currentSzi: -2, expected: "flip_long_to_short", reason: "long_to_short_size", deltaSzi: -4 },
+    { previousSzi: -2, currentSzi: 2, expected: "flip_short_to_long", reason: "short_to_long_size", deltaSzi: 4 },
+  ] as const;
+
+  for (const testCase of cases) {
+    const event = detectSmartMoneyEvents({
+      observedAt: now,
+      previousWallets: [snapshot(now - 4 * 3_600_000, testCase.previousSzi, 500_000)],
+      currentWallets: [snapshot(now, testCase.currentSzi, 1_000_000)],
+      previousVaults: [],
+      currentVaults: [],
+      policy: PILOT_EVENT_POLICY_V1,
+    }).find((candidate) => candidate.type === "unusual_position_change");
+    assert.ok(event, testCase.expected);
+    const eventEvidence = event.evidence as unknown as Record<string, unknown>;
+    assert.equal(eventEvidence.tradeChangeKind, testCase.expected);
+    assert.equal(eventEvidence.inferenceConfidence, "medium");
+    assert.deepEqual(eventEvidence.reasonCodes, ["snapshot_net_size_change", testCase.reason]);
+    assert.equal(eventEvidence.previousSzi, testCase.previousSzi);
+    assert.equal(eventEvidence.currentSzi, testCase.currentSzi);
+    assert.equal(eventEvidence.deltaSzi, testCase.deltaSzi);
+    assert.equal(eventEvidence.referenceMarkPrice, testCase.currentSzi === 0 ? 500_000 : 1_000_000);
+  }
+
+  const addLong = detectSmartMoneyEvents({
+    observedAt: now,
+    previousWallets: [snapshot(now - 4 * 3_600_000, 2, 500_000)],
+    currentWallets: [snapshot(now, 4, 1_000_000)],
+    previousVaults: [],
+    currentVaults: [],
+    policy: PILOT_EVENT_POLICY_V1,
+  }).find((candidate) => candidate.type === "unusual_position_change");
+  assert.equal(addLong?.evidence.previousPositionUsd, 2_000_000);
+  assert.equal(addLong?.evidence.currentPositionUsd, 4_000_000);
+  assert.equal(addLong?.evidence.deltaUsd, 2_000_000);
+});
+
+test("coordinated trade changes include only wallets whose coin sizes changed", () => {
+  const now = Date.UTC(2026, 6, 31, 19);
+  const changedAddresses = [
+    "0x1111111111111111111111111111111111111111",
+    "0x2222222222222222222222222222222222222222",
+    "0x3333333333333333333333333333333333333333",
+  ];
+  const markOnlyAddress = "0x4444444444444444444444444444444444444444";
+  const snapshot = (
+    address: string,
+    observedAt: number,
+    szi: number,
+    markPrice: number,
+  ): WalletPositionSnapshot => ({
+    address,
+    observedAt,
+    accountValue: 1_000_000,
+    positions: [{ coin: "HYPE", szi, positionValue: Math.abs(szi * markPrice), leverage: 2 }],
+  });
+
+  const event = detectSmartMoneyEvents({
+    observedAt: now,
+    previousWallets: [
+      ...changedAddresses.map((address) => snapshot(address, now - 4 * 3_600_000, -10, 500_000)),
+      snapshot(markOnlyAddress, now - 4 * 3_600_000, -10, 500_000),
+    ],
+    currentWallets: [
+      ...changedAddresses.map((address) => snapshot(address, now, -8, 500_000)),
+      snapshot(markOnlyAddress, now, -10, 650_000),
+    ],
+    previousVaults: [],
+    currentVaults: [],
+    policy: PILOT_EVENT_POLICY_V1,
+  }).find((candidate) => candidate.type === "coordinated_position_change");
+
+  assert.ok(event);
+  assert.equal(event.evidence.walletCount, 3);
+  assert.deepEqual(event.evidence.wallets, changedAddresses);
+  const tradeChanges = (event.evidence as unknown as {
+    tradeChanges: Array<{
+      address: string;
+      tradeChangeKind: string;
+      inferenceConfidence: string;
+      reasonCodes: string[];
+      previousSzi: number;
+      currentSzi: number;
+      deltaSzi: number;
+      deltaUsd: number;
+    }>;
+  }).tradeChanges;
+  assert.equal(tradeChanges.length, 3);
+  assert.ok(tradeChanges.every((change) => change.tradeChangeKind === "reduce_short"));
+  assert.ok(tradeChanges.every((change) => change.inferenceConfidence === "medium"));
+  assert.ok(tradeChanges.every((change) => change.reasonCodes.includes("snapshot_net_size_change")));
+  assert.ok(tradeChanges.every((change) => change.previousSzi === -10));
+  assert.ok(tradeChanges.every((change) => change.currentSzi === -8));
+  assert.ok(tradeChanges.every((change) => change.deltaSzi === 2));
+  assert.ok(tradeChanges.every((change) => change.deltaUsd === 1_000_000));
+  assert.ok(tradeChanges.every((change) => change.address !== markOnlyAddress));
+});
+
 test("coordinated HIP-3 events retain the full DEX-qualified market identity", () => {
   const now = Date.UTC(2026, 6, 31, 20);
   const addresses = [
@@ -314,12 +508,18 @@ test("alert drafts are descriptive, address-shortened, and evidence-linked", () 
     policy: PILOT_EVENT_POLICY_V1,
   }).find((candidate) => candidate.type === "unusual_position_change");
   assert.ok(event);
+  assert.equal(
+    (event.evidence as unknown as Record<string, unknown>).detectorVersionKey,
+    PILOT_EVENT_POLICY_V1.version,
+  );
 
   const draft = formatSmartMoneyAlertDraft(event!, evidence({ address, observedAt }));
   assert.match(draft, /DRAFT — HUMAN REVIEW REQUIRED/);
   assert.match(draft, /0x1111…1111/);
   assert.match(draft, /90-day PnL/);
   assert.match(draft, /4\.0-hour paired interval/);
+  assert.match(draft, /likely opened a long between snapshots/i);
+  assert.doesNotMatch(draft, /changed .*net exposure/i);
   assert.match(draft, /https:\/\/app\.hyperliquid\.xyz\/explorer\/address\//);
   assert.match(draft, /not trade advice/i);
   assert.doesNotMatch(draft, /\b(buy|sell)\b/i);
@@ -341,6 +541,14 @@ test("daily digest includes positioning, evidence, funding context, and one SVG 
     verificationUrls: [`https://app.hyperliquid.xyz/explorer/address/${wallets[0].address}`],
     evidence: {
       cohortVersionKey: "cohort-fixture-a",
+      detectorVersionKey: PILOT_EVENT_POLICY_V1.version,
+      tradeChangeKind: "open_long" as const,
+      inferenceConfidence: "medium" as const,
+      reasonCodes: ["snapshot_net_size_change", "flat_to_long_size"] as const,
+      previousSzi: 0,
+      currentSzi: 2,
+      deltaSzi: 2,
+      referenceMarkPrice: 1_000_000,
       previousPositionUsd: 500_000,
       currentPositionUsd: 2_000_000,
       deltaUsd: 1_500_000,
@@ -362,12 +570,138 @@ test("daily digest includes positioning, evidence, funding context, and one SVG 
   assert.match(digest.markdown, /Cohort positioning/);
   assert.match(digest.markdown, /Funding context/);
   assert.match(digest.markdown, /Cohort verification/);
+  assert.match(digest.markdown, /likely opened a long between snapshots/i);
   assert.match(digest.markdown, /0x1111…1111/);
   assert.match(digest.markdown, /https:\/\/app\.hyperliquid\.xyz\/explorer\/address\//);
   assert.match(digest.markdown, /not trade advice/i);
   assert.doesNotMatch(digest.markdown, /\b(buy|sell)\b/i);
   assert.match(digest.chartSvg, /^<svg/);
   assert.equal((digest.chartSvg.match(/data-symbol=/g) ?? []).length, 4);
+});
+
+test("daily digest discloses cohort turnover, mixed-cohort events, and concentrated exposure", () => {
+  const observedAt = Date.UTC(2026, 7, 8, 20);
+  const wallets = [
+    positionSnapshot("0x1111111111111111111111111111111111111111", observedAt, "BTC", 8_000_000),
+    positionSnapshot("0x2222222222222222222222222222222222222222", observedAt, "BTC", 1_000_000),
+    positionSnapshot("0x3333333333333333333333333333333333333333", observedAt, "BTC", -500_000),
+    positionSnapshot("0x4444444444444444444444444444444444444444", observedAt, "ETH", 500_000),
+  ];
+  const priorCohortEvent: SmartMoneyEventCandidate = {
+    fingerprint: "prior-cohort-event",
+    type: "unusual_position_change",
+    observedAt,
+    symbol: "BTC",
+    address: wallets[0].address,
+    vaultAddress: null,
+    verificationUrls: [],
+    evidence: {
+      cohortVersionKey: "cohort-v2",
+      detectorVersionKey: PILOT_EVENT_POLICY_V1.version,
+      tradeChangeKind: "open_long",
+      inferenceConfidence: "medium",
+      reasonCodes: ["snapshot_net_size_change", "flat_to_long_size"],
+      previousSzi: 0,
+      currentSzi: 8,
+      deltaSzi: 8,
+      referenceMarkPrice: 1_000_000,
+      deltaUsd: 8_000_000,
+    },
+  };
+
+  const digest = formatDailySmartMoneyDigest({
+    dateUtc: "2026-08-08",
+    generatedAt: observedAt,
+    currentWallets: wallets,
+    events: [priorCohortEvent],
+    funding: [],
+    cohortContext: {
+      currentVersionKey: "cohort-v3",
+      previousVersionKey: "cohort-v2",
+      currentMembers: 4,
+      previousMembers: 6,
+      entries: 3,
+      stays: 1,
+      exits: 5,
+    },
+    policy: PILOT_EVENT_POLICY_V1,
+  });
+
+  assert.match(digest.markdown, /## Interpretation guards/);
+  assert.match(digest.markdown, /3 entries, 1 retained, and 5 exits/i);
+  assert.match(digest.markdown, /25\.0% of current members carried over/i);
+  assert.match(digest.markdown, /not directly comparable/i);
+  assert.match(digest.markdown, /cohort-v2/);
+  assert.match(digest.markdown, /cohort-v3/);
+  assert.match(digest.markdown, /BTC[^\n]*84\.2%[^\n]*94\.7%/i);
+  assert.match(digest.markdown, /not broad cohort consensus/i);
+});
+
+test("daily digest omits interpretation warnings for a stable diversified cohort", () => {
+  const observedAt = Date.UTC(2026, 7, 8, 20);
+  const wallets = [1, 2, 3, 4].map((index) => positionSnapshot(
+    `0x${String(index).repeat(40)}`,
+    observedAt,
+    "BTC",
+    index % 2 === 0 ? -1_000_000 : 1_000_000,
+  ));
+  const digest = formatDailySmartMoneyDigest({
+    dateUtc: "2026-08-08",
+    generatedAt: observedAt,
+    currentWallets: wallets,
+    events: [],
+    funding: [],
+    cohortContext: {
+      currentVersionKey: "cohort-v3",
+      previousVersionKey: "cohort-v2",
+      currentMembers: 4,
+      previousMembers: 4,
+      entries: 0,
+      stays: 4,
+      exits: 0,
+    },
+    policy: PILOT_EVENT_POLICY_V1,
+  });
+
+  assert.doesNotMatch(digest.markdown, /not directly comparable/i);
+  assert.doesNotMatch(digest.markdown, /not broad cohort consensus/i);
+  assert.doesNotMatch(digest.markdown, /evidence event.*different cohort/i);
+});
+
+test("daily digest does not relabel historical V2 coordinated exposure events as size changes", () => {
+  const observedAt = Date.UTC(2026, 6, 31, 20);
+  const legacyEvent: SmartMoneyEventCandidate = {
+    fingerprint: "legacy-v2-coordinated",
+    type: "coordinated_position_change",
+    observedAt,
+    symbol: "HYPE",
+    address: null,
+    vaultAddress: null,
+    verificationUrls: [],
+    evidence: {
+      cohortVersionKey: "cohort-fixture-a",
+      detectorVersionKey: "smart-money-pilot-events-v2-shadow",
+      walletCount: 3,
+      wallets: [
+        "0x1111111111111111111111111111111111111111",
+        "0x2222222222222222222222222222222222222222",
+        "0x3333333333333333333333333333333333333333",
+      ],
+      deltaUsd: 1_500_000,
+    },
+  };
+
+  const digest = formatDailySmartMoneyDigest({
+    dateUtc: "2026-07-31",
+    generatedAt: observedAt,
+    currentWallets: [],
+    events: [legacyEvent],
+    funding: [],
+    policy: PILOT_EVENT_POLICY_V1,
+  });
+
+  assert.match(digest.markdown, /changed exposure in the same direction/i);
+  assert.doesNotMatch(digest.markdown, /changed actual position sizes/i);
 });
 
 test("weekly honesty report publishes follow-through misses without causal claims", () => {
