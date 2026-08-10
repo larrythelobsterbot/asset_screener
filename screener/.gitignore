@@ -36,6 +36,9 @@ yarn-error.log*
 /data/*.db-journal
 /data/*.db-wal
 /data/*.db-shm
+/data/.smart-money-pilot.lock
+/data/smart-money-drafts/
+/data/smart-money-source-archive/
 
 # typescript
 *.tsbuildinfo

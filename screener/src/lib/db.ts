@@ -34,7 +34,7 @@ export function getDb(): Database.Database {
 // Versioned via PRAGMA user_version so we can add schema changes without
 // blowing away the local file. Bump VERSION and add a step.
 
-const VERSION = 23;
+const VERSION = 24;
 
 function migrate(db: Database.Database): void {
   const current = db.pragma("user_version", { simple: true }) as number;
@@ -68,6 +68,7 @@ function migrate(db: Database.Database): void {
     if (current < 21) db.exec(MIGRATION_V21);
     if (current < 22) db.exec(MIGRATION_V22);
     if (current < 23) db.exec(MIGRATION_V23);
+    if (current < 24) db.exec(MIGRATION_V24);
     db.pragma(`user_version = ${VERSION}`);
   })();
 }
@@ -606,6 +607,196 @@ const MIGRATION_V23 = `
     );
     create index if not exists idx_market_open_oi_outcomes_target
       on market_open_oi_outcomes(horizon, target_at);
+  `;
+
+// V24 — shadow-only Hyperliquid smart-money pilot. Every published claim can
+// be traced to an immutable collection run and normalized source snapshots.
+// Review and delivery are separate: collectors can only create shadow drafts,
+// and a delivery queue cannot be entered until a human marks the item approved.
+const MIGRATION_V24 = `
+    create table if not exists smart_money_cohort_versions (
+      id                 integer primary key autoincrement,
+      version_key        text not null unique,
+      policy_version     text not null,
+      computed_at        integer not null,
+      candidate_count    integer not null check (candidate_count >= 0),
+      eligible_count     integer not null check (eligible_count >= 0),
+      member_count       integer not null check (member_count >= 0),
+      source_url         text not null,
+      source_sha256      text not null check (length(source_sha256) = 64),
+      evidence_json      text not null check (json_valid(evidence_json))
+    );
+
+    create table if not exists smart_money_collection_runs (
+      id                 integer primary key autoincrement,
+      run_key            text not null unique,
+      run_kind           text not null default 'collection' check (run_kind in ('cohort', 'collection')),
+      scheduled_for      integer not null,
+      started_at         integer not null,
+      completed_at       integer,
+      status             text not null check (status in ('running', 'complete', 'partial', 'failed')),
+      cohort_version_id  integer references smart_money_cohort_versions(id),
+      wallet_expected    integer not null default 0 check (wallet_expected >= 0),
+      wallet_succeeded   integer not null default 0 check (wallet_succeeded >= 0),
+      vault_expected     integer not null default 0 check (vault_expected >= 0),
+      vault_succeeded    integer not null default 0 check (vault_succeeded >= 0),
+      source_manifest_json text not null check (json_valid(source_manifest_json)),
+      error              text,
+      created_at         integer not null,
+      updated_at         integer not null,
+      check ((status = 'running' and completed_at is null) or (status != 'running' and completed_at is not null))
+    );
+    create index if not exists idx_smart_money_runs_status
+      on smart_money_collection_runs(status, scheduled_for desc);
+
+    create table if not exists smart_money_cohort_members (
+      cohort_version_id  integer not null references smart_money_cohort_versions(id) on delete cascade,
+      address            text not null,
+      is_member          integer not null check (is_member in (0, 1)),
+      membership_change  text not null check (membership_change in ('entry', 'stay', 'exit', 'ineligible')),
+      score              real,
+      suspected_gaming   integer not null check (suspected_gaming in (0, 1)),
+      exclusion_reasons_json text not null check (json_valid(exclusion_reasons_json)),
+      evidence_json      text not null check (json_valid(evidence_json)),
+      primary key (cohort_version_id, address)
+    );
+    create index if not exists idx_smart_money_members_active
+      on smart_money_cohort_members(cohort_version_id, is_member, score desc);
+
+    create table if not exists smart_money_wallet_performance (
+      collection_run_id  integer not null references smart_money_collection_runs(id) on delete cascade,
+      cohort_version_id  integer not null references smart_money_cohort_versions(id),
+      address            text not null,
+      observed_at        integer not null,
+      track_start_at     integer not null,
+      account_value      real not null check (account_value >= 0),
+      pnl_7d             real not null,
+      pnl_30d            real not null,
+      pnl_90d            real not null,
+      roi_30d            real not null,
+      volume_30d         real not null check (volume_30d >= 0),
+      source_url         text not null,
+      primary key (collection_run_id, address)
+    );
+    create index if not exists idx_smart_money_perf_address
+      on smart_money_wallet_performance(address, observed_at desc);
+
+    -- Wallet heartbeat rows make flat wallets explicit. Position absence in the
+    -- child table therefore means flat only when the heartbeat succeeded.
+    create table if not exists smart_money_wallet_snapshots (
+      collection_run_id  integer not null references smart_money_collection_runs(id) on delete cascade,
+      address            text not null,
+      observed_at        integer not null,
+      account_value      real check (account_value >= 0),
+      status             text not null check (status in ('complete', 'failed')),
+      source_url         text not null,
+      error              text,
+      primary key (collection_run_id, address),
+      check ((status = 'complete' and account_value is not null and error is null)
+        or (status = 'failed' and account_value is null and error is not null))
+    );
+    create index if not exists idx_smart_money_wallet_snapshots_address
+      on smart_money_wallet_snapshots(address, observed_at desc);
+
+    create table if not exists smart_money_wallet_positions (
+      collection_run_id  integer not null,
+      address            text not null,
+      coin               text not null,
+      szi                real not null,
+      position_value     real not null check (position_value >= 0),
+      entry_px           real,
+      unrealized_pnl     real,
+      leverage           real,
+      primary key (collection_run_id, address, coin),
+      foreign key (collection_run_id, address)
+        references smart_money_wallet_snapshots(collection_run_id, address) on delete cascade
+    );
+    create index if not exists idx_smart_money_positions_coin
+      on smart_money_wallet_positions(coin, collection_run_id);
+
+    create table if not exists smart_money_vault_snapshots (
+      collection_run_id  integer not null references smart_money_collection_runs(id) on delete cascade,
+      vault_address      text not null,
+      observed_at        integer not null,
+      name               text not null,
+      leader_address     text,
+      relationship_type  text not null check (relationship_type in ('normal', 'parent', 'child')),
+      tvl                real not null check (tvl >= 0),
+      apr                real,
+      cumulative_pnl     real not null,
+      follower_count     integer check (follower_count is null or follower_count >= 0),
+      is_closed          integer not null check (is_closed in (0, 1)),
+      verification_url   text not null,
+      primary key (collection_run_id, vault_address)
+    );
+    create index if not exists idx_smart_money_vault_address
+      on smart_money_vault_snapshots(vault_address, observed_at desc);
+
+    create table if not exists smart_money_events (
+      id                 integer primary key autoincrement,
+      fingerprint        text not null unique,
+      collection_run_id  integer not null references smart_money_collection_runs(id),
+      event_type         text not null check (event_type in (
+        'cohort_net_flip', 'unusual_position_change',
+        'coordinated_position_change', 'vault_flow_anomaly'
+      )),
+      observed_at        integer not null,
+      symbol             text,
+      address            text,
+      vault_address      text,
+      evidence_json      text not null check (json_valid(evidence_json)),
+      verification_urls_json text not null check (json_valid(verification_urls_json)),
+      draft_text         text not null check (length(draft_text) between 1 and 4096),
+      review_status      text not null default 'draft'
+        check (review_status in ('draft', 'approved', 'rejected', 'expired')),
+      delivery_status    text not null default 'shadow'
+        check (delivery_status in ('shadow', 'pending', 'delivered', 'failed', 'unknown')),
+      created_at         integer not null,
+      updated_at         integer not null,
+      check (delivery_status = 'shadow' or review_status = 'approved')
+    );
+    create index if not exists idx_smart_money_events_review
+      on smart_money_events(review_status, delivery_status, observed_at desc);
+
+    create table if not exists smart_money_event_outcomes (
+      event_id           integer not null references smart_money_events(id) on delete cascade,
+      horizon_hours      integer not null check (horizon_hours > 0),
+      target_at          integer not null,
+      status             text not null check (status in ('observed', 'missing', 'untrackable')),
+      entry_mark         real,
+      outcome_mark       real,
+      return_pct         real,
+      observed_at        integer not null,
+      note               text,
+      primary key (event_id, horizon_hours),
+      check ((status = 'observed' and entry_mark > 0 and outcome_mark > 0 and return_pct is not null)
+        or (status in ('missing', 'untrackable') and entry_mark is null and outcome_mark is null and return_pct is null))
+    );
+
+    create table if not exists smart_money_daily_digests (
+      id                 integer primary key autoincrement,
+      digest_key         text not null unique,
+      period_date        text not null,
+      generated_at       integer not null,
+      cohort_version_id  integer not null references smart_money_cohort_versions(id),
+      markdown_body      text not null,
+      chart_path         text not null,
+      evidence_json      text not null check (json_valid(evidence_json)),
+      review_status      text not null default 'draft'
+        check (review_status in ('draft', 'approved', 'rejected', 'expired'))
+    );
+
+    create table if not exists smart_money_weekly_reports (
+      id                 integer primary key autoincrement,
+      report_key         text not null unique,
+      week_start         text not null,
+      week_end           text not null,
+      generated_at       integer not null,
+      markdown_body      text not null,
+      evidence_json      text not null check (json_valid(evidence_json)),
+      review_status      text not null default 'draft'
+        check (review_status in ('draft', 'approved', 'rejected', 'expired'))
+    );
   `;
 
 const MIGRATION_V11 = `

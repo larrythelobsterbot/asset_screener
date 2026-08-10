@@ -45,5 +45,20 @@ module.exports = {
       cron_restart: "20 0 * * *",
       log_date_format: "YYYY-MM-DD HH:mm:ss",
     },
+    {
+      // Shadow-only smart-money pilot. It writes immutable evidence and
+      // human-review drafts; there is deliberately no Telegram sender here.
+      name: "smart-money-pilot",
+      script: "node_modules/tsx/dist/cli.mjs",
+      args: "scripts/smart-money-pilot.ts run",
+      cwd: __dirname,
+      autorestart: false,
+      cron_restart: "17 */4 * * *",
+      max_memory_restart: "384M",
+      log_date_format: "YYYY-MM-DD HH:mm:ss",
+      env: {
+        NODE_ENV: "production",
+      },
+    },
   ],
 };
