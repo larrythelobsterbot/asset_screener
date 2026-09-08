@@ -9,6 +9,7 @@ import Sparkline from "./Sparkline";
 import RSIGauge from "./RSIGauge";
 import MAGrid from "./MAGrid";
 import { useAttention, attentionTone } from "@/lib/useAttention";
+import type { OiSurgePublicEvent, OiSurgePublicPayload } from "@/lib/oiSurge";
 
 // Dense Bracket-style table view.
 //
@@ -175,6 +176,7 @@ export default function ScreenerTable({
   // symbol so social context is visible while scanning TA columns.
   const { bySymbol: attention } = useAttention();
   const [screenerRows, setScreenerRows] = useState<ScreenerRow[]>([]);
+  const [oiSurgeEvents, setOiSurgeEvents] = useState<OiSurgePublicEvent[]>([]);
   const [screenerLoading, setScreenerLoading] = useState(true);
   const [sortKey, setSortKey] = useState<SortKey>("volume24h");
   const [sortAsc, setSortAsc] = useState(false);
@@ -197,11 +199,34 @@ export default function ScreenerTable({
     return () => { cancelled = true; clearInterval(interval); };
   }, [candleTf]);
 
+  useEffect(() => {
+    let cancelled = false;
+    const fetchOnce = () => fetch("/api/oi-surges?hours=24&limit=200")
+      .then((response) => (response.ok ? response.json() : null))
+      .then((payload: OiSurgePublicPayload | null) => {
+        if (!cancelled && payload?.mode === "shadow" && Array.isArray(payload.events)) {
+          setOiSurgeEvents(payload.events);
+        }
+      })
+      .catch(() => { /* retain the last known shadow evidence */ });
+    fetchOnce();
+    const interval = setInterval(fetchOnce, 60_000);
+    return () => { cancelled = true; clearInterval(interval); };
+  }, []);
+
   const screenerBySymbol = useMemo(() => {
     const m = new Map<string, ScreenerRow>();
     for (const r of screenerRows) m.set(r.symbol, r);
     return m;
   }, [screenerRows]);
+
+  const oiSurgeBySymbol = useMemo(() => {
+    const events = new Map<string, OiSurgePublicEvent>();
+    for (const event of oiSurgeEvents) {
+      if (!events.has(event.symbol)) events.set(event.symbol, event);
+    }
+    return events;
+  }, [oiSurgeEvents]);
 
   const visibleAssets = useMemo(() => {
     let arr = showWatchlistOnly ? assets.filter((a) => watchlist.has(a.symbol)) : assets;
@@ -416,9 +441,9 @@ export default function ScreenerTable({
                 <th className="col-price" style={thRight} {...sortableHeaderProps("change24h")}>24H%{arr("change24h")}</th>
                 <th className="col-price" style={thRight} {...sortableHeaderProps("change7d")}>7D%{arr("change7d")}</th>
                 <th style={thRight} {...sortableHeaderProps("volume24h")}>Vol 24H{arr("volume24h")}</th>
-                <th className="col-positioning" style={thRight} {...sortableHeaderProps("oi_usd")} title="Open interest in USD (HL reports it in coins; this is coins × price).">OI{arr("oi_usd")}</th>
-                <th className="col-positioning" style={thRight} {...sortableHeaderProps("oi_change_24h")} title="Change in USD open interest vs 24h ago. Green = OI grew (new money took positions), red = OI shrank (positions closed). This is money flow, not price direction.">ΔOI 24H{arr("oi_change_24h")}</th>
-                <th className="col-positioning" style={thRight} {...sortableHeaderProps("oi_change_7d")} title="Change in USD open interest vs 7d ago.">ΔOI 7D{arr("oi_change_7d")}</th>
+                <th className="col-positioning" style={thRight} {...sortableHeaderProps("oi_usd")} title="Open interest in USD = canonical contract quantity (coins) × raw quote price. Selected contract identity is shown beside Sym.">OI USD{arr("oi_usd")}</th>
+                <th className="col-positioning" style={thRight} {...sortableHeaderProps("oi_change_24h")} title="Change in USD open interest vs 24h ago. The parenthetical percent is USD OI; the contract quantity delta is available in the detail/radar views.">ΔOI USD 24H{arr("oi_change_24h")}</th>
+                <th className="col-positioning" style={thRight} {...sortableHeaderProps("oi_change_7d")} title="Change in USD open interest vs 7d ago; USD values are separate from contract quantity changes.">ΔOI USD 7D{arr("oi_change_7d")}</th>
                 <th className="col-positioning" style={thRight} {...sortableHeaderProps("vol_oi")} title="24h volume ÷ open interest. <0.5× = parked positions, >2× = actively churned.">Vol/OI{arr("vol_oi")}</th>
                 <th className="col-technical" style={thRight} {...sortableHeaderProps("vol_ratio")}>Vol Ratio{arr("vol_ratio")}</th>
                 <th className="col-positioning" style={thRight} {...sortableHeaderProps("funding_apr")} title="Annualized funding APR, current print. + = longs pay shorts.">Fund APR{arr("funding_apr")}</th>
@@ -445,7 +470,7 @@ export default function ScreenerTable({
                     className={`screener-row${isHidden ? " row-hidden" : ""}`}
                     onClick={() => onSelectAsset(a.symbol)}
                     tabIndex={0}
-                    aria-label={`Open ${a.name} (${a.symbol}) details`}
+                    aria-label={`Open ${a.name} (${a.symbol}${a.contract ? `, ${a.contract.wireCoin}` : ""}) details`}
                     onKeyDown={(event) => {
                       if (
                         event.target === event.currentTarget
@@ -463,6 +488,23 @@ export default function ScreenerTable({
                     </td>
                     <td className="cell-sym sticky-symbol">
                       <span className="sym">{a.symbol}</span>
+                      {a.contract && (
+                        <span className="venue" title={`Selected contract: ${a.contract.wireCoin}; history key: ${a.contract.historyKey}`}>
+                          {a.contract.wireCoin}
+                        </span>
+                      )}
+                      {(() => {
+                        const surge = oiSurgeBySymbol.get(a.symbol);
+                        if (!surge) return null;
+                        return (
+                          <span
+                            className={`oi-surge-chip oi-surge-${surge.severity}`}
+                            title={`${surge.severity} ${surge.primaryHorizon} OI surge (shadow): +${surge.maxOiCoinsChangePct.toFixed(1)}%, ${fmtSignedVol(surge.maxQuantityDeltaUsd)}`}
+                          >
+                            {surge.severity === "extreme" ? "X" : "S"}·{surge.primaryHorizon} C
+                          </span>
+                        );
+                      })()}
                       {(() => {
                         const at = attention.get(a.symbol);
                         // Chip only when the radar classified the symbol —
@@ -659,6 +701,21 @@ export default function ScreenerTable({
         }
         :global(.cell-sym) {
           font-family: var(--font-geist-mono), ui-monospace, monospace;
+        }
+        :global(.oi-surge-chip) {
+          font-size: 8px;
+          line-height: 1.35;
+          padding: 1px 3px;
+          margin-left: 5px;
+          border-radius: 2px;
+          color: var(--acc-warn);
+          border: .5px solid color-mix(in oklab, var(--acc-warn) 52%, transparent);
+          vertical-align: 1px;
+        }
+        :global(.oi-surge-chip.oi-surge-extreme) {
+          color: var(--acc-down);
+          border-color: color-mix(in oklab, var(--acc-down) 58%, transparent);
+          background: color-mix(in oklab, var(--acc-down) 7%, transparent);
         }
         :global(.cell-num) {
           text-align: right;

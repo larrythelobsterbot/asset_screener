@@ -5,9 +5,9 @@ import assert from "node:assert/strict";
 import { getDb } from "../db";
 import { createSmartMoneyPilotStore } from "../smartMoneyPilotStore";
 
-test("migration v25 creates append-only smart-money and funding evidence tables", () => {
+test("migration chain through v28 preserves append-only smart-money and funding evidence tables", () => {
   const db = getDb();
-  assert.equal(db.pragma("user_version", { simple: true }), 25);
+  assert.equal(db.pragma("user_version", { simple: true }), 28);
   const tables = new Set(
     (db.prepare("select name from sqlite_master where type = 'table'").all() as Array<{ name: string }>)
       .map(({ name }) => name),

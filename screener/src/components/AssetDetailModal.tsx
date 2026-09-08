@@ -20,6 +20,7 @@ import type { ScreenerRow } from "@/app/api/screener/route";
 import type { SocialResponse } from "@/app/api/social/trending/route";
 import type { BtcBinaryResponse } from "@/app/api/btc/binary/route";
 import type { TopMentionsRouteResponse } from "@/app/api/social/top-mentions/[symbol]/route";
+import type { MarketContract } from "@/lib/marketContract";
 
 const BUILDER_TICKER_INFO: Record<string, { sector: string; label: string }> = {};
 for (const [key, info] of Object.entries(HL_BUILDER_PERP_MAP)) {
@@ -31,6 +32,13 @@ for (const [key, info] of Object.entries(HL_BUILDER_PERP_MAP)) {
 
 interface AssetDetail {
   symbol: string;
+  marketIdentity: {
+    kind: "spot" | "native-perp" | "builder-perp";
+    dex: string | null;
+    wireCoin: string;
+    historyKey: string;
+  };
+  contract: MarketContract | null;
   candles: Array<{ time: number; open: number; high: number; low: number; close: number; volume: number }>;
   indicators: {
     rsi: (number | null)[];
@@ -54,6 +62,8 @@ interface AssetDetail {
 
 interface Props {
   symbol: string;
+  /** Optional canonical selection; omitted keeps legacy bare-symbol callers working. */
+  contract?: MarketContract | null;
   onClose: () => void;
 }
 
@@ -445,7 +455,7 @@ function TopMentionsList({
 
 // ── Main component ─────────────────────────────────────────────────────
 
-export default function AssetDetailModal({ symbol, onClose }: Props) {
+export default function AssetDetailModal({ symbol, contract, onClose }: Props) {
   const [data, setData] = useState<AssetDetail | null>(null);
   // Attention radar — mention-history sparkline + accel context for the
   // Social section. Zero Elfa cost (SQLite-backed route, 5-min cache).
@@ -476,9 +486,11 @@ export default function AssetDetailModal({ symbol, onClose }: Props) {
     tradeId?: number;
   }>({ status: "idle" });
 
+  const tradeLoggingAllowed = contract?.kind !== "hip3";
+
   const logTrade = useCallback(
     (direction: "long" | "short", mode: "paper" | "live" = "paper") => {
-      if (!data?.stats) return;
+      if (!data?.stats || !tradeLoggingAllowed) return;
       setLogState({ status: "pending" });
       // Minimum-payload approach: send the current snapshot, let the
       // server compute stop/target/size from cached 4h candles. Keeps
@@ -509,7 +521,7 @@ export default function AssetDetailModal({ symbol, onClose }: Props) {
         })
         .catch((e) => setLogState({ status: "err", msg: String(e) }));
     },
-    [data, symbol]
+    [data, symbol, tradeLoggingAllowed]
   );
 
   const fetchData = useCallback(() => {
@@ -521,15 +533,19 @@ export default function AssetDetailModal({ symbol, onClose }: Props) {
     // succession costs at most one upstream call to each backend.
     // The binary fetch is gated on symbol === "BTC" to save a request
     // for every other asset; Promise.resolve(null) for the rest.
-    const isBtc = symbol === "BTC";
+    const isNativeBtc = symbol === "BTC"
+      && (contract == null || (contract.kind === "native" && contract.wireCoin === "BTC"));
+    const detailUrl = `/api/asset/${encodeURIComponent(symbol)}${contract?.wireCoin
+      ? `?wireCoin=${encodeURIComponent(contract.wireCoin)}`
+      : ""}`;
     Promise.all([
-      fetch(`/api/asset/${symbol}`).then((r) => {
+      fetch(detailUrl).then((r) => {
         if (!r.ok) throw new Error(`Failed to load ${symbol}`);
         return r.json();
       }),
       fetch(`/api/screener?tf=1d`).then((r) => r.json()),
       fetch(`/api/social/trending?tf=24h`).then((r) => r.ok ? r.json() : null).catch(() => null),
-      isBtc
+      isNativeBtc
         ? fetch(`/api/btc/binary`).then((r) => r.ok ? r.json() : null).catch(() => null)
         : Promise.resolve(null),
     ])
@@ -537,7 +553,10 @@ export default function AssetDetailModal({ symbol, onClose }: Props) {
         setBinary(bin);
         setData(d);
         if (Array.isArray(rows)) {
-          setScreenerRow(rows.find((r) => r.symbol === symbol) ?? null);
+          // The screener endpoint is keyed by bare ticker and cannot prove a
+          // builder venue. Do not splice native/legacy indicators into an
+          // explicitly qualified alternative-market detail panel.
+          setScreenerRow(contract?.kind === "hip3" ? null : rows.find((r) => r.symbol === symbol) ?? null);
         }
         if (soc && Array.isArray(soc.data)) {
           // Elfa returns rows already sorted desc by current_count, but
@@ -554,7 +573,7 @@ export default function AssetDetailModal({ symbol, onClose }: Props) {
         setLoading(false);
       })
       .catch((e) => { setError(String(e)); setLoading(false); });
-  }, [symbol]);
+  }, [symbol, contract]);
 
   useEffect(() => { fetchData(); }, [fetchData]);
 
@@ -591,8 +610,10 @@ export default function AssetDetailModal({ symbol, onClose }: Props) {
   }, []);
 
   const perpMapping = HL_PERP_SECTOR_MAP[symbol];
-  const builderMapping = BUILDER_TICKER_INFO[symbol];
-  const mapping = perpMapping || builderMapping;
+  const builderMapping = contract?.kind === "hip3"
+    ? HL_BUILDER_PERP_MAP[contract.wireCoin] ?? BUILDER_TICKER_INFO[symbol]
+    : BUILDER_TICKER_INFO[symbol];
+  const mapping = contract?.kind === "hip3" ? builderMapping : perpMapping || builderMapping;
   const sectorColor = mapping ? SECTORS[mapping.sector as keyof typeof SECTORS]?.color || "#64748B" : "#64748B";
   const sectorLabel = mapping ? SECTORS[mapping.sector as keyof typeof SECTORS]?.label || mapping.sector : "Unknown";
   const assetName = mapping ? mapping.label : symbol;
@@ -713,6 +734,9 @@ export default function AssetDetailModal({ symbol, onClose }: Props) {
               </div>
               <div style={{ display: "flex", gap: 10, fontSize: 11, color: "var(--text-mute)", marginTop: 2 }}>
                 <span className="sym" style={{ color: "var(--acc-warn)" }}>{symbol}</span>
+                <span title={data ? `Selected market wire identity; history key: ${data.marketIdentity.historyKey}` : "Selected market wire identity loading"}>
+                  {data?.marketIdentity.wireCoin ?? symbol}
+                </span>
                 <span>{sectorLabel}</span>
               </div>
             </div>
@@ -811,12 +835,12 @@ export default function AssetDetailModal({ symbol, onClose }: Props) {
                   click so it can't be hit by accident. */}
               <section style={{ marginBottom: 24 }}>
                 <div className="br-label" style={{ marginBottom: 10, paddingBottom: 6, borderBottom: ".5px solid var(--border-soft)" }}>
-                  Log Trade · Paper
+                  Log Trade · Paper{!tradeLoggingAllowed ? " · unavailable for qualified HIP-3 selection" : ""}
                 </div>
                 <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
                   <button
                     onClick={() => logTrade("long", "paper")}
-                    disabled={logState.status === "pending" || !data?.stats}
+                    disabled={logState.status === "pending" || !data?.stats || !tradeLoggingAllowed}
                     className="btn-ghost"
                     style={{
                       flex: 1, minWidth: 100,
@@ -833,7 +857,7 @@ export default function AssetDetailModal({ symbol, onClose }: Props) {
                   </button>
                   <button
                     onClick={() => logTrade("short", "paper")}
-                    disabled={logState.status === "pending" || !data?.stats}
+                    disabled={logState.status === "pending" || !data?.stats || !tradeLoggingAllowed}
                     className="btn-ghost"
                     style={{
                       flex: 1, minWidth: 100,
@@ -882,13 +906,13 @@ export default function AssetDetailModal({ symbol, onClose }: Props) {
               {/* Momentum */}
               <section style={{ marginBottom: 24 }}>
                 <div className="br-label" style={{ marginBottom: 10, paddingBottom: 6, borderBottom: ".5px solid var(--border-soft)" }}>
-                  Momentum
+                  Momentum · candle-derived approximations (1H unavailable)
                 </div>
                 <div style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: 6 }}>
-                  <MomentumCell label="1 Hour"  value={momentum.c1}  scale={2} />
-                  <MomentumCell label="4 Hour"  value={momentum.c4}  scale={4} />
-                  <MomentumCell label="24 Hour" value={momentum.c24} scale={8} />
-                  <MomentumCell label="7 Day"   value={momentum.c7d} scale={25} />
+                  <MomentumCell label="1 Hour · unavailable" value={momentum.c1} scale={2} />
+                  <MomentumCell label="4 Hour · candle" value={momentum.c4} scale={4} />
+                  <MomentumCell label="24 Hour · candle" value={momentum.c24} scale={8} />
+                  <MomentumCell label="7 Day · candle" value={momentum.c7d} scale={25} />
                 </div>
               </section>
 
@@ -906,6 +930,10 @@ export default function AssetDetailModal({ symbol, onClose }: Props) {
                   overflow: "hidden",
                 }}>
                   <Stat label="Volume 24H" value={fmtVol(data.stats?.volume24h ?? 0)} />
+                  <Stat
+                    label="OI CONTRACTS"
+                    value={data.stats?.openInterest == null ? "—" : data.stats.openInterest.toLocaleString(undefined, { maximumFractionDigits: 4 })}
+                  />
                   <Stat
                     label="Volume Ratio"
                     value={volRatio == null ? "—" : `${volRatio.toFixed(2)}×`}

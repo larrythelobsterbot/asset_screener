@@ -16,7 +16,22 @@ export type AssetMarketIdentity =
   | (BaseAssetMarketIdentity & { kind: "native-perp"; builderDex: null })
   | (BaseAssetMarketIdentity & { kind: "builder-perp"; builderDex: string });
 
-const ROUTE_SYMBOL_PATTERN = /^[A-Za-z0-9._-]{1,24}$/;
+export const ROUTE_SYMBOL_PATTERN = /^[A-Za-z0-9._-]{1,24}$/;
+const WIRE_COIN_PATTERN = /^([a-z0-9]{1,16}):([A-Za-z0-9._-]{1,24})$/;
+
+function selectedBuilderIdentity(symbol: string, wireCoin: string): AssetMarketIdentity | null {
+  const match = WIRE_COIN_PATTERN.exec(wireCoin);
+  if (!match || match[2] !== symbol || !BUILDER_DEXES.includes(match[1])) return null;
+  // The live universe is authoritative for dynamic builder listings. The
+  // static map is only used for the legacy bare-symbol fallback below.
+  return {
+    kind: "builder-perp",
+    symbol,
+    wireCoin,
+    cacheSymbol: symbol,
+    builderDex: match[1],
+  };
+}
 
 const SPOT_NAME_BY_TICKER = new Map<string, string>();
 for (const [spotName, info] of Object.entries(HL_SPOT_STOCKS)) {
@@ -32,8 +47,26 @@ for (const [spotName, info] of Object.entries(HL_SPOT_STOCKS)) {
  * configured builder DEX. Builder candles keep their local cache under the
  * bare ticker while funding and metadata use the DEX-qualified coin.
  */
-export function resolveAssetMarketIdentity(symbol: string): AssetMarketIdentity | null {
+export function resolveAssetMarketIdentity(symbol: string, selectedWireCoin?: string): AssetMarketIdentity | null {
   if (!ROUTE_SYMBOL_PATTERN.test(symbol)) return null;
+
+  // An explicit wire identity is a selection, not a hint. Validate its
+  // grammar, allowed DEX, and ticker coherence before any upstream request;
+  // the caller must still verify the selected venue's live universe.
+  if (selectedWireCoin !== undefined) {
+    if (selectedWireCoin === symbol) {
+      // Dynamic native listings are validated against native metadata by
+      // the route, just as dynamic builder listings are checked below.
+      return {
+        kind: "native-perp",
+        symbol,
+        wireCoin: symbol,
+        cacheSymbol: symbol,
+        builderDex: null,
+      };
+    }
+    return selectedBuilderIdentity(symbol, selectedWireCoin);
+  }
 
   const spotName = SPOT_NAME_BY_TICKER.get(symbol);
   if (spotName) {

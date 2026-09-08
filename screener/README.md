@@ -30,6 +30,11 @@ In-memory TTL cache for hot reads, with stale-while-revalidate.
 TELEGRAM_BOT_TOKEN=<bot token from @BotFather>
 TELEGRAM_CHAT_ID=<user/group chat id, integer>
 
+# Optional — set exactly to "extreme-pilot" to enable extreme-only OI surge Telegram delivery.
+# Unset, "shadow", and every other value fail closed without external sends.
+# Existing shadow event threads are never backfilled; eligibility starts with events created in pilot mode.
+OI_SURGE_ALERT_MODE=shadow
+
 # Optional — Elfa AI social intelligence (paid; 1000 req/day on free tier)
 # Sign up at dev.elfa.ai
 ELFA_API_KEY=elfak_<token>

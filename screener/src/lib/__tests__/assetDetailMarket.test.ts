@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import {
   fetchAssetDetailMarketData,
   selectAssetPerpContext,
+  assetMarketExistsInLiveUniverse,
   type AssetDetailMarketDependencies,
 } from "../assetDetailMarket";
 import { resolveAssetMarketIdentity } from "../assetMarketIdentity";
@@ -135,16 +136,41 @@ test("native and spot request plans preserve their existing upstream identities"
   assert.deepEqual(builderCalls, []);
 });
 
+test("selected live venue is checked without falling back to an overlapping DEX", () => {
+  const market = resolveAssetMarketIdentity("BABA", "km:BABA");
+  assert.ok(market);
+  assert.equal(assetMarketExistsInLiveUniverse(market, {
+    meta: meta("xyz:BABA"),
+    assetCtxs: [ctx("1")],
+  }, { allowBareBuilderName: false }), false);
+  assert.equal(assetMarketExistsInLiveUniverse(market, {
+    meta: meta("km:BABA"),
+    assetCtxs: [ctx("2")],
+  }), true);
+});
+
+test("qualified selection isolates candle cache identity from legacy bare cache", async () => {
+  const market = resolveAssetMarketIdentity("SKHX", "xyz:SKHX");
+  assert.ok(market);
+  const candleCalls: unknown[][] = [];
+  const data = await fetchAssetDetailMarketData(market, dependencies({
+    getCandles: async (...args) => {
+      candleCalls.push(args);
+      return [candle];
+    },
+  }), { candleCacheSymbol: market.wireCoin });
+  assert.deepEqual(candleCalls, [["xyz:SKHX", "4h", 350, "xyz:SKHX"]]);
+  assert.equal(data.builderData?.meta.universe[1]?.name, "xyz:SKHX");
+});
+
 test("candle, funding, and builder metadata failures retain the route's partial-response policy", async () => {
   const market = resolveAssetMarketIdentity("SKHX");
   assert.ok(market);
-
   const data = await fetchAssetDetailMarketData(market, dependencies({
     getCandles: async () => { throw new Error("candles unavailable"); },
     getFundingHistory: async () => { throw new Error("funding unavailable"); },
     getBuilderDexData: async () => { throw new Error("builder unavailable"); },
   }));
-
   assert.deepEqual(data.candles, []);
   assert.deepEqual(data.funding, []);
   assert.equal(data.builderData, null);

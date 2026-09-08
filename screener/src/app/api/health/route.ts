@@ -11,6 +11,8 @@ import {
   latestBtcBinarySnapshot,
   summarizeTelegramAlerts,
   summarizeMarketOpenOiReports,
+  summarizeOiSurgeDeliveries,
+  summarizeOiSurgeEvents,
 } from "@/lib/db";
 import { getHypePressurePollerStats } from "@/lib/hypePressurePoller";
 import { getBtcBinaryPollerStats } from "@/lib/btcBinaryPoller";
@@ -19,6 +21,8 @@ import { getTelegramStats } from "@/lib/telegram";
 import { getAlertOutcomeTrackerHealth } from "@/lib/alertOutcomeTracker";
 import { getMarketOpenOiSchedulerHealth } from "@/lib/marketOpenOiScheduler";
 import { marketOpenCalendarCoverageAt } from "@/lib/marketOpenOiCalendar";
+import { getOiSurgeSchedulerHealth } from "@/lib/oiSurgeService";
+import { getOiSurgeAlertMode } from "@/lib/oiSurgeDelivery";
 
 // Data-freshness probe for the terminal status bar. A terminal that can
 // silently serve stale data is worse than none — this makes staleness
@@ -53,6 +57,12 @@ export interface HealthResponse {
     ledger: ReturnType<typeof summarizeMarketOpenOiReports>;
     calendarCoverage: ReturnType<typeof marketOpenCalendarCoverageAt>;
   };
+  oiSurges: {
+    alertMode: ReturnType<typeof getOiSurgeAlertMode>;
+    scheduler: ReturnType<typeof getOiSurgeSchedulerHealth>;
+    deliveries24h: ReturnType<typeof summarizeOiSurgeDeliveries>;
+    ledger24h: ReturnType<typeof summarizeOiSurgeEvents>;
+  };
 }
 
 export async function GET() {
@@ -71,8 +81,23 @@ export async function GET() {
   const marketOpenOiDegraded = marketOpenOiScheduler.enabled
     && (marketOpenOiScheduler.lastError != null
       || (marketOpenOiScheduler.lastStartedAt != null && now - marketOpenOiScheduler.lastStartedAt > 5 * 60_000));
+  const oiSurgeScheduler = getOiSurgeSchedulerHealth();
+  const oiSurgeAlertMode = getOiSurgeAlertMode();
+  const oiSurgeDeliveries24h = summarizeOiSurgeDeliveries(now - 24 * 60 * 60_000);
+  const telegramStats = getTelegramStats();
+  const oiSurgeSchedulerDegraded = oiSurgeScheduler.lastStartedAt != null
+    && (oiSurgeScheduler.lastError != null
+      || now - oiSurgeScheduler.lastStartedAt > 5 * 60_000
+      || (oiSurgeScheduler.lastReport?.scan.errors ?? 0) > 0
+      || (oiSurgeScheduler.lastReport?.outcomes.errors ?? 0) > 0
+      || (oiSurgeScheduler.lastReport?.delivery.errors ?? 0) > 0);
+  const oiSurgeDeliveryDegraded = oiSurgeAlertMode === "extreme-pilot"
+    && (!telegramStats.configured
+      || oiSurgeDeliveries24h.failed > 0
+      || oiSurgeDeliveries24h.unknown > 0);
+  const oiSurgeDegraded = oiSurgeSchedulerDegraded || oiSurgeDeliveryDegraded;
   const body: HealthResponse = {
-    status: evaluator.stale || marketOpenOiDegraded ? "degraded" : "ok",
+    status: evaluator.stale || marketOpenOiDegraded || oiSurgeDegraded ? "degraded" : "ok",
     now,
     hlWs: {
       connected: hl.connected,
@@ -93,7 +118,7 @@ export async function GET() {
       wallet: getWalletPollerStats(),
     },
     alerts: {
-      telegramProcess: getTelegramStats(),
+      telegramProcess: telegramStats,
       ledger: summarizeTelegramAlerts(),
       evaluator,
     },
@@ -101,6 +126,12 @@ export async function GET() {
       scheduler: marketOpenOiScheduler,
       ledger: summarizeMarketOpenOiReports(),
       calendarCoverage: marketOpenCalendarCoverageAt(now),
+    },
+    oiSurges: {
+      alertMode: oiSurgeAlertMode,
+      scheduler: oiSurgeScheduler,
+      deliveries24h: oiSurgeDeliveries24h,
+      ledger24h: summarizeOiSurgeEvents(now - 24 * 60 * 60_000),
     },
   };
   return NextResponse.json(body, {

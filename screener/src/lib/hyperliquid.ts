@@ -2,6 +2,9 @@ import { cache } from "./cache";
 import { upsertCandles, getCandlesFromCache, type CandleRow } from "./db";
 import { fetchWithTimeout } from "./fetchWithTimeout";
 import { BUILDER_DEXES } from "@/config/sectors";
+// Preserve the historical Hyperliquid exports while keeping the pure price
+// scale implementation out of this server-only module.
+export { PRICE_DISPLAY_SCALE, displayScaleOf, rawPriceOf } from "./priceScale";
 
 const HL_API = "https://api.hyperliquid.xyz/info";
 
@@ -22,17 +25,8 @@ const HL_API = "https://api.hyperliquid.xyz/info";
 // markPx against a stored snapshot mark for SPX yields a ~-99.99% delta.
 //
 // Keyed by HL symbol; absent => scale 1 (the overwhelmingly common case).
-export const PRICE_DISPLAY_SCALE: Record<string, number> = { SPX: 20000 };
-
-export function displayScaleOf(symbol: string): number {
-  return PRICE_DISPLAY_SCALE[symbol] ?? 1;
-}
-
-// The price in HL's own quote units — what a coin-denominated size must be
-// multiplied by to get USD. Takes a DISPLAY price (live or historical).
-export function rawPriceOf(symbol: string, displayPrice: number): number {
-  return displayPrice / displayScaleOf(symbol);
-}
+// The scale helpers are imported/re-exported above so existing server callers
+// keep their API without making client components import this module.
 
 // ── Token-bucket rate limiter ────────────────────────────────────────────
 // Hyperliquid's published limit is ~1200 req/min per IP on the /info endpoint.

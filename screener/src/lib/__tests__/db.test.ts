@@ -553,7 +553,7 @@ test("telegram alert ledger persists lifecycle, outcomes, reads, and indexed mig
   assert.equal(summarizeTelegramAlerts({ symbol: "LEDGERSYM" }).target, 1);
   const indexes = getDb().prepare(`select name from sqlite_master where type = 'index'`).all() as Array<{ name: string }>;
   const names = new Set(indexes.map((row) => row.name));
-  assert.equal(getDb().pragma("user_version", { simple: true }), 25);
+  assert.equal(getDb().pragma("user_version", { simple: true }), 28);
   assert.ok(names.has("idx_telegram_alerts_delivery"));
   assert.ok(names.has("idx_telegram_alerts_outcome"));
   assert.ok(names.has("idx_telegram_alerts_symbol_created"));
@@ -567,6 +567,7 @@ test("telegram alert ledger persists lifecycle, outcomes, reads, and indexed mig
   assert.ok(names.has("uq_market_open_oi_message_id"));
   assert.ok(names.has("idx_market_open_oi_reports_delivery"));
   assert.ok(names.has("idx_market_open_oi_outcomes_target"));
+  assert.ok(names.has("idx_oi_surge_deliveries_status"));
   const candidateColumns = getDb().prepare(`pragma table_info(alert_candidates)`).all() as Array<{ name: string }>;
   assert.ok(candidateColumns.some((column) => column.name === "shadow_policy_json"));
 });
