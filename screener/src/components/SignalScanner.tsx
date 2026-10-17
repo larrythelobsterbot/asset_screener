@@ -30,11 +30,11 @@ export default function SignalScanner({
     <div className="bg-surface/50 rounded-xl border border-white/5 overflow-hidden">
       <div className="flex items-center justify-between px-4 py-3 border-b border-white/5">
         <div className="flex items-center gap-2">
-          <div className="w-2 h-2 rounded-full bg-positive animate-pulse" />
+          <div className="w-2 h-2 rounded-full bg-gray-500" title="Cached signal view — see snapshot availability above" />
           <span className="text-xs font-semibold uppercase tracking-wider text-gray-300">
             Signal Scanner
           </span>
-          <span className="text-[10px] font-mono text-gray-600 bg-gray-800/50 px-1.5 py-0.5 rounded">
+          <span className="text-[10px] font-mono text-gray-600 bg-gray-800/50 px-1.5 py-0.5 rounded" title="Cached rows matching this view, not scan coverage">
             {visibleSignals.length}
           </span>
         </div>
@@ -70,7 +70,7 @@ export default function SignalScanner({
       <div className="p-3">
         {loading ? (
           <div className="text-center py-8 text-gray-600 text-sm">
-            Scanning for signals...
+            Loading cached signals...
           </div>
         ) : view === "feed" ? (
           <SignalFeed signals={visibleSignals} onSelectAsset={onSelectAsset} />

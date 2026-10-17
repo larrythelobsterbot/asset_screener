@@ -9,6 +9,7 @@ import ScreenerTable from "@/components/ScreenerTable";
 import IdeasView from "@/components/IdeasView";
 import RotationView from "@/components/RotationView";
 import SignalScanner from "@/components/SignalScanner";
+import SignalSnapshotStatus from "@/components/SignalSnapshotStatus";
 import AttentionPanel from "@/components/AttentionPanel";
 import AssetDetailModal from "@/components/AssetDetailModal";
 import { FilterPanel } from "@/components/FilterPanel";
@@ -27,7 +28,7 @@ import type { MarketContract } from "@/lib/marketContract";
 import type { Signal } from "@/lib/signals";
 import { createLatestRequestGate, parseMarketPayload } from "@/lib/marketPolling";
 import { readStorage, writeStorage } from "@/lib/safeStorage";
-import { parseSignalSnapshot } from "@/lib/signalSnapshot";
+import { parseSignalSnapshotResponse, type SignalSnapshotRead } from "@/lib/signalSnapshotDisplay";
 
 type View = "ideas" | "heatmap" | "table" | "rotation";
 type SelectedAsset = { symbol: string; contract?: MarketContract | null };
@@ -72,6 +73,8 @@ export default function Home() {
   const [isLoading, setIsLoading] = useState(true);
   const [signals, setSignals] = useState<Signal[]>([]);
   const [signalsLoading, setSignalsLoading] = useState(true);
+  const [signalSnapshot, setSignalSnapshot] = useState<SignalSnapshotRead>({ signals: [], generatedAt: null, stale: null, malformedRows: 0 });
+  const [signalSnapshotError, setSignalSnapshotError] = useState<string | null>(null);
   // Track the most recent fetch outcome so the UI can distinguish
   // "no data" (initial load) from "backend down" (existing data is
   // stale because /api/markets failed). For a financial dashboard
@@ -128,32 +131,48 @@ export default function Home() {
   }, []);
 
   // One shared, cache-only signal snapshot feeds Ideas and the legacy scanner.
-  // Server instrumentation owns /api/signals refreshes; opening this page must
-  // never initiate persistence or Telegram work.
+  // Server instrumentation owns refreshes; this page only presents cached evidence.
   useEffect(() => {
     const gate = createLatestRequestGate();
+    let controller: AbortController | null = null;
 
     async function loadSignals() {
+      controller?.abort();
+      controller = new AbortController();
       const requestId = gate.start();
       try {
-        const response = await fetch("/api/signals/snapshot", { cache: "no-store" });
+        const response = await fetch("/api/signals/snapshot", { cache: "no-store", signal: controller.signal });
         if (!gate.isCurrent(requestId)) return;
         if (!response.ok) throw new Error(`HTTP ${response.status}`);
-        const data = parseSignalSnapshot(await response.json());
-        if (gate.isCurrent(requestId)) setSignals(data);
-      } catch {
-        // Preserve the last successful signal snapshot. Market freshness is
-        // surfaced separately and a missing signal feed renders honestly as
-        // no current signal evidence rather than fabricating a state.
+        const body = await response.json();
+        const read = parseSignalSnapshotResponse(body, response.headers, Date.now(), performance.now());
+        if (gate.isCurrent(requestId)) {
+          setSignals(read.signals);
+          setSignalSnapshot(read);
+          setSignalSnapshotError(null);
+        }
+      } catch (error) {
+        if (gate.isCurrent(requestId)) {
+          setSignalSnapshotError(error instanceof Error ? error.message : String(error));
+        }
       } finally {
         if (gate.isCurrent(requestId)) setSignalsLoading(false);
       }
     }
     loadSignals();
+    const onResume = () => {
+      if (document.visibilityState !== "visible") return;
+      void loadSignals();
+    };
     const id = setInterval(loadSignals, 30_000);
+    document.addEventListener("visibilitychange", onResume);
+    window.addEventListener("focus", onResume);
     return () => {
       gate.close();
+      controller?.abort();
       clearInterval(id);
+      document.removeEventListener("visibilitychange", onResume);
+      window.removeEventListener("focus", onResume);
     };
   }, []);
 
@@ -404,6 +423,8 @@ export default function Home() {
         onClear={clearFilters}
         onOpen={() => setFilterPanelOpen(true)}
       />
+
+      <SignalSnapshotStatus read={signalSnapshot} error={signalSnapshotError} />
 
       {/* ── Main surface ────────────────────────────────────── */}
       {view === "ideas" ? (
