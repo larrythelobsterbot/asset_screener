@@ -7,7 +7,9 @@ import TimeframeToggle, { Timeframe } from "@/components/TimeframeToggle";
 import Heatmap from "@/components/Heatmap";
 import ScreenerTable from "@/components/ScreenerTable";
 import IdeasView from "@/components/IdeasView";
+import RotationView from "@/components/RotationView";
 import SignalScanner from "@/components/SignalScanner";
+import SignalSnapshotStatus from "@/components/SignalSnapshotStatus";
 import AttentionPanel from "@/components/AttentionPanel";
 import AssetDetailModal from "@/components/AssetDetailModal";
 import { FilterPanel } from "@/components/FilterPanel";
@@ -22,17 +24,19 @@ import {
   type FilterKey,
 } from "@/lib/useFilters";
 import { AssetData } from "@/lib/types";
+import type { MarketContract } from "@/lib/marketContract";
 import type { Signal } from "@/lib/signals";
 import { createLatestRequestGate, parseMarketPayload } from "@/lib/marketPolling";
 import { readStorage, writeStorage } from "@/lib/safeStorage";
-import { parseSignalSnapshot } from "@/lib/signalSnapshot";
+import { parseSignalSnapshotResponse, type SignalSnapshotRead } from "@/lib/signalSnapshotDisplay";
 
-type View = "ideas" | "heatmap" | "table";
+type View = "ideas" | "heatmap" | "table" | "rotation";
+type SelectedAsset = { symbol: string; contract?: MarketContract | null };
 const VIEW_STORAGE_KEY = "asset-screener-view";
 
 export default function Home() {
   const [timeframe, setTimeframe] = useState<Timeframe>("24h");
-  const [selectedAsset, setSelectedAsset] = useState<string | null>(null);
+  const [selectedAsset, setSelectedAsset] = useState<SelectedAsset | null>(null);
   const [showWatchlist, setShowWatchlist] = useState(false);
   const { watchlist, toggle, count } = useWatchlist();
   const { hidden, toggle: toggleHide, count: hiddenCount } = useHidelist();
@@ -43,7 +47,7 @@ export default function Home() {
   useEffect(() => {
     if (typeof window === "undefined") return;
     const stored = readStorage(() => window.localStorage, VIEW_STORAGE_KEY);
-    if (stored === "ideas" || stored === "table" || stored === "heatmap") setView(stored);
+    if (stored === "ideas" || stored === "table" || stored === "heatmap" || stored === "rotation") setView(stored);
   }, []);
   function changeView(next: View) {
     setView(next);
@@ -56,9 +60,21 @@ export default function Home() {
   const [filterPanelOpen, setFilterPanelOpen] = useState(false);
 
   const [allAssets, setAllAssets] = useState<AssetData[]>([]);
+  function inspectAsset(symbol: string, contract?: MarketContract | null) {
+    const existing = allAssets.find((asset) => asset.symbol === symbol);
+    setSelectedAsset({
+      symbol,
+      // Existing table/heatmap callbacks only provide a symbol. Preserve the
+      // current AssetData contract when available, while Rotation supplies
+      // its canonical row contract explicitly.
+      contract: contract === undefined ? existing?.contract ?? null : contract,
+    });
+  }
   const [isLoading, setIsLoading] = useState(true);
   const [signals, setSignals] = useState<Signal[]>([]);
   const [signalsLoading, setSignalsLoading] = useState(true);
+  const [signalSnapshot, setSignalSnapshot] = useState<SignalSnapshotRead>({ signals: [], generatedAt: null, stale: null, malformedRows: 0 });
+  const [signalSnapshotError, setSignalSnapshotError] = useState<string | null>(null);
   // Track the most recent fetch outcome so the UI can distinguish
   // "no data" (initial load) from "backend down" (existing data is
   // stale because /api/markets failed). For a financial dashboard
@@ -67,6 +83,8 @@ export default function Home() {
   // user something is wrong.
   const [marketsError, setMarketsError] = useState<string | null>(null);
   const [marketsStale, setMarketsStale] = useState(false);
+  const [marketsPartial, setMarketsPartial] = useState(false);
+  const [marketsFailedSources, setMarketsFailedSources] = useState<string[]>([]);
   const [lastFetchAt, setLastFetchAt] = useState<number | null>(null);
 
   useEffect(() => {
@@ -84,10 +102,17 @@ export default function Home() {
         const data = parseMarketPayload(await res.json());
         if (!gate.isCurrent(requestId)) return;
         const stale = res.headers.get("X-Data-Stale") === "true";
+        const partial = res.headers.get("X-Data-Partial") === "true";
+        const failedSources = [...new Set([
+          ...(res.headers.get("X-Data-Failed-Sources") ?? "").split(","),
+          ...(res.headers.get("X-Data-Stale-Sources") ?? "").split(","),
+        ].map((source) => source.trim()).filter(Boolean))];
         const generatedAt = Number(res.headers.get("X-Data-Generated-At"));
         setAllAssets(data);
         setMarketsError(null);
         setMarketsStale(stale);
+        setMarketsPartial(partial);
+        setMarketsFailedSources(failedSources);
         setLastFetchAt(Number.isFinite(generatedAt) && generatedAt > 0 ? generatedAt : Date.now());
       } catch (err) {
         if (gate.isCurrent(requestId)) {
@@ -106,32 +131,48 @@ export default function Home() {
   }, []);
 
   // One shared, cache-only signal snapshot feeds Ideas and the legacy scanner.
-  // Server instrumentation owns /api/signals refreshes; opening this page must
-  // never initiate persistence or Telegram work.
+  // Server instrumentation owns refreshes; this page only presents cached evidence.
   useEffect(() => {
     const gate = createLatestRequestGate();
+    let controller: AbortController | null = null;
 
     async function loadSignals() {
+      controller?.abort();
+      controller = new AbortController();
       const requestId = gate.start();
       try {
-        const response = await fetch("/api/signals/snapshot", { cache: "no-store" });
+        const response = await fetch("/api/signals/snapshot", { cache: "no-store", signal: controller.signal });
         if (!gate.isCurrent(requestId)) return;
         if (!response.ok) throw new Error(`HTTP ${response.status}`);
-        const data = parseSignalSnapshot(await response.json());
-        if (gate.isCurrent(requestId)) setSignals(data);
-      } catch {
-        // Preserve the last successful signal snapshot. Market freshness is
-        // surfaced separately and a missing signal feed renders honestly as
-        // no current signal evidence rather than fabricating a state.
+        const body = await response.json();
+        const read = parseSignalSnapshotResponse(body, response.headers, Date.now(), performance.now());
+        if (gate.isCurrent(requestId)) {
+          setSignals(read.signals);
+          setSignalSnapshot(read);
+          setSignalSnapshotError(null);
+        }
+      } catch (error) {
+        if (gate.isCurrent(requestId)) {
+          setSignalSnapshotError(error instanceof Error ? error.message : String(error));
+        }
       } finally {
         if (gate.isCurrent(requestId)) setSignalsLoading(false);
       }
     }
     loadSignals();
+    const onResume = () => {
+      if (document.visibilityState !== "visible") return;
+      void loadSignals();
+    };
     const id = setInterval(loadSignals, 30_000);
+    document.addEventListener("visibilitychange", onResume);
+    window.addEventListener("focus", onResume);
     return () => {
       gate.close();
+      controller?.abort();
       clearInterval(id);
+      document.removeEventListener("visibilitychange", onResume);
+      window.removeEventListener("focus", onResume);
     };
   }, []);
 
@@ -184,7 +225,7 @@ export default function Home() {
           attention movers. The full HypePressureCard lives on /terminal;
           here it's compressed into an inline chip so nothing floats. */}
       <MacroBar>
-        <ContextChips onSelectAsset={setSelectedAsset} />
+        <ContextChips onSelectAsset={inspectAsset} />
       </MacroBar>
 
       {/* Backend health banner — only renders when /api/markets has
@@ -193,7 +234,7 @@ export default function Home() {
           users can still see prices, but the banner makes clear the
           numbers may be stale. Mustard-bordered to be visible
           without competing with the trade-action colors (green/red). */}
-      {(marketsError || marketsStale) && (
+      {(marketsError || marketsStale || marketsPartial) && (
         <div
           role="alert"
           style={{
@@ -214,9 +255,11 @@ export default function Home() {
           <span>
             {allAssets.length === 0
               ? "Unable to load market data"
-              : marketsStale && !marketsError
-                ? "Upstream refresh failed — showing last known data"
-                : "Backend unreachable — showing last known data"}
+              : marketsPartial
+                ? `Partial market data — failed/stale sources: ${marketsFailedSources.join(", ") || "source timestamp unavailable"}`
+                : marketsStale && !marketsError
+                  ? "Upstream refresh failed — showing last known data"
+                  : "Backend unreachable — showing last known data"}
             {lastFetchAt ? ` (${Math.round((Date.now() - lastFetchAt) / 1000)}s old)` : ""}
           </span>
           {marketsError && (
@@ -270,6 +313,9 @@ export default function Home() {
             </button>
             <button aria-pressed={view === "table"} onClick={() => changeView("table")} className={view === "table" ? "on" : ""}>
               Data
+            </button>
+            <button aria-pressed={view === "rotation"} onClick={() => changeView("rotation")} className={view === "rotation" ? "on" : ""}>
+              Rotation
             </button>
           </div>
 
@@ -378,6 +424,8 @@ export default function Home() {
         onOpen={() => setFilterPanelOpen(true)}
       />
 
+      <SignalSnapshotStatus read={signalSnapshot} error={signalSnapshotError} />
+
       {/* ── Main surface ────────────────────────────────────── */}
       {view === "ideas" ? (
         <IdeasView
@@ -387,14 +435,22 @@ export default function Home() {
           timeframe={timeframe}
           watchlist={watchlist}
           onToggleWatch={toggle}
-          onInspectAsset={setSelectedAsset}
+          onInspectAsset={inspectAsset}
+        />
+      ) : view === "rotation" ? (
+        <RotationView
+          allowedSymbols={passingSymbols}
+          searchQuery={searchQuery}
+          watchlist={watchlist}
+          showWatchlist={showWatchlist}
+          onInspectAsset={inspectAsset}
         />
       ) : view === "heatmap" ? (
         <Heatmap
           assets={filteredAssets}
           isLoading={isLoading}
           timeframe={timeframe}
-          onSelectAsset={setSelectedAsset}
+          onSelectAsset={inspectAsset}
           showWatchlistOnly={showWatchlist}
           watchlist={watchlist}
           onToggleWatch={toggle}
@@ -407,7 +463,7 @@ export default function Home() {
           assets={filteredAssets}
           isLoading={isLoading}
           timeframe={timeframe}
-          onSelectAsset={setSelectedAsset}
+          onSelectAsset={inspectAsset}
           showWatchlistOnly={showWatchlist}
           watchlist={watchlist}
           onToggleWatch={toggle}
@@ -420,21 +476,22 @@ export default function Home() {
       {/* Bottom row: confirmation (signals) beside discovery (attention).
           Two-column on wide screens — the scanner needs the width for its
           table view; the radar is a fixed-rhythm list. Stacks on narrow. */}
-      {view !== "ideas" && (
+      {view !== "ideas" && view !== "rotation" && (
         <div className="bottom-grid">
           <SignalScanner
-            onSelectAsset={setSelectedAsset}
+            onSelectAsset={inspectAsset}
             allowedSymbols={passingSymbols}
             signals={signals}
             loading={signalsLoading}
           />
-          <AttentionPanel onSelectAsset={setSelectedAsset} />
+          <AttentionPanel onSelectAsset={inspectAsset} />
         </div>
       )}
 
       {selectedAsset && (
         <AssetDetailModal
-          symbol={selectedAsset}
+          symbol={selectedAsset.symbol}
+          contract={selectedAsset.contract}
           onClose={() => setSelectedAsset(null)}
         />
       )}

@@ -2,8 +2,11 @@ import { NextResponse } from "next/server";
 import { getMetaAndCtxs, getBuilderDexData, displayScaleOf, rawPriceOf } from "@/lib/hyperliquid";
 import { getMarkets } from "@/lib/coingecko";
 import { HL_PERP_SECTOR_MAP, HL_BUILDER_PERP_MAP, BUILDER_DEXES, SECTORS, Sector } from "@/config/sectors";
-import { AssetData } from "@/lib/types";
+import { AssetData, PositioningMetadata } from "@/lib/types";
+import { marketContract } from "@/lib/marketContract";
+import { derivePositioningObservation } from "@/lib/positioningMetrics";
 import { cache } from "@/lib/cache";
+import { loadObservedSource, sourceAgeMs as observationAgeMs } from "@/lib/sourceObservation";
 import {
   insertPriceSnapshots,
   startPruneJob,
@@ -36,20 +39,82 @@ function ensureMarketsRuntime() {
 export const dynamic = "force-dynamic";
 
 const MARKETS_CACHE_KEY = "api:markets";
+const MARKETS_METADATA_CACHE_KEY = "api:markets:metadata";
 const MARKETS_MAX_STALE_MS = 10 * 60_000;
+const MARKET_SOURCE_MAX_AGE_MS = 2 * 60_000;
 const DEDUP_LOG_INTERVAL_MS = 60 * 60_000;
 let lastDedupSignature: string | null = null;
 let lastDedupLoggedAt = 0;
 
-function marketsResponse(data: AssetData[], stale: boolean) {
+function positioningMetadata(observation: ReturnType<typeof derivePositioningObservation>): PositioningMetadata {
+  return {
+    status: observation.status,
+    currentTs: observation.currentTs,
+    priorTs: observation.priorTs,
+    historicalAgeMs: observation.historicalAgeMs,
+    source: "price_snapshots",
+  };
+}
+
+function priorFor(
+  current: AssetData,
+  prior: { mark: number; oi: number | null; ts: number } | undefined,
+  snapshotTs: number,
+  horizonMs: number,
+  toleranceMs: number,
+) {
+  return derivePositioningObservation({
+    symbol: current.symbol,
+    horizonMs,
+    toleranceMs,
+    displayScale: displayScaleOf(current.symbol),
+    current: { ts: snapshotTs, mark: current.price, oiCoins: current.openInterest },
+    prior: prior ? { ts: prior.ts, mark: prior.mark, oiCoins: prior.oi } : null,
+    now: snapshotTs,
+    currentMaxAgeMs: 0,
+  });
+}
+
+type MarketsSourceMetadata = {
+  generatedAt: number;
+  sourceObservedAt: number | null;
+  partial: boolean;
+  failedSources: string[];
+  staleSources: string[];
+};
+
+async function loadNativeMarketsSource() {
+  return loadObservedSource("hl:metaAndCtxs", getMetaAndCtxs, MARKETS_MAX_STALE_MS);
+}
+
+async function loadBuilderMarketsSource(dex: string) {
+  const key = `hl:builderDex:${dex}`;
+  try {
+    return await loadObservedSource(key, () => getBuilderDexData(dex), MARKETS_MAX_STALE_MS);
+  } catch {
+    return { data: null, observedAt: null, failed: true, stale: false };
+  }
+}
+
+function marketsResponse(data: AssetData[], stale: boolean, metadata?: MarketsSourceMetadata) {
   const info = cache.getInfo<AssetData[]>(MARKETS_CACHE_KEY);
+  const source = metadata ?? cache.get<MarketsSourceMetadata>(MARKETS_METADATA_CACHE_KEY);
+  const sourceAgeMs = observationAgeMs(source?.sourceObservedAt);
+  const sourceStale = sourceAgeMs == null || sourceAgeMs > MARKET_SOURCE_MAX_AGE_MS;
+  const partial = Boolean(source?.partial) || sourceStale;
+  const failedSources = source?.failedSources ?? [];
+  const staleSources = source?.staleSources ?? [];
   return NextResponse.json(data, {
     headers: {
       "Cache-Control": "no-store, no-cache, must-revalidate",
       "CDN-Cache-Control": "no-store",
       "X-Data-Age-Ms": String(info?.ageMs ?? 0),
       "X-Data-Generated-At": String(info?.createdAt ?? Date.now()),
-      "X-Data-Stale": String(stale),
+      "X-Data-Stale": String(stale || sourceStale || staleSources.length > 0),
+      "X-Data-Partial": String(partial),
+      "X-Data-Failed-Sources": failedSources.join(","),
+      "X-Data-Stale-Sources": staleSources.join(","),
+      "X-Data-Source-Age-Ms": String(sourceAgeMs ?? ""),
     },
   });
 }
@@ -61,11 +126,39 @@ export async function GET() {
     const cached = cache.get<AssetData[]>(MARKETS_CACHE_KEY);
     if (cached) return marketsResponse(cached, false);
 
-    const [hlData, cgData, ...builderDexResults] = await Promise.all([
-      getMetaAndCtxs(),
-      getMarkets(),
-      ...BUILDER_DEXES.map((dex) => getBuilderDexData(dex).catch(() => null)),
+    const [nativeSource, cgSource, ...builderSources] = await Promise.all([
+      loadNativeMarketsSource(),
+      loadObservedSource("cg:markets", getMarkets, MARKETS_MAX_STALE_MS).catch(() => null),
+      ...BUILDER_DEXES.map((dex) => loadBuilderMarketsSource(dex)),
     ]);
+    const cgData = cgSource?.data ?? [];
+    const failedSources = new Set<string>();
+    const staleSources = new Set<string>();
+    if (nativeSource.failed) failedSources.add("hyperliquid");
+    if (nativeSource.stale) staleSources.add("hyperliquid");
+    if (!cgSource || cgData.length === 0 || cgSource.failed) failedSources.add("coingecko");
+    if (cgSource?.stale) staleSources.add("coingecko");
+    builderSources.forEach((source, index) => {
+      const name = `builder:${BUILDER_DEXES[index]}`;
+      if (source.failed) failedSources.add(name);
+      if (source.stale) staleSources.add(name);
+    });
+    const includedSourceTimes: Array<number | null> = [nativeSource.observedAt];
+    if (cgData.length > 0) includedSourceTimes.push(cgSource?.observedAt ?? null);
+    builderSources.forEach((source) => {
+      if (source.data) includedSourceTimes.push(source.observedAt);
+    });
+    const sourceObservedAt = includedSourceTimes.length > 0
+      && includedSourceTimes.every((value): value is number => typeof value === "number" && Number.isFinite(value))
+      ? Math.min(...includedSourceTimes)
+      : null;
+    const sourceMetadata: MarketsSourceMetadata = {
+      generatedAt: Date.now(),
+      sourceObservedAt,
+      partial: failedSources.size > 0 || staleSources.size > 0 || sourceObservedAt == null,
+      failedSources: [...failedSources],
+      staleSources: [...staleSources],
+    };
 
     const assets: AssetData[] = [];
     // Time-series snapshot rows accumulated alongside the response shape.
@@ -76,7 +169,7 @@ export async function GET() {
     const snapshotRows: PriceSnapshotRow[] = [];
 
     // ALL Hyperliquid perps — use sector map if available, otherwise auto-classify
-    const { meta, assetCtxs } = hlData;
+    const { meta, assetCtxs } = nativeSource.data;
     for (let i = 0; i < meta.universe.length; i++) {
       const name = meta.universe[i].name;
       const ctx = assetCtxs[i];
@@ -136,6 +229,7 @@ export async function GET() {
         markPrice: price,
         oraclePrice: parseFloat(ctx.oraclePx || "0"),
         source: "hyperliquid",
+        contract: marketContract(name),
         // Flow metrics are filled by the backfill pass below.
         oiUsd: null,
         oiChange24hUsd: null,
@@ -165,7 +259,7 @@ export async function GET() {
     const dedupConflicts: Array<{ ticker: string; loserDex: string; winnerSource: string }> = [];
     for (let di = 0; di < BUILDER_DEXES.length; di++) {
       const dex = BUILDER_DEXES[di];
-      const dexData = builderDexResults[di];
+      const dexData = builderSources[di]?.data;
       if (!dexData) continue;
 
       const { meta: dexMeta, assetCtxs: dexCtxs } = dexData;
@@ -227,6 +321,7 @@ export async function GET() {
           markPrice: price,
           oraclePrice: parseFloat(ctx.oraclePx || "0"),
           source: "hyperliquid",
+          contract: marketContract(ticker, dex),
           // Flow metrics are filled by the backfill pass below.
           oiUsd: null,
           oiChange24hUsd: null,
@@ -295,6 +390,7 @@ export async function GET() {
         markPrice: null,
         oraclePrice: null,
         source: "coingecko",
+        contract: null,
         // CoinGecko rows have no perp context — no OI, no funding. These
         // stay null permanently; the UI renders them as em-dashes.
         oiUsd: null,
@@ -416,11 +512,33 @@ export async function GET() {
           a[pctKey] = ((oiUsd - priorOiUsd) / priorOiUsd) * 100;
         }
       }
+      a.oiCoins = a.openInterest;
+      const observation24h = priorFor(
+        a,
+        full24h.get(a.symbol),
+        snapshotTs,
+        24 * 3_600_000,
+        2 * 3_600_000,
+      );
+      const observation7d = priorFor(
+        a,
+        prior7d,
+        snapshotTs,
+        7 * 86_400_000,
+        6 * 3_600_000,
+      );
+      a.positioning24h = positioningMetadata(observation24h);
+      a.positioning7d = positioningMetadata(observation7d);
+      a.oiCoinsChange24hPct = observation24h.oiCoinsChangePct;
+      a.oiQuantityDelta24hUsd = observation24h.oiQuantityDeltaUsd;
+      a.oiCoinsChange7dPct = observation7d.oiCoinsChangePct;
+      a.oiQuantityDelta7dUsd = observation7d.oiQuantityDeltaUsd;
       const fAvg = avgFunding24h.get(a.symbol);
       if (fAvg != null) a.fundingAvg24h = fAvg;
     }
 
     cache.set(MARKETS_CACHE_KEY, assets, 30_000);
+    cache.set(MARKETS_METADATA_CACHE_KEY, sourceMetadata, 30_000);
 
     // Fire-and-forget time-series snapshot. Only HL-sourced rows are
     // captured (assembled in the perp + builder-dex loops above) — we
@@ -436,10 +554,19 @@ export async function GET() {
       }
     });
 
-    return marketsResponse(assets, false);
+    return marketsResponse(assets, false, sourceMetadata);
   } catch (err) {
     const stale = cache.getStaleWithin<AssetData[]>(MARKETS_CACHE_KEY, MARKETS_MAX_STALE_MS);
-    if (stale) return marketsResponse(stale, true);
+    if (stale) {
+      const previous = cache.get<MarketsSourceMetadata>(MARKETS_METADATA_CACHE_KEY);
+      return marketsResponse(stale, true, {
+        generatedAt: previous?.generatedAt ?? Date.now(),
+        sourceObservedAt: previous?.sourceObservedAt ?? null,
+        partial: true,
+        failedSources: [...new Set([...(previous?.failedSources ?? []), "market-refresh"])],
+        staleSources: previous?.staleSources ?? [],
+      });
+    }
     return NextResponse.json({ error: String(err) }, { status: 500 });
   }
 }

@@ -1,6 +1,12 @@
 import Database from "better-sqlite3";
 import { mkdirSync } from "fs";
 import { join } from "path";
+import type {
+  OiSurgeHorizon,
+  OiSurgeLane,
+  OiSurgeQuadrant,
+  OiSurgeSeverity,
+} from "./oiSurge";
 
 // Single SQLite file, lives next to the app so PM2 restarts don't lose it.
 // WAL mode lets readers and writers coexist without blocking — important
@@ -34,7 +40,7 @@ export function getDb(): Database.Database {
 // Versioned via PRAGMA user_version so we can add schema changes without
 // blowing away the local file. Bump VERSION and add a step.
 
-const VERSION = 25;
+const VERSION = 28;
 
 function migrate(db: Database.Database): void {
   const current = db.pragma("user_version", { simple: true }) as number;
@@ -70,6 +76,9 @@ function migrate(db: Database.Database): void {
     if (current < 23) db.exec(MIGRATION_V23);
     if (current < 24) db.exec(MIGRATION_V24);
     if (current < 25) db.exec(MIGRATION_V25);
+    if (current < 26) db.exec(MIGRATION_V26);
+    if (current < 27) db.exec(MIGRATION_V27);
+    if (current < 28) db.exec(MIGRATION_V28);
     db.pragma(`user_version = ${VERSION}`);
   })();
 }
@@ -880,6 +889,105 @@ const MIGRATION_V25 = `
     );
     create index if not exists idx_smart_money_funding_run_payments_identity
       on smart_money_funding_run_payments(address, settlement_at, coin, funding_run_id);
+  `;
+
+// V26 — durable, descriptive OI-surge shadow events. This ledger is kept
+// separate from directional Telegram trade alerts: OI expansion has two
+// counterparties and is context, not a long/short recommendation. Repeated
+// horizon triggers update one bounded event thread; the initial evidence and
+// entry mark remain immutable so forward-return analysis has a stable origin.
+const MIGRATION_V26 = `
+    create table if not exists oi_surge_events (
+      id                         integer primary key autoincrement,
+      policy_version             text not null,
+      source                     text not null check (length(source) > 0),
+      mode                       text not null default 'shadow' check (mode = 'shadow'),
+      symbol                     text not null,
+      sector                     text not null,
+      started_at                 integer not null,
+      last_detected_at           integer not null,
+      severity                   text not null check (severity in ('high', 'extreme')),
+      primary_horizon            text not null check (primary_horizon in ('5m', '15m', '1h', '4h')),
+      entry_mark                 real not null check (entry_mark > 0),
+      entry_oi_usd               real not null check (entry_oi_usd >= 0),
+      latest_quadrant            text not null check (latest_quadrant in (
+        'expanding_up', 'expanding_down', 'expanding_flat'
+      )),
+      max_oi_coins_change_pct    real not null check (max_oi_coins_change_pct > 0),
+      max_quantity_delta_usd     real not null check (max_quantity_delta_usd > 0),
+      latest_price_change_pct    real not null,
+      volume_24h                 real not null check (volume_24h >= 0),
+      funding_hourly             real,
+      horizons_json              text not null check (json_valid(horizons_json)),
+      lanes_json                 text not null check (json_valid(lanes_json)),
+      initial_evidence_json      text not null check (json_valid(initial_evidence_json)),
+      latest_evidence_json       text not null check (json_valid(latest_evidence_json)),
+      created_at                 integer not null,
+      updated_at                 integer not null,
+      unique(policy_version, source, symbol, started_at),
+      check (last_detected_at >= started_at),
+      check (updated_at >= created_at)
+    );
+    create index if not exists idx_oi_surge_events_recent
+      on oi_surge_events(last_detected_at desc, severity);
+    create index if not exists idx_oi_surge_events_symbol
+      on oi_surge_events(symbol, started_at desc);
+
+    create table if not exists oi_surge_outcomes (
+      event_id         integer not null references oi_surge_events(id) on delete cascade,
+      horizon          text not null check (horizon in ('1h', '4h', '24h')),
+      target_at        integer not null,
+      status           text not null check (status in ('observed', 'missing', 'untrackable')),
+      snapshot_at      integer,
+      mark             real,
+      return_pct       real,
+      abs_return_pct   real,
+      high_return_pct  real,
+      low_return_pct   real,
+      observed_at      integer not null,
+      note             text,
+      primary key (event_id, horizon),
+      check (
+        (status = 'observed' and snapshot_at is not null and mark is not null and mark > 0
+          and return_pct is not null and abs_return_pct is not null and abs_return_pct >= 0
+          and high_return_pct is not null and low_return_pct is not null
+          and high_return_pct >= max(0, return_pct) and low_return_pct <= min(0, return_pct))
+        or (status in ('missing', 'untrackable') and snapshot_at is null and mark is null
+          and return_pct is null and abs_return_pct is null
+          and high_return_pct is null and low_return_pct is null)
+      )
+    );
+    create index if not exists idx_oi_surge_outcomes_target
+      on oi_surge_outcomes(horizon, target_at);
+  `;
+
+// V27 — at-most-once Telegram delivery ledger for the explicitly enabled
+// extreme-only OI surge pilot. Existing V26 events are not backfilled: a row
+// is created only when a current extreme detection is offered for delivery.
+const MIGRATION_V27 = `
+    create table if not exists oi_surge_deliveries (
+      event_id              integer primary key references oi_surge_events(id) on delete cascade,
+      alert_mode            text not null check (alert_mode = 'extreme-pilot'),
+      message_body          text not null check (length(message_body) between 1 and 4096),
+      delivery_status       text not null check (delivery_status in (
+        'pending', 'delivered', 'failed', 'unknown', 'expired'
+      )),
+      delivery_attempted_at integer,
+      delivered_at          integer,
+      telegram_message_id   text,
+      delivery_error        text,
+      created_at            integer not null,
+      updated_at            integer not null,
+      check (updated_at >= created_at)
+    );
+    create index if not exists idx_oi_surge_deliveries_status
+      on oi_surge_deliveries(delivery_status, created_at);
+  `;
+
+// V28 — explicit pilot eligibility fence. Kept separate from V27 so a node
+// that briefly ran the pre-fence V27 artifact remains forward-migratable.
+const MIGRATION_V28 = `
+    alter table oi_surge_events add column pilot_eligible_at integer;
   `;
 
 const MIGRATION_V11 = `
@@ -3068,4 +3176,560 @@ export function listPendingMarketOpenOiOutcomeItems(
     order by r.open_at asc, i.id asc
     limit @limit
   `).all({ settledThrough, limit: Math.max(1, Math.min(5_000, limit)) }) as PendingMarketOpenOiOutcomeItem[];
+}
+
+// ── OI surge shadow events ──────────────────────────────────────────────
+
+export interface OiSurgeEventRow {
+  id: number;
+  policy_version: string;
+  source: string;
+  mode: "shadow";
+  symbol: string;
+  sector: string;
+  started_at: number;
+  last_detected_at: number;
+  severity: OiSurgeSeverity;
+  primary_horizon: OiSurgeHorizon;
+  entry_mark: number;
+  entry_oi_usd: number;
+  latest_quadrant: Extract<OiSurgeQuadrant, "expanding_up" | "expanding_down" | "expanding_flat">;
+  max_oi_coins_change_pct: number;
+  max_quantity_delta_usd: number;
+  latest_price_change_pct: number;
+  volume_24h: number;
+  funding_hourly: number | null;
+  horizons_json: string;
+  lanes_json: string;
+  initial_evidence_json: string;
+  latest_evidence_json: string;
+  created_at: number;
+  updated_at: number;
+  pilot_eligible_at: number | null;
+}
+
+export interface NewOiSurgeEvent {
+  policy_version: string;
+  source: string;
+  symbol: string;
+  sector: string;
+  detected_at: number;
+  severity: OiSurgeSeverity;
+  primary_horizon: OiSurgeHorizon;
+  quadrant: Extract<OiSurgeQuadrant, "expanding_up" | "expanding_down" | "expanding_flat">;
+  entry_mark: number;
+  entry_oi_usd: number;
+  oi_coins_change_pct: number;
+  oi_quantity_delta_usd: number;
+  price_change_pct: number;
+  volume_24h: number;
+  funding_hourly: number | null;
+  horizons: OiSurgeHorizon[];
+  lanes: OiSurgeLane[];
+  evidence: unknown;
+  observed_at: number;
+}
+
+export type OiSurgeReservation =
+  | { kind: "inserted"; id: number }
+  | { kind: "updated"; id: number };
+
+const OI_SURGE_HORIZON_ORDER: readonly OiSurgeHorizon[] = ["5m", "15m", "1h", "4h"];
+const OI_SURGE_LANE_ORDER: readonly OiSurgeLane[] = ["relative", "systemic"];
+
+function mergeOrdered<T extends string>(
+  existing: string,
+  incoming: readonly T[],
+  order: readonly T[],
+): T[] {
+  let parsed: unknown = [];
+  try {
+    parsed = JSON.parse(existing);
+  } catch {
+    parsed = [];
+  }
+  const values = new Set<T>([
+    ...(Array.isArray(parsed) ? parsed.filter((value): value is T =>
+      typeof value === "string" && order.includes(value as T)) : []),
+    ...incoming,
+  ]);
+  return order.filter((value) => values.has(value));
+}
+
+function validateNewOiSurgeEvent(event: NewOiSurgeEvent, threadMs: number): string {
+  if (!event.policy_version.startsWith("oi-surge-shadow-v")) {
+    throw new Error("OI surge event requires a versioned shadow policy");
+  }
+  if (event.source.trim() === "" || event.symbol.trim() === "" || event.sector.trim() === "") {
+    throw new Error("OI surge event requires source, symbol, and sector");
+  }
+  if (
+    !Number.isFinite(threadMs) || threadMs <= 0
+    || !Number.isFinite(event.detected_at)
+    || !Number.isFinite(event.observed_at)
+    || event.observed_at < event.detected_at
+    || !Number.isFinite(event.entry_mark) || event.entry_mark <= 0
+    || !Number.isFinite(event.entry_oi_usd) || event.entry_oi_usd < 0
+    || !Number.isFinite(event.oi_coins_change_pct) || event.oi_coins_change_pct <= 0
+    || !Number.isFinite(event.oi_quantity_delta_usd) || event.oi_quantity_delta_usd <= 0
+    || !Number.isFinite(event.price_change_pct)
+    || !Number.isFinite(event.volume_24h) || event.volume_24h < 0
+  ) {
+    throw new Error("OI surge event contains invalid numeric evidence");
+  }
+  if (event.horizons.length === 0 || event.lanes.length === 0) {
+    throw new Error("OI surge event requires at least one horizon and lane");
+  }
+  const evidenceJson = JSON.stringify(event.evidence);
+  if (evidenceJson === undefined) throw new Error("OI surge evidence must be JSON serializable");
+  return evidenceJson;
+}
+
+export function reserveOiSurgeEvent(
+  event: NewOiSurgeEvent,
+  threadMs: number,
+): OiSurgeReservation {
+  const evidenceJson = validateNewOiSurgeEvent(event, threadMs);
+  const db = getDb();
+  const reserve = db.transaction((): OiSurgeReservation => {
+    const existing = db.prepare(`
+      select * from oi_surge_events
+      where policy_version = @policy_version and source = @source and symbol = @symbol
+        and started_at >= @threadStart and started_at <= @detected_at
+      order by started_at desc, id desc limit 1
+    `).get({
+      policy_version: event.policy_version,
+      source: event.source,
+      symbol: event.symbol,
+      threadStart: event.detected_at - threadMs,
+      detected_at: event.detected_at,
+    }) as OiSurgeEventRow | undefined;
+
+    const horizons = existing
+      ? mergeOrdered(existing.horizons_json, event.horizons, OI_SURGE_HORIZON_ORDER)
+      : OI_SURGE_HORIZON_ORDER.filter((value) => event.horizons.includes(value));
+    const lanes = existing
+      ? mergeOrdered(existing.lanes_json, event.lanes, OI_SURGE_LANE_ORDER)
+      : OI_SURGE_LANE_ORDER.filter((value) => event.lanes.includes(value));
+
+    if (existing) {
+      const upgrading = existing.severity === "high" && event.severity === "extreme";
+      db.prepare(`
+        update oi_surge_events set
+          last_detected_at = @last_detected_at,
+          severity = @severity,
+          primary_horizon = @primary_horizon,
+          latest_quadrant = @latest_quadrant,
+          max_oi_coins_change_pct = @max_oi_coins_change_pct,
+          max_quantity_delta_usd = @max_quantity_delta_usd,
+          latest_price_change_pct = @latest_price_change_pct,
+          volume_24h = @volume_24h,
+          funding_hourly = @funding_hourly,
+          horizons_json = @horizons_json,
+          lanes_json = @lanes_json,
+          latest_evidence_json = @latest_evidence_json,
+          updated_at = @updated_at
+        where id = @id
+      `).run({
+        id: existing.id,
+        last_detected_at: Math.max(existing.last_detected_at, event.detected_at),
+        severity: upgrading ? "extreme" : existing.severity,
+        primary_horizon: upgrading || existing.severity === event.severity
+          ? event.primary_horizon
+          : existing.primary_horizon,
+        latest_quadrant: event.quadrant,
+        max_oi_coins_change_pct: Math.max(existing.max_oi_coins_change_pct, event.oi_coins_change_pct),
+        max_quantity_delta_usd: Math.max(existing.max_quantity_delta_usd, event.oi_quantity_delta_usd),
+        latest_price_change_pct: event.price_change_pct,
+        volume_24h: event.volume_24h,
+        funding_hourly: event.funding_hourly,
+        horizons_json: JSON.stringify(horizons),
+        lanes_json: JSON.stringify(lanes),
+        latest_evidence_json: evidenceJson,
+        updated_at: Math.max(existing.updated_at, event.observed_at),
+      });
+      return { kind: "updated", id: existing.id };
+    }
+
+    const result = db.prepare(`
+      insert into oi_surge_events (
+        policy_version, source, mode, symbol, sector, started_at, last_detected_at,
+        severity, primary_horizon, entry_mark, entry_oi_usd, latest_quadrant,
+        max_oi_coins_change_pct, max_quantity_delta_usd, latest_price_change_pct,
+        volume_24h, funding_hourly, horizons_json, lanes_json,
+        initial_evidence_json, latest_evidence_json, created_at, updated_at
+      ) values (
+        @policy_version, @source, 'shadow', @symbol, @sector, @started_at, @last_detected_at,
+        @severity, @primary_horizon, @entry_mark, @entry_oi_usd, @latest_quadrant,
+        @max_oi_coins_change_pct, @max_quantity_delta_usd, @latest_price_change_pct,
+        @volume_24h, @funding_hourly, @horizons_json, @lanes_json,
+        @initial_evidence_json, @latest_evidence_json, @created_at, @updated_at
+      )
+    `).run({
+      policy_version: event.policy_version,
+      source: event.source,
+      symbol: event.symbol,
+      sector: event.sector,
+      started_at: event.detected_at,
+      last_detected_at: event.detected_at,
+      severity: event.severity,
+      primary_horizon: event.primary_horizon,
+      entry_mark: event.entry_mark,
+      entry_oi_usd: event.entry_oi_usd,
+      latest_quadrant: event.quadrant,
+      max_oi_coins_change_pct: event.oi_coins_change_pct,
+      max_quantity_delta_usd: event.oi_quantity_delta_usd,
+      latest_price_change_pct: event.price_change_pct,
+      volume_24h: event.volume_24h,
+      funding_hourly: event.funding_hourly,
+      horizons_json: JSON.stringify(horizons),
+      lanes_json: JSON.stringify(lanes),
+      initial_evidence_json: evidenceJson,
+      latest_evidence_json: evidenceJson,
+      created_at: event.observed_at,
+      updated_at: event.observed_at,
+    });
+    return { kind: "inserted", id: Number(result.lastInsertRowid) };
+  });
+  return reserve.immediate();
+}
+
+export function listOiSurgeEvents(
+  options: { since?: number; symbol?: string; limit?: number } = {},
+): OiSurgeEventRow[] {
+  const where: string[] = [];
+  const params: Array<string | number> = [];
+  if (options.since != null && Number.isFinite(options.since)) {
+    where.push("last_detected_at >= ?");
+    params.push(options.since);
+  }
+  if (options.symbol) {
+    where.push("symbol = ?");
+    params.push(options.symbol);
+  }
+  const limit = Math.max(1, Math.min(options.limit ?? 100, 1_000));
+  params.push(limit);
+  return getDb().prepare(`
+    select * from oi_surge_events
+    ${where.length > 0 ? `where ${where.join(" and ")}` : ""}
+    order by last_detected_at desc, id desc limit ?
+  `).all(...params) as OiSurgeEventRow[];
+}
+
+export function getOiSurgeEvent(eventId: number): OiSurgeEventRow | null {
+  if (!Number.isSafeInteger(eventId) || eventId <= 0) return null;
+  return (getDb().prepare("select * from oi_surge_events where id = ?")
+    .get(eventId) as OiSurgeEventRow | undefined) ?? null;
+}
+
+export function markOiSurgeEventPilotEligible(eventId: number, eligibleAt = Date.now()): boolean {
+  if (!Number.isSafeInteger(eventId) || eventId <= 0 || !Number.isFinite(eligibleAt)) return false;
+  return getDb().prepare(`
+    update oi_surge_events set pilot_eligible_at = ?
+    where id = ? and pilot_eligible_at is null
+  `).run(eligibleAt, eventId).changes === 1;
+}
+
+export function listLatestOiSurgeEventsBySymbol(
+  since: number,
+  symbols?: string[],
+): Map<string, OiSurgeEventRow> {
+  if (symbols && symbols.length === 0) return new Map();
+  const rows = listOiSurgeEvents({ since, limit: 1_000 });
+  const allowed = symbols ? new Set(symbols) : null;
+  const out = new Map<string, OiSurgeEventRow>();
+  for (const row of rows) {
+    if (allowed && !allowed.has(row.symbol)) continue;
+    if (!out.has(row.symbol)) out.set(row.symbol, row);
+  }
+  return out;
+}
+
+export interface OiSurgeEventSummary {
+  total: number;
+  high: number;
+  extreme: number;
+}
+
+export function summarizeOiSurgeEvents(since: number, symbol?: string): OiSurgeEventSummary {
+  const rows = getDb().prepare(`
+    select severity, count(*) as count from oi_surge_events
+    where last_detected_at >= @since and (@symbol is null or symbol = @symbol)
+    group by severity
+  `).all({ since, symbol: symbol ?? null }) as Array<{ severity: OiSurgeSeverity; count: number }>;
+  const summary: OiSurgeEventSummary = { total: 0, high: 0, extreme: 0 };
+  for (const row of rows) {
+    summary.total += row.count;
+    summary[row.severity] += row.count;
+  }
+  return summary;
+}
+
+export type OiSurgeOutcomeHorizon = "1h" | "4h" | "24h";
+
+export interface OiSurgeOutcomeRow {
+  event_id: number;
+  horizon: OiSurgeOutcomeHorizon;
+  target_at: number;
+  status: "observed" | "missing" | "untrackable";
+  snapshot_at: number | null;
+  mark: number | null;
+  return_pct: number | null;
+  abs_return_pct: number | null;
+  high_return_pct: number | null;
+  low_return_pct: number | null;
+  observed_at: number;
+  note: string | null;
+}
+
+export function upsertOiSurgeOutcome(row: OiSurgeOutcomeRow): boolean {
+  return getDb().prepare(`
+    insert into oi_surge_outcomes (
+      event_id, horizon, target_at, status, snapshot_at, mark,
+      return_pct, abs_return_pct, high_return_pct, low_return_pct, observed_at, note
+    ) values (
+      @event_id, @horizon, @target_at, @status, @snapshot_at, @mark,
+      @return_pct, @abs_return_pct, @high_return_pct, @low_return_pct, @observed_at, @note
+    ) on conflict(event_id, horizon) do nothing
+  `).run(row).changes === 1;
+}
+
+export function listOiSurgeOutcomes(eventId: number): OiSurgeOutcomeRow[] {
+  return getDb().prepare(`
+    select * from oi_surge_outcomes where event_id = ?
+    order by case horizon when '1h' then 0 when '4h' then 1 else 2 end
+  `).all(eventId) as OiSurgeOutcomeRow[];
+}
+
+export function listOiSurgeOutcomesForEvents(eventIds: number[]): OiSurgeOutcomeRow[] {
+  const ids = boundedPositiveIds(eventIds, 500);
+  if (ids.length === 0) return [];
+  const placeholders = ids.map(() => "?").join(", ");
+  return getDb().prepare(`
+    select * from oi_surge_outcomes where event_id in (${placeholders})
+    order by event_id asc,
+      case horizon when '1h' then 0 when '4h' then 1 else 2 end
+    limit 1500
+  `).all(...ids) as OiSurgeOutcomeRow[];
+}
+
+export interface PendingOiSurgeOutcomeEvent {
+  eventId: number;
+  symbol: string;
+  startedAt: number;
+  entryMark: number;
+}
+
+export function listPendingOiSurgeOutcomeEvents(
+  now: number,
+  limit = 500,
+): PendingOiSurgeOutcomeEvent[] {
+  const settledThrough = now - 10 * 60_000;
+  return getDb().prepare(`
+    select id as eventId, symbol, started_at as startedAt, entry_mark as entryMark
+    from oi_surge_events e
+    where
+      (started_at + 3600000 <= @settledThrough and not exists (
+        select 1 from oi_surge_outcomes o where o.event_id = e.id and o.horizon = '1h'
+      ))
+      or (started_at + 14400000 <= @settledThrough and not exists (
+        select 1 from oi_surge_outcomes o where o.event_id = e.id and o.horizon = '4h'
+      ))
+      or (started_at + 86400000 <= @settledThrough and not exists (
+        select 1 from oi_surge_outcomes o where o.event_id = e.id and o.horizon = '24h'
+      ))
+    order by started_at asc, id asc limit @limit
+  `).all({
+    settledThrough,
+    limit: Math.max(1, Math.min(5_000, limit)),
+  }) as PendingOiSurgeOutcomeEvent[];
+}
+
+export type OiSurgeDeliveryStatus =
+  | "pending"
+  | "delivered"
+  | "failed"
+  | "unknown"
+  | "expired";
+
+export interface OiSurgeDeliveryRow {
+  event_id: number;
+  alert_mode: "extreme-pilot";
+  message_body: string;
+  delivery_status: OiSurgeDeliveryStatus;
+  delivery_attempted_at: number | null;
+  delivered_at: number | null;
+  telegram_message_id: string | null;
+  delivery_error: string | null;
+  created_at: number;
+  updated_at: number;
+}
+
+export type OiSurgeDeliveryReservation =
+  | { kind: "inserted"; eventId: number }
+  | { kind: "duplicate"; eventId: number }
+  | { kind: "ineligible"; eventId: number };
+
+export function reserveOiSurgeDelivery(
+  eventId: number,
+  messageBody: string,
+  alertMode: "extreme-pilot",
+  createdAt = Date.now(),
+): OiSurgeDeliveryReservation {
+  if (!Number.isSafeInteger(eventId) || eventId <= 0) throw new Error("Invalid OI surge event id");
+  if (!messageBody || messageBody.length > 4_096) throw new Error("Invalid OI surge Telegram body");
+  const db = getDb();
+  const reserve = db.transaction((): OiSurgeDeliveryReservation => {
+    const event = db.prepare("select severity, pilot_eligible_at from oi_surge_events where id = ?")
+      .get(eventId) as { severity: OiSurgeSeverity; pilot_eligible_at: number | null } | undefined;
+    if (event?.severity !== "extreme" || event.pilot_eligible_at == null) {
+      return { kind: "ineligible", eventId };
+    }
+    const result = db.prepare(`
+      insert into oi_surge_deliveries (
+        event_id, alert_mode, message_body, delivery_status, created_at, updated_at
+      ) values (?, ?, ?, 'pending', ?, ?)
+      on conflict(event_id) do nothing
+    `).run(eventId, alertMode, messageBody, createdAt, createdAt);
+    return { kind: result.changes === 1 ? "inserted" : "duplicate", eventId };
+  });
+  return reserve.immediate();
+}
+
+export function listOiSurgeDeliveries(
+  options: { eventId?: number; limit?: number } = {},
+): OiSurgeDeliveryRow[] {
+  const limit = Math.max(1, Math.min(1_000, Math.floor(options.limit ?? 100)));
+  if (options.eventId != null) {
+    return getDb().prepare(`
+      select * from oi_surge_deliveries where event_id = ? limit ?
+    `).all(options.eventId, limit) as OiSurgeDeliveryRow[];
+  }
+  return getDb().prepare(`
+    select * from oi_surge_deliveries order by created_at desc limit ?
+  `).all(limit) as OiSurgeDeliveryRow[];
+}
+
+export function listPendingOiSurgeDeliveries(limit = 20): OiSurgeDeliveryRow[] {
+  return getDb().prepare(`
+    select * from oi_surge_deliveries
+    where delivery_status = 'pending' and delivery_attempted_at is null
+    order by created_at asc limit ?
+  `).all(Math.max(1, Math.min(100, Math.floor(limit)))) as OiSurgeDeliveryRow[];
+}
+
+export function markOiSurgeDeliveryAttempted(eventId: number, attemptedAt = Date.now()): boolean {
+  return getDb().prepare(`
+    update oi_surge_deliveries
+    set delivery_attempted_at = ?, updated_at = ?
+    where event_id = ? and delivery_status = 'pending' and delivery_attempted_at is null
+  `).run(attemptedAt, attemptedAt, eventId).changes === 1;
+}
+
+export function markOiSurgeDeliveryDelivered(
+  eventId: number,
+  messageId: string,
+  deliveredAt = Date.now(),
+): boolean {
+  if (!messageId) return false;
+  return getDb().prepare(`
+    update oi_surge_deliveries
+    set delivery_status = 'delivered', delivered_at = ?, telegram_message_id = ?, updated_at = ?
+    where event_id = ? and delivery_status = 'pending' and delivery_attempted_at is not null
+  `).run(deliveredAt, messageId, deliveredAt, eventId).changes === 1;
+}
+
+function markOiSurgeDeliveryTerminal(
+  eventId: number,
+  status: "failed" | "unknown" | "expired",
+  error: string,
+  observedAt: number,
+  requireAttempt: boolean,
+): boolean {
+  const attemptClause = requireAttempt
+    ? "and delivery_attempted_at is not null"
+    : "and delivery_attempted_at is null";
+  return getDb().prepare(`
+    update oi_surge_deliveries
+    set delivery_status = @status, delivery_error = @error, updated_at = @observedAt
+    where event_id = @eventId and delivery_status = 'pending' ${attemptClause}
+  `).run({
+    eventId,
+    status,
+    error: error.slice(0, 1_000),
+    observedAt,
+  }).changes === 1;
+}
+
+export function markOiSurgeDeliveryFailed(
+  eventId: number,
+  error: string,
+  failedAt = Date.now(),
+): boolean {
+  return markOiSurgeDeliveryTerminal(eventId, "failed", error, failedAt, true);
+}
+
+export function markOiSurgeDeliveryUnknown(
+  eventId: number,
+  error: string,
+  observedAt = Date.now(),
+): boolean {
+  return markOiSurgeDeliveryTerminal(eventId, "unknown", error, observedAt, true);
+}
+
+export function markOiSurgeDeliveryExpired(
+  eventId: number,
+  error: string,
+  expiredAt = Date.now(),
+): boolean {
+  return markOiSurgeDeliveryTerminal(eventId, "expired", error, expiredAt, false);
+}
+
+export function reconcileStaleAttemptedOiSurgeDeliveries(
+  attemptedBefore: number,
+  observedAt = Date.now(),
+): number {
+  return getDb().prepare(`
+    update oi_surge_deliveries
+    set delivery_status = 'unknown',
+        delivery_error = 'Delivery attempt interrupted before acknowledgement was persisted',
+        updated_at = @observedAt
+    where delivery_status = 'pending'
+      and delivery_attempted_at is not null
+      and delivery_attempted_at <= @attemptedBefore
+  `).run({ attemptedBefore, observedAt }).changes;
+}
+
+export interface OiSurgeDeliverySummary {
+  total: number;
+  pending: number;
+  delivered: number;
+  failed: number;
+  unknown: number;
+  expired: number;
+}
+
+export function summarizeOiSurgeDeliveries(since?: number): OiSurgeDeliverySummary {
+  const rows = getDb().prepare(`
+    select delivery_status, count(*) as count
+    from oi_surge_deliveries
+    where (@since is null or created_at >= @since)
+    group by delivery_status
+  `).all({ since: since != null && Number.isFinite(since) ? since : null }) as Array<{
+    delivery_status: OiSurgeDeliveryStatus;
+    count: number;
+  }>;
+  const summary: OiSurgeDeliverySummary = {
+    total: 0,
+    pending: 0,
+    delivered: 0,
+    failed: 0,
+    unknown: 0,
+    expired: 0,
+  };
+  for (const row of rows) {
+    summary.total += row.count;
+    summary[row.delivery_status] += row.count;
+  }
+  return summary;
 }

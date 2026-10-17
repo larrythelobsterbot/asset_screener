@@ -72,3 +72,21 @@ test("latest-request gate rejects stale and post-unmount commits", () => {
   assert.equal(gate.isCurrent(second), false);
   assert.equal(gate.isCurrent(gate.start()), false);
 });
+
+test("deferred old success and error cannot commit after a newer request", () => {
+  const gate = createLatestRequestGate();
+  const deferred = gate.start();
+  const latest = gate.start();
+  assert.equal(gate.isCurrent(deferred), false, "old deferred success is gated");
+  assert.equal(gate.isCurrent(deferred), false, "old deferred error is gated");
+  assert.equal(gate.isCurrent(latest), true, "new success remains eligible");
+});
+
+test("hung request is invalidated by supersession and unmount cleanup", () => {
+  const gate = createLatestRequestGate();
+  const hung = gate.start();
+  gate.start();
+  assert.equal(gate.isCurrent(hung), false);
+  gate.close();
+  assert.equal(gate.isCurrent(gate.start()), false);
+});

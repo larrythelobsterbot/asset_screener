@@ -26,6 +26,8 @@
 //                  not coupled to success of the expensive TA scan.
 //   /api/market-open-oi/run → DST/calendar-aware market-open OI briefing
 //                  scheduler plus its independent outcome tracker.
+//   /api/oi-surges/run → Hyperliquid OI-surge shadow detector plus its
+//                  descriptive 1h/4h/24h outcome tracker.
 //   /api/hype/pressure and /api/btc/binary → recurring bootstrap requests
 //                  that start their idempotent background pollers and retry
 //                  automatically after any transient startup failure.
@@ -64,6 +66,9 @@ export function resolveScreenerSelfOrigin(
 export async function register() {
   if (process.env.NEXT_RUNTIME !== "nodejs") return;
   if (process.env.NEXT_PHASE === "phase-production-build") return;
+  // Explicit opt-in for isolated verification; production remains always-on.
+  // This stops self-pings, not user-requested API reads or their own side effects.
+  if (process.env.SCREENER_DISABLE_BACKGROUND === "1") return;
 
   const origin = resolveScreenerSelfOrigin();
   const capabilityGlobal = globalThis as typeof globalThis & {
@@ -99,6 +104,15 @@ export async function register() {
       },
     }).catch(() => {});
   };
+  const pingOiSurges = () => {
+    fetch(`${origin}/api/oi-surges/run`, {
+      method: "POST",
+      cache: "no-store",
+      headers: {
+        "X-Asset-Screener-Outcome-Capability": alertOutcomeCapability,
+      },
+    }).catch(() => {});
+  };
   const bootstrapPollers = () => {
     fetch(`${origin}/api/hype/pressure`, { cache: "no-store" }).catch(() => {});
     fetch(`${origin}/api/btc/binary`, { cache: "no-store" }).catch(() => {});
@@ -117,6 +131,17 @@ export async function register() {
     console.info("[instrumentation] keepalive started (markets+feed+social+HYPE+BTC @60s)");
   }, 10_000);
   if (typeof coreBootstrapTimer.unref === "function") coreBootstrapTimer.unref();
+
+  // Run after the markets keepalive has had time to persist the newest
+  // same-instant OI/price batch; otherwise a concurrent boot ping can scan
+  // the previous minute and then interval-limit the fresh pass.
+  const oiSurgeBootstrapTimer = setTimeout(() => {
+    pingOiSurges();
+    const oiSurgeTimer = setInterval(pingOiSurges, 60_000);
+    if (typeof oiSurgeTimer.unref === "function") oiSurgeTimer.unref();
+    console.info("[instrumentation] OI-surge shadow detector keepalive started (@60s)");
+  }, 20_000);
+  if (typeof oiSurgeBootstrapTimer.unref === "function") oiSurgeBootstrapTimer.unref();
 
   // Stagger the expensive 160-call TA scan away from the core refresh so
   // it does not contend with the initial markets/Elfa requests at boot.

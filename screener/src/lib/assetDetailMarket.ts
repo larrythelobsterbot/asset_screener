@@ -34,6 +34,33 @@ export type AssetDetailMarketData = {
   builderData: MetaAndContexts | null;
 };
 
+export type AssetDetailMarketOptions = {
+  /** Preloaded metadata is supplied by the route after identity validation. */
+  hlData?: MetaAndContexts;
+  builderData?: MetaAndContexts | null;
+  /** Qualified selections must not reuse legacy bare-ticker candle rows. */
+  candleCacheSymbol?: string;
+};
+
+/** Verify the requested contract is present in the selected live venue. */
+export function assetMarketExistsInLiveUniverse(
+  market: AssetMarketIdentity,
+  data: MetaAndContexts,
+  options: { allowBareBuilderName?: boolean; builderDex?: string } = {},
+): boolean {
+  if (market.kind === "spot") return true;
+  return data.meta.universe.some((entry) => {
+    if (market.kind === "native-perp") return entry.name === market.symbol;
+    if (entry.name === market.wireCoin) return true;
+    // Some live builder responses use a bare ticker even though the request
+    // was scoped to one DEX. A qualified row must still match exactly; a
+    // qualified row from another venue can never satisfy this check.
+    return (options.allowBareBuilderName !== false || options.builderDex != null)
+      && !entry.name.includes(":")
+      && entry.name === market.symbol;
+  });
+}
+
 /**
  * Fetch the market-dependent inputs for the asset-detail route from one
  * resolved identity. Individual candle/funding/builder failures preserve the
@@ -43,18 +70,26 @@ export type AssetDetailMarketData = {
 export async function fetchAssetDetailMarketData(
   market: AssetMarketIdentity,
   deps: AssetDetailMarketDependencies,
+  options: AssetDetailMarketOptions = {},
 ): Promise<AssetDetailMarketData> {
   const builderDataPromise = market.kind === "builder-perp"
-    ? deps.getBuilderDexData(market.builderDex).catch(() => null)
+    ? options.builderData !== undefined
+      ? Promise.resolve(options.builderData)
+      : deps.getBuilderDexData(market.builderDex).catch(() => null)
     : Promise.resolve(null);
   const fundingPromise: Promise<FundingHistoryRow[]> = market.kind === "spot"
     ? Promise.resolve([])
     : deps.getFundingHistory(market.wireCoin).catch(() => []);
 
   const [candles, funding, hlData, allMids, builderData] = await Promise.all([
-    deps.getCandles(market.wireCoin, "4h", 350, market.cacheSymbol).catch(() => []),
+    deps.getCandles(
+      market.wireCoin,
+      "4h",
+      350,
+      options.candleCacheSymbol ?? market.cacheSymbol,
+    ).catch(() => []),
     fundingPromise,
-    deps.getMetaAndCtxs(),
+    options.hlData ? Promise.resolve(options.hlData) : deps.getMetaAndCtxs(),
     deps.getAllMids(),
     builderDataPromise,
   ]);

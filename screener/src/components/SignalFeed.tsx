@@ -20,7 +20,8 @@ export default function SignalFeed({ signals, onSelectAsset }: Props) {
   if (!signals.length) {
     return (
       <div className="text-center py-8 text-gray-600 text-sm">
-        No active signals
+        <p>No cached signal rows match this view.</p>
+        <p className="mt-1 text-xs">This does not establish complete scan coverage.</p>
       </div>
     );
   }
